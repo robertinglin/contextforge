@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contextforge"
+version = "0.1.0"
+description = "Context-aware markdown diff/file extractor and fuzzy patch applier."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "ContextForge Contributors" }]
+keywords = ["patch", "diff", "unified diff", "fuzzy patch", "markdown"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Version Control"
+]
+
+# Pull in the standard patch parser used by the fallback in core.py
+dependencies = [
+  "patch>=1.16"
+]
+
+[project.urls]
+Homepage = "https://github.com/robertinglin/contextforge"
+Repository = "https://github.com/robertinglin/contextforge"
+
+[tool.setuptools.packages.find]
+include = ["contextforge*"]
+
+[tool.setuptools]
+include-package-data = false
