@@ -1,39 +1,42 @@
 # contextforge/utils/gitignore.py
 import os
 import pathspec
+from typing import List
 
 def get_gitignore(path: str) -> pathspec.PathSpec:
     """
-    Finds and parses the .gitignore file by searching from the given path upwards.
-
-    This function mimics Git's behavior by starting at `path` and walking up the
-    directory tree until it finds a `.gitignore` file. It uses the first one it
-    encounters and does not merge ignore rules from other `.gitignore` files in
-    parent directories.
-
-    It also includes a default rule to always ignore the '.git/' directory and
-    'package-lock.json'.
-
-    Args:
-        path: The starting directory path for the search.
-
-    Returns:
-        A `pathspec.PathSpec` object compiled from the found .gitignore rules.
+    Return a PathSpec compiled from the nearest .gitignore found by walking
+    upward from `path` (file or directory). Always ignores '.git/' by default.
+    If no .gitignore exists or it cannot be read, still return a valid spec
+    that at least ignores '.git/'.
     """
-    default_ignores = ['.git/', 'package-lock.json']
-    ignore_lines = default_ignores
+    defaults: List[str] = ['.git/']
+    lines: List[str] = list(defaults)
 
-    current_path = os.path.abspath(path)
+    # Normalize base (allow either a file or a directory)
+    base = os.path.abspath(path or ".")
+    if os.path.isfile(base):
+        base = os.path.dirname(base)
+
+    cur = base
     while True:
-        gitignore_path = os.path.join(current_path, '.gitignore')
-        if os.path.exists(gitignore_path):
-            with open(gitignore_path, 'r') as f:
-                ignore_lines.extend(f.readlines())
+        gi = os.path.join(cur, ".gitignore")
+        try:
+            if os.path.exists(gi):
+                with open(gi, "r", encoding="utf-8", errors="ignore") as f:
+                    # Splitlines to avoid carrying raw newline characters
+                    lines.extend(f.read().splitlines())
+                break
+        except OSError:
+            # Ignore unreadable .gitignore and keep walking upward
+            pass
+        parent = os.path.dirname(cur)
+        if parent == cur:
             break
+        cur = parent
 
-        parent_path = os.path.dirname(current_path)
-        if parent_path == current_path:
-            break
-        current_path = parent_path
-
-    return pathspec.PathSpec.from_lines('gitwildmatch', ignore_lines)
+    # Always return a valid spec; fall back to defaults only if necessary.
+    try:
+        return pathspec.PathSpec.from_lines("gitwildmatch", lines)
+    except Exception:
+        return pathspec.PathSpec.from_lines("gitwildmatch", defaults)

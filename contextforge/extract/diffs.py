@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import sys
 from typing import List, Dict, Optional, Tuple
+from ..errors import ExtractError
 
 from ..models.fence import FenceToken
 
@@ -22,6 +23,12 @@ def _line_bounds(text: str, idx: int) -> Tuple[int, int]:
     le_pos = text.find("\n", idx)
     le = le_pos if le_pos != -1 else len(text)
     return ls, le
+
+
+def _line_index_for_charpos(text: str, pos: int) -> int:
+    """Return 0-based line index for the given absolute char position."""
+    if pos <= 0: return 0
+    return text.count("\n", 0, pos)
 
 
 def _first_token(s: str) -> str:
@@ -310,6 +317,12 @@ def extract_diffs_from_text(
             continue
 
         body = text[body_start:body_end]
+        # If the fence explicitly declares a diff but the body doesn't look like one,
+        # treat this as a malformed diff and raise with a helpful location.
+        if is_explicit_diff and not _looks_like_diff(body):
+            line_no = _line_index_for_charpos(text, open_tok.start) + 1  # 1-based
+            raise ExtractError(f"Malformed diff fence near line {line_no}: expected a unified diff body.")
+
         if not is_explicit_diff and not _looks_like_diff(body):
             if _diff_score(body) < 4.0:
                 i += 1

@@ -3,11 +3,14 @@ import os
 from typing import Dict, Generator, List, Optional
 
 from .commit import patch_text
-from .commit import patch_fromstring
+from patch import fromstring as patch_fromstring
 from .errors import PatchFailedError
 from .extract import extract_blocks_from_text
 from .extract.metadata import extract_file_info_from_context_and_code
 from .utils.parsing import _contains_truncation_marker
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def parse_markdown_string(markdown_content: str) -> Generator[Dict[str, str], None, None]:
@@ -61,11 +64,11 @@ def plan_and_generate_changes(planned_changes: List[Dict], codebase_dir: str) ->
                 with open(target_path, 'r', encoding='utf-8') as f:
                     original_content = f.read()
             except Exception as e:
-                print(f"  - WARNING: Could not read original file, proceeding as if empty. Error: {e}")
+                logger.warning(f"  - WARNING: Could not read original file, proceeding as if empty. Error: {e}")
         new_content = None
         if change_type == 'full_replacement':
             if _contains_truncation_marker(block['code']):
-                print("  - WARNING: Truncation markers detected. LLM-based merging is not part of this function. Treating as a full replacement.")
+                logger.warning("  - WARNING: Truncation markers detected. LLM-based merging is not part of this function. Treating as a full replacement.")
             new_content = block['code']
         elif change_type == 'diff':
             try:
@@ -78,10 +81,10 @@ def plan_and_generate_changes(planned_changes: List[Dict], codebase_dir: str) ->
                 try:
                     new_content = patch_text(original_content, block['code'])
                 except PatchFailedError as e:
-                    print(f"  - ERROR: Fuzzy patch failed for {file_path}: {e}")
+                    logger.error(f"  - ERROR: Fuzzy patch failed for {file_path}: {e}")
                     new_content = None
         else:
-            print(f"  - Unknown change type '{change_type}' for {file_path}. Skipping.")
+            logger.info(f"  - Unknown change type '{change_type}' for {file_path}. Skipping.")
             continue
         if new_content is not None:
             final_changes.append({

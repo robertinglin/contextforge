@@ -8,6 +8,7 @@ node_modules/
 project/config.py
 # Python-generated files
 __pycache__/
+pytest-*
 *.py[oc]
 build/
 dist/

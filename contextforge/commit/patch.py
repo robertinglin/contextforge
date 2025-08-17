@@ -6,7 +6,6 @@ import logging
 import re
 import textwrap
 from typing import Dict, List, Optional, Tuple
-from typing import Dict, List, Optional, Tuple
 
 from ..errors.patch import PatchFailedError
 
@@ -615,7 +614,18 @@ def _apply_hunk_block_style(
 
 
 def patch_text(content: str, patch_str: str, threshold: float = 0.6) -> str:
-    """Apply a fuzzy patch to content, preserving EOL style and trailing newline."""
+    """
+    Apply a patch string to the provided content.
+
+    Prefers standard unified-diff hunks; falls back to a simplified '@@' hunk
+    separator when headers are absent. Matching is robust to minor whitespace
+    drift and uses a block-first strategy with contextual anchors and a final
+    fuzzy-search fallback. End-of-line style and the presence/absence of a
+    trailing newline are preserved.
+
+    Raises:
+        PatchFailedError: if no acceptable match can be found for any hunk.
+    """
     if not patch_str.strip():
         return content
 

@@ -52,25 +52,24 @@ def _build_context_string(request: Any) -> str:
     if request.instructions:
         context_str += f"<user_instructions>\n{request.instructions}\n</user_instructions>\n"
 
+    # Stable, copy-pasteable formatting guidance for downstream tools.
     context_str += (
-        '\n<format_instruction>\n'
-        'When providing code changes, please adhere to the following rules:\n'
-        '1.  **Use Git Diffs:** For modifications, always provide changes in the standard git diff format. Start the code block with ```diff.\n'
-        '2.  **Handle New/Full Files:** If it is a full replacement, state that it\'s a replacement and the file path right before the code block. If it\'s a new file, mention it\'s new and provide the file path.\n'
-        '3.  **Use Markdown:** All code and diff blocks must be enclosed in triple backticks (```). Specify the language (e.g., `python`, `diff`) where applicable.\n'
-        '4.  **No XML:** Do not use XML tags in your response.\n'
-        '\n'
-        '**Example of a Git Diff:**\n'
-        '```diff\n'
-        '--- a/src/main.js\n'
-        '+++ b/src/main.js\n'
-        '@@ -1,5 +1,5 @@\n'
-        ' function oldFunction() {\n'
-        '-    console.log("old");\n'
-        '+    console.log("new");\n'
-        ' }\n'
-        '```\n'
-        '</format_instruction>\n'
+        "\n<format_instruction>\n"
+        "Output code changes like this:\n"
+        "1) Use Git patches for edits. Start diff fences with ```diff\n"
+        "2) For full replacements or new files, state the action and file path on a line directly above the fence.\n"
+        "3) Wrap all code/diffs in triple backticks and specify the language when known (e.g., python, diff).\n"
+        "4) Do not use XML-like tags in responses.\n"
+        "\n"
+        "Example (git diff):\n"
+        "```diff\n"
+        "--- a/src/main.js\n"
+        "+++ b/src/main.js\n"
+        "@@ -1,3 +1,3 @@\n"
+        "-console.log('old')\n"
+        "+console.log('new')\n"
+        "```\n"
+        "</format_instruction>\n"
     )
 
     return context_str

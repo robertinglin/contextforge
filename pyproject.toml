@@ -1,6 +1,7 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
+
 
 [project]
 name = "contextforge"
@@ -18,7 +19,9 @@ classifiers = [
 
 # Pull in the standard patch parser used by the fallback in core.py
 dependencies = [
-  "patch>=1.16"
+  "patch>=1.16",
+  "pathspec>=0.12",
+  "pytest>=8.3.5",
 ]
 
 [project.urls]
@@ -30,3 +33,48 @@ include = ["contextforge*"]
 
 [tool.setuptools]
 include-package-data = false
+
+# -----------------------------------
+# Tooling configuration (lint/type/tests/coverage)
+# -----------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+# Forbid print() in library code
+extend-select = ["T201"]
+select = ["E", "F", "I", "UP", "B", "SIM", "W"]
+ignore = []
+
+
+[tool.mypy]
+python_version = "3.8"
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+show_error_codes = true
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["contextforge"]
+parallel = true
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 80
+
+# Optional docs extra so users can `pip install .[docs]` to build the site
+[project.optional-dependencies]
+docs = [
+  "mkdocs>=1.5",
+  "mkdocs-material>=9.5"
+]

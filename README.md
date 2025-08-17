@@ -5,6 +5,30 @@ ContextForge is a small toolkit for:
 - extracting diffs and full-file blocks from Markdown,
 - and applying robust, fuzzy-aware patches to text.
 
+## Pillars
+
+**Extraction** — Robustly parse fenced diffs and full-file blocks from Markdown.
+
+**Patch** — Apply unified diffs using a block-first strategy with contextual anchors and fuzzy fallbacks that preserve EOL style.
+
+**Commit** — Safely materialize planned edits with containment checks, optional atomic promotion, and optional backups.
+
+**Context** — Build a reproducible context bundle that includes a file tree and selected file contents with guardrails against path traversal.
+
+## Tooling & CI
+
+This repo includes pre-commit hooks, Ruff for linting/formatting, MyPy for types, and Pytest + Coverage. GitHub Actions runs the checks across Python 3.8–3.12.
+
+### Local dev
+```bash
+python -m pip install -U pip
+python -m pip install -e ".[docs]"
+pre-commit install
+ruff check . && ruff format --check .
+mypy contextforge
+pytest
+
+
 ## Install
 
 ```bash
