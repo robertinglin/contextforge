@@ -1,4 +1,4 @@
 
-class PathViolation:
-    "Called when there's a path violation"
+class PathViolation(PermissionError):
+    """Raised for path-traversal or other security violations."""
     pass

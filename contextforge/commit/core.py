@@ -28,13 +28,13 @@ class CommitSummary:
 def _normalized_path(base_real: str, rel_path: str) -> str:
     """
     Join and normalize a repository-relative path while enforcing containment.
-    Raises PermissionError if the resolved path escapes base_real.
+    Raises PathViolation if the resolved path escapes base_real.
     """
     target_path = os.path.join(base_real, *rel_path.split("/"))
     resolved = os.path.realpath(target_path)
     # Use commonpath for robust containment check (prefix checks are error-prone).
     if os.path.commonpath([base_real, resolved]) != base_real:
-        raise PermissionError(f"Path traversal attempt detected for '{rel_path}'")
+        raise PathViolation(f"Path traversal attempt detected for '{rel_path}'")
     return resolved
 
 

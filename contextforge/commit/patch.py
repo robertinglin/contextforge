@@ -4,14 +4,13 @@ from __future__ import annotations
 import difflib
 import logging
 import re
-import textwrap
 from typing import Dict, List, Optional, Tuple
 
+from .._logging import resolve_logger
 from ..errors.patch import PatchFailedError
 
 __all__ = ["patch_text", "fuzzy_patch_partial"]
 
-logger = logging.getLogger(__name__)
 
 
 # ---------- core helpers ----------
@@ -367,6 +366,7 @@ def _apply_hunk_block_style(
     hunk: Dict,
     threshold: float,
     start_hint: int,
+    log: logging.Logger,
 ) -> Tuple[List[str], int]:
     """
     Apply hunk using block-first approach, resolving ambiguity by distance to hint
@@ -377,23 +377,23 @@ def _apply_hunk_block_style(
     ctx_probe = _adaptive_ctx_window(lead_ctx, tail_ctx)
 
     # DEBUG: Log hunk details
-    logger.debug(f"\n=== APPLYING HUNK (start_hint={start_hint}) ===")
-    logger.debug(f"Hunk lines ({len(hunk['lines'])} total):")
+    log.debug(f"\n=== APPLYING HUNK (start_hint={start_hint}) ===")
+    log.debug(f"Hunk lines ({len(hunk['lines'])} total):")
     for i, line in enumerate(hunk['lines'][:10]):  # Show first 10 lines
-        logger.debug(f"  {i:3}: {repr(line)}")
+        log.debug(f"  {i:3}: {repr(line)}")
     if len(hunk['lines']) > 10:
-        logger.debug(f"  ... and {len(hunk['lines']) - 10} more lines")
-    logger.debug(f"Old content ({len(old_content)} lines): {old_content[:3] if old_content else '(empty)'}")
-    logger.debug(f"New content ({len(new_content)} lines): {new_content[:3] if new_content else '(empty)'}")
-    logger.debug(f"Lead context: {lead_ctx}")
-    logger.debug(f"Tail context: {tail_ctx}")
+        log.debug(f"  ... and {len(hunk['lines']) - 10} more lines")
+    log.debug(f"Old content ({len(old_content)} lines): {old_content[:3] if old_content else '(empty)'}")
+    log.debug(f"New content ({len(new_content)} lines): {new_content[:3] if new_content else '(empty)'}")
+    log.debug(f"Lead context: {lead_ctx}")
+    log.debug(f"Tail context: {tail_ctx}")
 
     # --- Step 0: composite block replace (from_lines -> to_lines) ---
     from_lines, to_lines = _compose_from_to(hunk["lines"])
     if any(ln for ln in hunk["lines"] if ln and ln[0] in " -") and len(from_lines) > 0:
         # Try exact, nearest to hint
         hits = _find_block_matches(target_lines, from_lines, loose=False)
-        logger.debug(f"Exact block match for {len(from_lines)} lines: {len(hits)} hits at positions {hits[:5]}")
+        log.debug(f"Exact block match for {len(from_lines)} lines: {len(hits)} hits at positions {hits[:5]}")
         if hits:
             i = min(hits, key=lambda p: abs(p - start_hint))
             new_lines = target_lines[:i] + to_lines + target_lines[i + len(from_lines):]
@@ -401,7 +401,7 @@ def _apply_hunk_block_style(
 
         # Try loose, nearest to hint
         hits_loose = _find_block_matches(target_lines, from_lines, loose=True)
-        logger.debug(f"Loose block match for {len(from_lines)} lines: {len(hits_loose)} hits at positions {hits_loose[:5]}")
+        log.debug(f"Loose block match for {len(from_lines)} lines: {len(hits_loose)} hits at positions {hits_loose[:5]}")
         if hits_loose:
             i = min(hits_loose, key=lambda p: abs(p - start_hint))
             new_lines = target_lines[:i] + to_lines + target_lines[i + len(from_lines):]
@@ -423,7 +423,7 @@ def _apply_hunk_block_style(
 
     # Pure addition (no old_content to find): insert using both lead & tail anchors.
     if not old_content:
-        logger.debug("Pure addition detected - using context anchors")
+        log.debug("Pure addition detected - using context anchors")
         ins_pos = _locate_insertion_index(target_lines, lead_ctx, tail_ctx, start_hint, ctx_probe)
         # Tiny structure bias hook (doesn't move insertion yet—kept conservative)
         new_lines = target_lines[:ins_pos] + new_content + target_lines[ins_pos:]
@@ -432,7 +432,7 @@ def _apply_hunk_block_style(
     # 1) Exact block match(es)
     exact = _find_block_matches(target_lines, old_content, loose=False)
     if exact:
-        logger.debug(f"Exact content match: {len(exact)} hits at positions {exact[:5]}")
+        log.debug(f"Exact content match: {len(exact)} hits at positions {exact[:5]}")
         def _score_exact(p: int) -> Tuple[int, int, int, int]:
             before = target_lines[max(0, p - ctx_probe):p]
             after = target_lines[p + len(old_content): p + len(old_content) + ctx_probe]
@@ -462,7 +462,7 @@ def _apply_hunk_block_style(
     # 2) Loose block match(es)
     loose = _find_block_matches(target_lines, old_content, loose=True)
     if loose:
-        logger.debug(f"Loose content match: {len(loose)} hits at positions {loose[:5]}")
+        log.debug(f"Loose content match: {len(loose)} hits at positions {loose[:5]}")
         def _score_loose(p: int) -> Tuple[int, int]:
             return (abs(p - start_hint), _structure_penalty(target_lines, p, new_content, lead_ctx))
         i = sorted(loose, key=_score_loose)[0]
@@ -470,14 +470,14 @@ def _apply_hunk_block_style(
         return new_lines, i + len(new_content)
 
     # 3) Fuzzy window (trimmed tokens). Be robust when old_content is longer than target.
-    logger.debug(f"\nFuzzy window search:")
-    logger.debug(f"  Looking for {len(old_content)} lines in {len(target_lines)} total lines")
-    logger.debug(f"  First 3 lines to match (trimmed):")
+    log.debug(f"\nFuzzy window search:")
+    log.debug(f"  Looking for {len(old_content)} lines in {len(target_lines)} total lines")
+    log.debug(f"  First 3 lines to match (trimmed):")
     for i, line in enumerate(old_content[:3]):
-        logger.debug(f"    {i}: {repr(line.strip())}")
-    logger.debug(f"  Actual file content around hint position {start_hint}:")
+        log.debug(f"    {i}: {repr(line.strip())}")
+    log.debug(f"  Actual file content around hint position {start_hint}:")
     for i in range(max(0, start_hint-1), min(len(target_lines), start_hint+4)):
-        logger.debug(f"    {i}: {repr(target_lines[i][:80])}")
+        log.debug(f"    {i}: {repr(target_lines[i][:80])}")
 
     m_full = len(old_content)
     n = len(target_lines)
@@ -499,29 +499,29 @@ def _apply_hunk_block_style(
 
         # Log high-scoring matches for debugging
         if ratio > 0.3:
-            logger.debug(f"    Position {i}: ratio={ratio:.3f}")
+            log.debug(f"    Position {i}: ratio={ratio:.3f}")
             if ratio > 0.5:
-                logger.debug(f"      Window preview: {b_trim[:2]}")
+                log.debug(f"      Window preview: {b_trim[:2]}")
 
         if (ratio > best_ratio or
             (ratio == best_ratio and abs(i - start_hint) < abs(best_index - start_hint))):
             best_ratio = ratio
             best_index = i
             if best_ratio == 1.0:
-                logger.debug(f"  Perfect match found at position {i}")
+                log.debug(f"  Perfect match found at position {i}")
                 break
 
-    logger.debug(f"  Best fuzzy match: ratio={best_ratio:.3f} at position {best_index}")
+    log.debug(f"  Best fuzzy match: ratio={best_ratio:.3f} at position {best_index}")
     if best_ratio < threshold:
-        logger.debug("\n  ⚠️  MATCH FAILURE ANALYSIS:")
-        logger.debug(f"  Expected to find these lines:")
+        log.debug("\n  ⚠️  MATCH FAILURE ANALYSIS:")
+        log.debug(f"  Expected to find these lines:")
         for i, line in enumerate(old_content[:min(5, len(old_content))]):
-            logger.debug(f"    - {repr(line)}")
+            log.debug(f"    - {repr(line)}")
         if len(old_content) > 5:
-            logger.debug(f"    ... and {len(old_content) - 5} more lines")
+            log.debug(f"    ... and {len(old_content) - 5} more lines")
 
         # --- FALLBACK 1: ANCHORED, WHITESPACE-INSENSITIVE "SURGICAL" MATCH ---
-        logger.debug("\n  💡 Attempting anchored, whitespace-insensitive fallback...")
+        log.debug("\n  💡 Attempting anchored, whitespace-insensitive fallback...")
         if old_content:
             anchor_line_stripped = old_content[0].strip()
             anchor_hits = [i for i, line in enumerate(target_lines) if line.strip() == anchor_line_stripped]
@@ -536,13 +536,13 @@ def _apply_hunk_block_style(
                         flat_consumed = _flatten_ws_outside_quotes("\n".join(current_consumed_lines))
                         if not flat_old_block.startswith(flat_consumed): break
                         if flat_consumed == flat_old_block:
-                            logger.debug(f"  ✅ Fallback success: Surgically matched {i + 1 - anchor_index} file lines from anchor {anchor_index}.")
+                            log.debug(f"  ✅ Fallback success: Surgically matched {i + 1 - anchor_index} file lines from anchor {anchor_index}.")
                             start, end = anchor_index, i + 1
                             new_lines = target_lines[:start] + new_content + target_lines[end:]
                             return new_lines, start + len(new_content)
 
         # --- FALLBACK 2: UNIQUE START AND END ANCHOR MATCH ---
-        logger.debug("\n  💡 Attempting unique end-anchor fallback...")
+        log.debug("\n  💡 Attempting unique end-anchor fallback...")
         if old_content and len(old_content) > 1:
             start_anchor_strip = old_content[0].strip()
             end_anchor_strip = next((line.strip() for line in reversed(old_content) if line.strip()), None)
@@ -553,18 +553,18 @@ def _apply_hunk_block_style(
 
                 if len(end_hits) == 1:
                     end_line_idx = end_hits[0]
-                    logger.debug(f"  ✅ Found unique end-anchor at line {end_line_idx}.")
+                    log.debug(f"  ✅ Found unique end-anchor at line {end_line_idx}.")
                     # Find the best start anchor that comes before this unique end
                     plausible_starts = [i for i in start_hits if i <= end_line_idx]
                     if plausible_starts:
                         start_line_idx = min(plausible_starts, key=lambda i: abs(i - start_hint))
-                        logger.debug(f"  Paired with best start-anchor at line {start_line_idx}. Replacing block.")
+                        log.debug(f"  Paired with best start-anchor at line {start_line_idx}. Replacing block.")
                         start, end = start_line_idx, end_line_idx + 1
                         new_lines = target_lines[:start] + new_content + target_lines[end:]
                         return new_lines, start + len(new_content)
 
         # --- FINAL FALLBACK: FIND BEST FUZZY BLOCK AND CREATE MERGE CONFLICT ---
-        logger.debug("\n  💡 All precise fallbacks failed. Attempting to find best fuzzy block for merge conflict...")
+        log.debug("\n  💡 All precise fallbacks failed. Attempting to find best fuzzy block for merge conflict...")
         if not old_content:
             raise PatchFailedError("All patch methods failed and cannot generate conflict for an empty block.")
 
@@ -589,7 +589,7 @@ def _apply_hunk_block_style(
         conflict_threshold = 0.25  # Lower threshold for creating a conflict vs. a clean patch
         if best_ratio >= conflict_threshold:
             start_line, end_line = anchor_index, best_end_line
-            logger.debug(f"  ✅ Found best fuzzy block match (ratio={best_ratio:.2f}) on lines [{start_line}-{end_line-1}]. Inserting merge conflict.")
+            log.debug(f"  ✅ Found best fuzzy block match (ratio={best_ratio:.2f}) on lines [{start_line}-{end_line-1}]. Inserting merge conflict.")
             original_block = target_lines[start_line:end_line]
             conflict_block = []
             conflict_block.append("<<<<<<< CURRENT CHANGE")
@@ -613,7 +613,7 @@ def _apply_hunk_block_style(
     raise PatchFailedError(f"Best match ratio {best_ratio:.2f} is below threshold {threshold:.2f}.")
 
 
-def patch_text(content: str, patch_str: str, threshold: float = 0.6) -> str:
+def patch_text(content: str, patch_str: str, threshold: float = 0.6, *, logger=None, log: bool = False) -> str:
     """
     Apply a patch string to the provided content.
 
@@ -626,6 +626,8 @@ def patch_text(content: str, patch_str: str, threshold: float = 0.6) -> str:
     Raises:
         PatchFailedError: if no acceptable match can be found for any hunk.
     """
+    log = resolve_logger(logger=logger, enabled=log, name=__name__, level=logging.DEBUG)
+
     if not patch_str.strip():
         return content
 
@@ -639,38 +641,38 @@ def patch_text(content: str, patch_str: str, threshold: float = 0.6) -> str:
     eol = _detect_eol(content)
     had_trailing_nl = content.endswith(("\r\n", "\n", "\r"))
 
-    dedented_patch = textwrap.dedent(patch_str).strip()
+    dedented_patch = patch_str.strip()
 
     # DEBUG: Show patch detection
-    logger.debug("\n=== PATCH PARSING ===")
-    logger.debug(f"Patch first 500 chars:\n{dedented_patch[:500]}")
-    logger.debug(f"\nChecking for standard diff pattern (@@ -N,N +N,N @@)...")
+    log.debug("\n=== PATCH PARSING ===")
+    log.debug(f"Patch first 500 chars:\n{dedented_patch[:500]}")
+    log.debug(f"\nChecking for standard diff pattern (@@ -N,N +N,N @@)...")
     # Look for standard unified diff header: @@ -start[,count] +start[,count] @@
     standard_match = re.search(r"^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@", dedented_patch, re.MULTILINE)
-    logger.debug(f"Standard diff pattern found: {bool(standard_match)}")
+    log.debug(f"Standard diff pattern found: {bool(standard_match)}")
 
     if not standard_match:
         # Check for simplified format
         has_simplified = '@@' in dedented_patch
-        logger.debug(f"Simplified format detected (contains @@): {has_simplified}")
+        log.debug(f"Simplified format detected (contains @@): {has_simplified}")
 
     # Decide which parser to use. If it looks like a standard diff, use the strict parser.
     # Otherwise, use the simplified '@@' separator parser.
-    if re.search(r"^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@", dedented_patch, re.MULTILINE):
+    if standard_match:
         hunks = _parse_patch_hunks(dedented_patch)
     else:
         hunks = _parse_simplified_patch_hunks(dedented_patch)
 
-    logger.debug(f"\nParsed {len(hunks)} hunks using {'standard' if standard_match else 'simplified'} parser")
+    log.debug(f"\nParsed {len(hunks)} hunks using {'standard' if standard_match else 'simplified'} parser")
     for i, h in enumerate(hunks):
-        logger.debug(f"  Hunk {i+1}: {len(h.get('lines', []))} lines")
+        log.debug(f"  Hunk {i+1}: {len(h.get('lines', []))} lines")
 
     current_lines = content.splitlines()
-    logger.debug(f"Target file has {len(current_lines)} lines")
+    log.debug(f"Target file has {len(current_lines)} lines")
     cursor = 0
 
     for i, h in enumerate(hunks):
-        logger.debug(f"\n{'='*60}\nProcessing Hunk #{i+1}/{len(hunks)}")
+        log.debug(f"\n{'='*60}\nProcessing Hunk #{i+1}/{len(hunks)}")
         lines = h.get("lines", [])
         pure_add = all(ln.startswith("+") or ln == "" for ln in lines) and any(ln.startswith("+") for ln in lines)
 
@@ -685,21 +687,23 @@ def patch_text(content: str, patch_str: str, threshold: float = 0.6) -> str:
         start_hint = header_hint if pure_add or not h.get("new_start") else max(0, min(len(current_lines), int(round(0.7 * cursor + 0.3 * header_hint))))
 
         try:
-            current_lines, cursor = _apply_hunk_block_style(current_lines, h, threshold, start_hint)
-            logger.debug(f"✓ Hunk #{i+1} applied successfully. New cursor position: {cursor}")
+            current_lines, cursor = _apply_hunk_block_style(current_lines, h, threshold, start_hint, log=log)
+            log.debug(f"✓ Hunk #{i+1} applied successfully. New cursor position: {cursor}")
         except PatchFailedError as e:
-            logger.debug(f"✗ Hunk #{i+1} FAILED: {e}")
+            log.debug(f"✗ Hunk #{i+1} FAILED: {e}")
             raise PatchFailedError(f"Failed to apply hunk #{i + 1}: {e}") from e
 
     return (eol.join(current_lines)) + (eol if had_trailing_nl else "")
 
-def fuzzy_patch_partial(content: str, patch_str: str, threshold: float = 0.6):
+def fuzzy_patch_partial(content: str, patch_str: str, threshold: float = 0.6, *, logger=None, log: bool = False):
     """
     Best-effort patching:
       - applies all hunks it can
       - returns (new_text, applied_indices, failed) where failed is a list of
         {index, error, lead_ctx, tail_ctx, old_content, new_content}
     """
+    log = resolve_logger(logger=logger, enabled=log, name=__name__, level=logging.DEBUG)
+
     if not patch_str.strip():
         return content, [], []
     def _detect_eol(s: str) -> str:
@@ -708,7 +712,7 @@ def fuzzy_patch_partial(content: str, patch_str: str, threshold: float = 0.6):
         return "\n"
     eol = _detect_eol(content)
     had_trailing_nl = content.endswith(("\r\n", "\n", "\r"))
-    hunks = _parse_patch_hunks(textwrap.dedent(patch_str).strip())
+    hunks = _parse_patch_hunks(patch_str.strip())
     current_lines = content.splitlines()
     cursor = 0
     applied, failed = [], []
@@ -718,7 +722,7 @@ def fuzzy_patch_partial(content: str, patch_str: str, threshold: float = 0.6):
         pure_add = all(ln.startswith("+") or ln == "" for ln in lines) and any(ln.startswith("+") for ln in lines)
         start_hint = header_hint if pure_add else max(0, min(len(current_lines), int(round(0.7 * cursor + 0.3 * header_hint))))
         try:
-            current_lines, cursor = _apply_hunk_block_style(current_lines, h, threshold, start_hint)
+            current_lines, cursor = _apply_hunk_block_style(current_lines, h, threshold, start_hint, log=log)
             applied.append(i)
         except PatchFailedError as e:
             old_content, new_content, _ctx = _split_hunk_components(h["lines"])
