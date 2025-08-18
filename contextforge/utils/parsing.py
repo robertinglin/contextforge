@@ -16,9 +16,10 @@ def _contains_truncation_marker(code: str) -> bool:
         r"\/\*.*\.\.\..*\*\/|"  # C-style multi-line on one line
         r"--.*\.\.\..*"  # SQL, Haskell
         r")",
-        re.MULTILINE
+        re.MULTILINE,
     )
     return truncation_pattern.search(code) is not None
+
 
 def _try_parse_comment_header(content: str) -> Optional[Dict[str, str]]:
     """
@@ -30,12 +31,10 @@ def _try_parse_comment_header(content: str) -> Optional[Dict[str, str]]:
         return None
 
     # A robust regex for various file paths within comments.
-    path_pattern = re.compile(
-        r"^\s*(?://|#|--|/\*|<!--)\s*(?P<path>[\w./-]+)[\s*/-]*$"
-    )
+    path_pattern = re.compile(r"^\s*(?://|#|--|/\*|<!--)\s*(?P<path>[\w./-]+)[\s*/-]*$")
     match = path_pattern.match(lines[0])
     if match:
         found_path = match.group("path")
-        if found_path and '.' in found_path:  # Basic sanity check for an extension
+        if found_path and "." in found_path:  # Basic sanity check for an extension
             return {"file_path": found_path, "code": "\n".join(lines[1:])}
     return None

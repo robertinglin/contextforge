@@ -11,6 +11,7 @@ def read(path):
     with open(path, encoding="utf-8") as f:
         return f.read()
 
+
 @pytest.mark.parametrize("atomic", [True, False])
 @pytest.mark.parametrize("backup_ext", [None, ".bak", "bak"])
 def test_backup_behavior_matrix(tmp_path, atomic, backup_ext):
@@ -19,7 +20,9 @@ def test_backup_behavior_matrix(tmp_path, atomic, backup_ext):
     (base / "existing.txt").write_text("old content")
     # New file
     changes = [
-        Change(path="existing.txt", new_content="new", original_content="old content", is_new=False),
+        Change(
+            path="existing.txt", new_content="new", original_content="old content", is_new=False
+        ),
         Change(path="new.txt", new_content="new", original_content="", is_new=True),
     ]
 
@@ -40,12 +43,13 @@ def test_backup_behavior_matrix(tmp_path, atomic, backup_ext):
     # No backup for new files
     assert not (base / "new.txt.bak").exists()
 
+
 def test_fail_fast_non_atomic_partial_write(tmp_path):
     base = tmp_path
     changes = [
         Change("a.txt", "A", "", is_new=True),
-        Change("../invalid.txt", "X", "", is_new=True), # This will fail
-        Change("b.txt", "B", "", is_new=True), # This should not be written
+        Change("../invalid.txt", "X", "", is_new=True),  # This will fail
+        Change("b.txt", "B", "", is_new=True),  # This should not be written
     ]
     summary = commit_changes(str(base), changes, mode="fail_fast", atomic=False)
 
@@ -55,16 +59,17 @@ def test_fail_fast_non_atomic_partial_write(tmp_path):
     assert (base / "a.txt").exists()
     assert not (base / "b.txt").exists()
 
+
 def test_atomic_promotion_rollback(tmp_path):
     base = tmp_path
     (base / "a.txt").write_text("original A")
     (base / "b.txt").write_text("original B")
-    (base / "c.txt").mkdir() # Make this a directory to cause os.replace to fail
+    (base / "c.txt").mkdir()  # Make this a directory to cause os.replace to fail
 
     changes = [
         Change("a.txt", "new A", "original A", is_new=False),
         Change("b.txt", "new B", "original B", is_new=False),
-        Change("c.txt", "new C", "", is_new=True), # This will fail on promotion
+        Change("c.txt", "new C", "", is_new=True),  # This will fail on promotion
     ]
 
     summary = commit_changes(str(base), changes, mode="fail_fast", atomic=True)
@@ -76,7 +81,8 @@ def test_atomic_promotion_rollback(tmp_path):
     # Assert rollback
     assert read(base / "a.txt") == "original A"
     assert read(base / "b.txt") == "original B"
-    assert (base / "c.txt").is_dir() # Should not have been replaced
+    assert (base / "c.txt").is_dir()  # Should not have been replaced
+
 
 @patch("tempfile.mkstemp")
 def test_staging_failure_cleanup(mock_mkstemp, tmp_path):
@@ -93,6 +99,7 @@ def test_staging_failure_cleanup(mock_mkstemp, tmp_path):
     temp_files = [f for f in os.listdir(base) if f.startswith(".cf-")]
     assert not temp_files
 
+
 def test_dry_run_permissions_probe(tmp_path):
     base = tmp_path
     unwritable_dir = tmp_path / "unwritable"
@@ -108,12 +115,13 @@ def test_dry_run_permissions_probe(tmp_path):
 
     summary = commit_changes(str(base), changes, mode="fail_fast", dry_run=True)
 
-    if os.name != 'nt':
+    if os.name != "nt":
         assert "unwritable/a.txt" in summary.failed
         assert "PermissionError" in summary.errors["unwritable/a.txt"]
 
     # cleanup
     os.chmod(unwritable_dir, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+
 
 def test_directory_creation(tmp_path):
     base = tmp_path

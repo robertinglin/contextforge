@@ -5,7 +5,9 @@ from contextforge.commit.patch import patch_text
 
 def _assert_eq(actual: str, expected: str, name: str):
     if actual != expected:
-        raise AssertionError(f"{name} failed:\n--- actual ---\n{actual}\n--- expected ---\n{expected}")
+        raise AssertionError(
+            f"{name} failed:\n--- actual ---\n{actual}\n--- expected ---\n{expected}"
+        )
 
 
 def test_duplicate_at_beginning():

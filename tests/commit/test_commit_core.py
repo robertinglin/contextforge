@@ -12,7 +12,9 @@ def test_best_effort_writes_and_reports_failures(tmp_path):
     # Path traversal should be blocked and reported.
     bad = Change(path="../evil.txt", new_content="X", original_content="", is_new=True)
 
-    summary = commit_changes(str(base), [good, bad], mode="best_effort", atomic=False, dry_run=False)
+    summary = commit_changes(
+        str(base), [good, bad], mode="best_effort", atomic=False, dry_run=False
+    )
     assert "a.txt" in summary.success
     assert "../evil.txt" in summary.failed
     assert (base / "a.txt").exists()

@@ -14,6 +14,7 @@ Design goals:
 - Zero-noise by default; consumers opt in by passing a logger or enabled flag.
 - Safe to import without configuring global logging.
 """
+
 from __future__ import annotations
 
 import logging

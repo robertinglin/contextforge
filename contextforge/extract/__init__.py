@@ -8,5 +8,5 @@ __all__ = [
     "extract_file_blocks_from_text",
     "extract_blocks_from_text",
     "detect_new_files",
-    "extract_file_info_from_context_and_code"
+    "extract_file_info_from_context_and_code",
 ]

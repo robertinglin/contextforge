@@ -25,9 +25,9 @@ def _build_context_string(request: Any) -> str:
     for file_path in request.files:
         try:
             # Build absolute path and enforce that it stays within the project directory.
-            full_path = os.path.join(base_real_path, *file_path.split('/'))
+            full_path = os.path.join(base_real_path, *file_path.split("/"))
 
-        # SECURITY CHECK: Ensure the resolved path is within the base project directory.
+            # SECURITY CHECK: Ensure the resolved path is within the base project directory.
             resolved_path = os.path.realpath(full_path)
             common_path = os.path.commonpath([base_real_path, resolved_path])
 
@@ -41,9 +41,9 @@ def _build_context_string(request: Any) -> str:
                 )
                 continue
 
-            with open(resolved_path, encoding='utf-8', errors='ignore') as f:
+            with open(resolved_path, encoding="utf-8", errors="ignore") as f:
                 content = f.read()
-            lang = os.path.splitext(file_path)[1].lstrip('.')
+            lang = os.path.splitext(file_path)[1].lstrip(".")
             context_str += f"File: {file_path}\n```{lang}\n{content}\n```\n\n"
         except OSError as e:
             raise ContextError(f"Failed to read file '{file_path}': {e}") from e

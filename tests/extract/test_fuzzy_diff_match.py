@@ -1,4 +1,3 @@
-
 # Import the contextforge version for testing
 import textwrap
 
@@ -10,7 +9,9 @@ from contextforge import patch_text as cf_fuzzy_patch
 # -----------------------
 def _assert_eq(actual: str, expected: str, name: str):
     if actual != expected:
-        raise AssertionError(f"{name} failed:\n--- actual ---\n{actual}\n--- expected ---\n{expected}")
+        raise AssertionError(
+            f"{name} failed:\n--- actual ---\n{actual}\n--- expected ---\n{expected}"
+        )
 
 
 def test_run_tests():
@@ -114,7 +115,9 @@ def test_run_tests():
     -scanQrButton.addEventListener('click', startQrScanner);
     """)
     after = cf_fuzzy_patch(before, patch)
-    assert "qrScanner:" not in after and "qrVideoStream" not in after and "qrAnimationId" not in after
+    assert (
+        "qrScanner:" not in after and "qrVideoStream" not in after and "qrAnimationId" not in after
+    )
     assert "viewName === 'qrScanner'" not in after and "scanQrButton.addEventListener" not in after
     tests_passed += 1
 
@@ -133,4 +136,3 @@ def test_run_tests():
     out = cf_fuzzy_patch(initial, patch)
     _assert_eq(out, expected, "block-first")
     tests_passed += 1
-

@@ -38,15 +38,17 @@ def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
     # Normalize diff blocks
     norm_diffs: List[Dict[str, Any]] = []
     for d in diffs:
-        norm_diffs.append({
-            "type": "diff",
-            "language": "diff",
-            "start": d.get("start", 0),
-            "end": d.get("end", 0),
-            "code": d.get("code", ""),
-            "file_path": d.get("file_path") or None,
-            "context": d.get("context"),
-        })
+        norm_diffs.append(
+            {
+                "type": "diff",
+                "language": "diff",
+                "start": d.get("start", 0),
+                "end": d.get("end", 0),
+                "code": d.get("code", ""),
+                "file_path": d.get("file_path") or None,
+                "context": d.get("context"),
+            }
+        )
 
     files = extract_file_blocks_from_text(markdown_content)
 
@@ -58,14 +60,16 @@ def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
         code = fb.get("code")
         if code is None:
             code = markdown_content[body_start:body_end].strip("\r\n")
-        norm_files.append({
-            "type": "file",
-            "language": fb.get("language", "plain"),
-            "start": body_start,
-            "end": body_end,
-            "code": code,
-            "file_path": fb.get("file_path") or None,
-        })
+        norm_files.append(
+            {
+                "type": "file",
+                "language": fb.get("language", "plain"),
+                "start": body_start,
+                "end": body_end,
+                "code": code,
+                "file_path": fb.get("file_path") or None,
+            }
+        )
 
     # Stable, deterministic ordering
     return sorted(norm_diffs + norm_files, key=lambda b: b["start"])

@@ -14,7 +14,7 @@ def _generate_tree_string(path: str, spec: pathspec.PathSpec) -> str:
             for item in os.listdir(current_path):
                 full_path = os.path.join(current_path, item)
                 # Normalize to POSIX-style paths for consistent PathSpec matching
-                relative_path = os.path.relpath(full_path, path).replace(os.sep, '/')
+                relative_path = os.path.relpath(full_path, path).replace(os.sep, "/")
                 # Append a trailing '/' for directories so patterns like 'dir/' match
                 probe = "/" + relative_path + ("/" if os.path.isdir(full_path) else "")
                 if not spec.match_file(probe):

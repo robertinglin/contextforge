@@ -11,8 +11,8 @@ from ..errors.patch import PatchFailedError
 __all__ = ["patch_text", "fuzzy_patch_partial"]
 
 
-
 # ---------- core helpers ----------
+
 
 def _compose_from_to(hunk_lines: list[str]) -> tuple[list[str], list[str]]:
     """Build 'from' (everything except '+') and 'to' (everything except '-') blocks."""
@@ -26,9 +26,9 @@ def _compose_from_to(hunk_lines: list[str]) -> tuple[list[str], list[str]]:
             continue
         tag = ln[0]
         body = ln[1:] if tag in " +-+" else ln  # tag handled below
-        if tag != '+':
+        if tag != "+":
             from_lines.append(body)
-        if tag != '-':
+        if tag != "-":
             to_lines.append(body)
     return from_lines, to_lines
 
@@ -44,10 +44,10 @@ def _find_block_end_by_braces(lines: list[str], start: int) -> int:
     for i in range(start, len(lines)):
         ln = lines[i]
         for ch in ln:
-            if ch == '{':
+            if ch == "{":
                 depth += 1
                 seen_open = True
-            elif ch == '}':
+            elif ch == "}":
                 depth -= 1
         if seen_open and depth <= 0:
             return i + 1
@@ -80,7 +80,7 @@ def _indent(s: str) -> int:
 def _brace_depth(lines: list[str], upto: int) -> int:
     """Very light brace-depth heuristic for C/JS-like code."""
     depth = 0
-    for ln in lines[:max(0, min(upto, len(lines)))]:
+    for ln in lines[: max(0, min(upto, len(lines)))]:
         for ch in ln:
             if ch in "{[(":
                 depth += 1
@@ -144,9 +144,13 @@ def _flatten_ws_outside_quotes(text: str) -> str:
     return "".join(out)
 
 
-def _structure_penalty(target: list[str], pos: int, new_content: list[str], lead_ctx: list[str]) -> int:
+def _structure_penalty(
+    target: list[str], pos: int, new_content: list[str], lead_ctx: list[str]
+) -> int:
     """Lower is better. Penalize positions whose indentation resembles context poorly."""
-    want_indent = _indent(lead_ctx[-1]) if lead_ctx else _indent(new_content[0] if new_content else "")
+    want_indent = (
+        _indent(lead_ctx[-1]) if lead_ctx else _indent(new_content[0] if new_content else "")
+    )
     have_indent = _indent(target[pos - 1]) if pos > 0 else 0
     indent_pen = abs(want_indent - have_indent)
     return min(indent_pen, 8)
@@ -186,6 +190,7 @@ def _parse_patch_hunks(patch_str: str) -> list[dict]:
         raise PatchFailedError("Patch string contains no valid hunks.")
     return hunks
 
+
 def _parse_simplified_patch_hunks(patch_str: str) -> list[dict]:
     """
     Parse patch string using '@@' as a simple hunk separator, ignoring line numbers.
@@ -199,10 +204,14 @@ def _parse_simplified_patch_hunks(patch_str: str) -> list[dict]:
     start_idx = 0
     for i, line in enumerate(lines):
         # Stop at first @@ or first actual diff line
-        if line.strip() == '@@':
+        if line.strip() == "@@":
             start_idx = i + 1  # Start after the @@
             break
-        if line and line[0] in ('+', '-', ' ') and not (line.startswith('--- ') or line.startswith('+++ ')):
+        if (
+            line
+            and line[0] in ("+", "-", " ")
+            and not (line.startswith("--- ") or line.startswith("+++ "))
+        ):
             start_idx = i
             break
 
@@ -210,7 +219,7 @@ def _parse_simplified_patch_hunks(patch_str: str) -> list[dict]:
     lines = lines[start_idx:]
 
     for line in lines:
-        if line.strip() == '@@':
+        if line.strip() == "@@":
             if current_hunk_lines:
                 hunks.append({"lines": current_hunk_lines})
                 current_hunk_lines = []
@@ -222,6 +231,7 @@ def _parse_simplified_patch_hunks(patch_str: str) -> list[dict]:
         hunks.append({"lines": current_hunk_lines})
 
     return hunks
+
 
 def _find_block_matches(target: list[str], block: list[str], loose: bool = False) -> list[int]:
     """Find all start indices where block appears in target."""
@@ -237,9 +247,9 @@ def _find_block_matches(target: list[str], block: list[str], loose: bool = False
                 ok = False
                 break
         else:
-                if target[i + j] != block[j]:
-                    ok = False
-                    break
+            if target[i + j] != block[j]:
+                ok = False
+                break
         if ok:
             matches.append(i)
     return matches
@@ -316,8 +326,8 @@ def _locate_insertion_index(
     if n == 0:
         return 0
 
-    lead_slice = lead_ctx[-min(ctx_probe, len(lead_ctx)):] if lead_ctx else []
-    tail_slice = tail_ctx[:min(ctx_probe, len(tail_ctx))] if tail_ctx else []
+    lead_slice = lead_ctx[-min(ctx_probe, len(lead_ctx)) :] if lead_ctx else []
+    tail_slice = tail_ctx[: min(ctx_probe, len(tail_ctx))] if tail_ctx else []
 
     lead_hits = _find_block_matches(target, lead_slice, loose=True) if lead_slice else []
     tail_hits = _find_block_matches(target, tail_slice, loose=True) if tail_slice else []
@@ -356,6 +366,7 @@ def _locate_insertion_index(
 
 # ---------- main application ----------
 
+
 def _apply_hunk_block_style(
     target_lines: list[str],
     hunk: dict,
@@ -374,12 +385,16 @@ def _apply_hunk_block_style(
     # DEBUG: Log hunk details
     log.debug(f"\n=== APPLYING HUNK (start_hint={start_hint}) ===")
     log.debug(f"Hunk lines ({len(hunk['lines'])} total):")
-    for i, line in enumerate(hunk['lines'][:10]):  # Show first 10 lines
+    for i, line in enumerate(hunk["lines"][:10]):  # Show first 10 lines
         log.debug(f"  {i:3}: {repr(line)}")
-    if len(hunk['lines']) > 10:
+    if len(hunk["lines"]) > 10:
         log.debug(f"  ... and {len(hunk['lines']) - 10} more lines")
-    log.debug(f"Old content ({len(old_content)} lines): {old_content[:3] if old_content else '(empty)'}")
-    log.debug(f"New content ({len(new_content)} lines): {new_content[:3] if new_content else '(empty)'}")
+    log.debug(
+        f"Old content ({len(old_content)} lines): {old_content[:3] if old_content else '(empty)'}"
+    )
+    log.debug(
+        f"New content ({len(new_content)} lines): {new_content[:3] if new_content else '(empty)'}"
+    )
     log.debug(f"Lead context: {lead_ctx}")
     log.debug(f"Tail context: {tail_ctx}")
 
@@ -388,23 +403,34 @@ def _apply_hunk_block_style(
     if any(ln for ln in hunk["lines"] if ln and ln[0] in " -") and len(from_lines) > 0:
         # Try exact, nearest to hint
         hits = _find_block_matches(target_lines, from_lines, loose=False)
-        log.debug(f"Exact block match for {len(from_lines)} lines: {len(hits)} hits at positions {hits[:5]}")
+        log.debug(
+            f"Exact block match for {len(from_lines)} lines: {len(hits)} hits at positions {hits[:5]}"
+        )
         if hits:
             i = min(hits, key=lambda p: abs(p - start_hint))
-            new_lines = target_lines[:i] + to_lines + target_lines[i + len(from_lines):]
+            new_lines = target_lines[:i] + to_lines + target_lines[i + len(from_lines) :]
             return new_lines, i + len(to_lines)
 
         # Try loose, nearest to hint
         hits_loose = _find_block_matches(target_lines, from_lines, loose=True)
-        log.debug(f"Loose block match for {len(from_lines)} lines: {len(hits_loose)} hits at positions {hits_loose[:5]}")
+        log.debug(
+            f"Loose block match for {len(from_lines)} lines: {len(hits_loose)} hits at positions {hits_loose[:5]}"
+        )
         if hits_loose:
             i = min(hits_loose, key=lambda p: abs(p - start_hint))
-            new_lines = target_lines[:i] + to_lines + target_lines[i + len(from_lines):]
+            new_lines = target_lines[:i] + to_lines + target_lines[i + len(from_lines) :]
             return new_lines, i + len(to_lines)
 
         # JS-ish brace-aware fallback: if lead has a likely function signature,
         # anchor there and replace to the balanced brace end.
-        sig = next((ln for ln in lead_ctx if ln.strip().startswith("function ") or "updateParentCheckboxState(" in ln), None)
+        sig = next(
+            (
+                ln
+                for ln in lead_ctx
+                if ln.strip().startswith("function ") or "updateParentCheckboxState(" in ln
+            ),
+            None,
+        )
         if sig:
             sig_hits = [k for k, ln in enumerate(target_lines) if _eq_loose(ln, sig)]
             if sig_hits:
@@ -428,40 +454,53 @@ def _apply_hunk_block_style(
     exact = _find_block_matches(target_lines, old_content, loose=False)
     if exact:
         log.debug(f"Exact content match: {len(exact)} hits at positions {exact[:5]}")
+
         def _score_exact(p: int) -> tuple[int, int, int, int]:
-            before = target_lines[max(0, p - ctx_probe):p]
-            after = target_lines[p + len(old_content): p + len(old_content) + ctx_probe]
-            lead_hit = 0 if not lead_ctx else int(
-                difflib.SequenceMatcher(
-                    None,
-                    [x.strip() for x in lead_ctx[-min(ctx_probe, len(lead_ctx)):]],
-                    [x.strip() for x in before[-min(ctx_probe, len(before)):]],
-                    autojunk=False,
-                ).ratio() * 1000
+            before = target_lines[max(0, p - ctx_probe) : p]
+            after = target_lines[p + len(old_content) : p + len(old_content) + ctx_probe]
+            lead_hit = (
+                0
+                if not lead_ctx
+                else int(
+                    difflib.SequenceMatcher(
+                        None,
+                        [x.strip() for x in lead_ctx[-min(ctx_probe, len(lead_ctx)) :]],
+                        [x.strip() for x in before[-min(ctx_probe, len(before)) :]],
+                        autojunk=False,
+                    ).ratio()
+                    * 1000
+                )
             )
-            tail_hit = 0 if not tail_ctx else int(
-                difflib.SequenceMatcher(
-                    None,
-                    [x.strip() for x in tail_ctx[:min(ctx_probe, len(tail_ctx))]],
-                    [x.strip() for x in after[:min(ctx_probe, len(after))]],
-                    autojunk=False,
-                ).ratio() * 1000
+            tail_hit = (
+                0
+                if not tail_ctx
+                else int(
+                    difflib.SequenceMatcher(
+                        None,
+                        [x.strip() for x in tail_ctx[: min(ctx_probe, len(tail_ctx))]],
+                        [x.strip() for x in after[: min(ctx_probe, len(after))]],
+                        autojunk=False,
+                    ).ratio()
+                    * 1000
+                )
             )
             struct_pen = _structure_penalty(target_lines, p, new_content, lead_ctx)
             return (abs(p - start_hint), -(lead_hit + tail_hit), struct_pen, p)
 
         i = sorted(exact, key=_score_exact)[0]
-        new_lines = target_lines[:i] + new_content + target_lines[i + len(old_content):]
+        new_lines = target_lines[:i] + new_content + target_lines[i + len(old_content) :]
         return new_lines, i + len(new_content)
 
     # 2) Loose block match(es)
     loose = _find_block_matches(target_lines, old_content, loose=True)
     if loose:
         log.debug(f"Loose content match: {len(loose)} hits at positions {loose[:5]}")
+
         def _score_loose(p: int) -> tuple[int, int]:
             return (abs(p - start_hint), _structure_penalty(target_lines, p, new_content, lead_ctx))
+
         i = sorted(loose, key=_score_loose)[0]
-        new_lines = target_lines[:i] + new_content + target_lines[i + len(old_content):]
+        new_lines = target_lines[:i] + new_content + target_lines[i + len(old_content) :]
         return new_lines, i + len(new_content)
 
     # 3) Fuzzy window (trimmed tokens). Be robust when old_content is longer than target.
@@ -471,7 +510,7 @@ def _apply_hunk_block_style(
     for i, line in enumerate(old_content[:3]):
         log.debug(f"    {i}: {repr(line.strip())}")
     log.debug(f"  Actual file content around hint position {start_hint}:")
-    for i in range(max(0, start_hint-1), min(len(target_lines), start_hint+4)):
+    for i in range(max(0, start_hint - 1), min(len(target_lines), start_hint + 4)):
         log.debug(f"    {i}: {repr(target_lines[i][:80])}")
 
     m_full = len(old_content)
@@ -488,7 +527,7 @@ def _apply_hunk_block_style(
     a_trim = a_trim_full[:m]
 
     for i in range(n - m + 1):
-        window = target_lines[i:i + m]
+        window = target_lines[i : i + m]
         b_trim = [x.strip() for x in window]
         ratio = difflib.SequenceMatcher(None, a_trim, b_trim, autojunk=False).ratio()
 
@@ -498,8 +537,9 @@ def _apply_hunk_block_style(
             if ratio > 0.5:
                 log.debug(f"      Window preview: {b_trim[:2]}")
 
-        if (ratio > best_ratio or
-            (ratio == best_ratio and abs(i - start_hint) < abs(best_index - start_hint))):
+        if ratio > best_ratio or (
+            ratio == best_ratio and abs(i - start_hint) < abs(best_index - start_hint)
+        ):
             best_ratio = ratio
             best_index = i
             if best_ratio == 1.0:
@@ -510,7 +550,7 @@ def _apply_hunk_block_style(
     if best_ratio < threshold:
         log.debug("\n  ⚠️  MATCH FAILURE ANALYSIS:")
         log.debug("  Expected to find these lines:")
-        for _i, line in enumerate(old_content[:min(5, len(old_content))]):
+        for _i, line in enumerate(old_content[: min(5, len(old_content))]):
             log.debug(f"    - {repr(line)}")
         if len(old_content) > 5:
             log.debug(f"    ... and {len(old_content) - 5} more lines")
@@ -519,7 +559,9 @@ def _apply_hunk_block_style(
         log.debug("\n  💡 Attempting anchored, whitespace-insensitive fallback...")
         if old_content:
             anchor_line_stripped = old_content[0].strip()
-            anchor_hits = [i for i, line in enumerate(target_lines) if line.strip() == anchor_line_stripped]
+            anchor_hits = [
+                i for i, line in enumerate(target_lines) if line.strip() == anchor_line_stripped
+            ]
             if anchor_hits:
                 sorted_anchors = sorted(anchor_hits, key=lambda i: abs(i - start_hint))
                 flat_old_block = _flatten_ws_outside_quotes("\n".join(old_content))
@@ -528,11 +570,15 @@ def _apply_hunk_block_style(
                     # (though it usually succeeds on the first try if it's going to work)
                     for i in range(anchor_index, len(target_lines)):
                         current_consumed_lines = target_lines[anchor_index : i + 1]
-                        flat_consumed = _flatten_ws_outside_quotes("\n".join(current_consumed_lines))
+                        flat_consumed = _flatten_ws_outside_quotes(
+                            "\n".join(current_consumed_lines)
+                        )
                         if not flat_old_block.startswith(flat_consumed):
                             break
                         if flat_consumed == flat_old_block:
-                            log.debug(f"  ✅ Fallback success: Surgically matched {i + 1 - anchor_index} file lines from anchor {anchor_index}.")
+                            log.debug(
+                                f"  ✅ Fallback success: Surgically matched {i + 1 - anchor_index} file lines from anchor {anchor_index}."
+                            )
                             start, end = anchor_index, i + 1
                             new_lines = target_lines[:start] + new_content + target_lines[end:]
                             return new_lines, start + len(new_content)
@@ -541,10 +587,14 @@ def _apply_hunk_block_style(
         log.debug("\n  💡 Attempting unique end-anchor fallback...")
         if old_content and len(old_content) > 1:
             start_anchor_strip = old_content[0].strip()
-            end_anchor_strip = next((line.strip() for line in reversed(old_content) if line.strip()), None)
+            end_anchor_strip = next(
+                (line.strip() for line in reversed(old_content) if line.strip()), None
+            )
 
             if start_anchor_strip and end_anchor_strip:
-                start_hits = [i for i, k in enumerate(target_lines) if k.strip() == start_anchor_strip]
+                start_hits = [
+                    i for i, k in enumerate(target_lines) if k.strip() == start_anchor_strip
+                ]
                 end_hits = [i for i, k in enumerate(target_lines) if k.strip() == end_anchor_strip]
 
                 if len(end_hits) == 1:
@@ -554,21 +604,31 @@ def _apply_hunk_block_style(
                     plausible_starts = [i for i in start_hits if i <= end_line_idx]
                     if plausible_starts:
                         start_line_idx = min(plausible_starts, key=lambda i: abs(i - start_hint))
-                        log.debug(f"  Paired with best start-anchor at line {start_line_idx}. Replacing block.")
+                        log.debug(
+                            f"  Paired with best start-anchor at line {start_line_idx}. Replacing block."
+                        )
                         start, end = start_line_idx, end_line_idx + 1
                         new_lines = target_lines[:start] + new_content + target_lines[end:]
                         return new_lines, start + len(new_content)
 
         # --- FINAL FALLBACK: FIND BEST FUZZY BLOCK AND CREATE MERGE CONFLICT ---
-        log.debug("\n  💡 All precise fallbacks failed. Attempting to find best fuzzy block for merge conflict...")
+        log.debug(
+            "\n  💡 All precise fallbacks failed. Attempting to find best fuzzy block for merge conflict..."
+        )
         if not old_content:
-            raise PatchFailedError("All patch methods failed and cannot generate conflict for an empty block.")
+            raise PatchFailedError(
+                "All patch methods failed and cannot generate conflict for an empty block."
+            )
 
         anchor_line_stripped = old_content[0].strip()
-        anchor_hits = [i for i, line in enumerate(target_lines) if line.strip() == anchor_line_stripped]
+        anchor_hits = [
+            i for i, line in enumerate(target_lines) if line.strip() == anchor_line_stripped
+        ]
 
         if not anchor_hits:
-            raise PatchFailedError("Final fallback failed: Anchor line for merge conflict not found.")
+            raise PatchFailedError(
+                "Final fallback failed: Anchor line for merge conflict not found."
+            )
 
         sorted_anchors = sorted(anchor_hits, key=lambda i: abs(i - start_hint))
         anchor_index = sorted_anchors[0]
@@ -576,17 +636,25 @@ def _apply_hunk_block_style(
         best_ratio = -1.0
         best_end_line = -1
 
-        search_end = min(len(target_lines), anchor_index + len(old_content) * 2 + 20) # Search a reasonable distance
-        for i in range(anchor_index, search_end): # Expand window from anchor
-            flat_current_block = _flatten_ws_outside_quotes("\n".join(target_lines[anchor_index : i + 1]))
-            ratio = difflib.SequenceMatcher(None, flat_current_block, flat_old_block, autojunk=False).ratio()
+        search_end = min(
+            len(target_lines), anchor_index + len(old_content) * 2 + 20
+        )  # Search a reasonable distance
+        for i in range(anchor_index, search_end):  # Expand window from anchor
+            flat_current_block = _flatten_ws_outside_quotes(
+                "\n".join(target_lines[anchor_index : i + 1])
+            )
+            ratio = difflib.SequenceMatcher(
+                None, flat_current_block, flat_old_block, autojunk=False
+            ).ratio()
             if ratio > best_ratio:
                 best_ratio, best_end_line = ratio, i + 1
 
         conflict_threshold = 0.25  # Lower threshold for creating a conflict vs. a clean patch
         if best_ratio >= conflict_threshold:
             start_line, end_line = anchor_index, best_end_line
-            log.debug(f"  ✅ Found best fuzzy block match (ratio={best_ratio:.2f}) on lines [{start_line}-{end_line-1}]. Inserting merge conflict.")
+            log.debug(
+                f"  ✅ Found best fuzzy block match (ratio={best_ratio:.2f}) on lines [{start_line}-{end_line - 1}]. Inserting merge conflict."
+            )
             original_block = target_lines[start_line:end_line]
             conflict_block = []
             conflict_block.append("<<<<<<< CURRENT CHANGE")
@@ -598,12 +666,13 @@ def _apply_hunk_block_style(
             new_lines = target_lines[:start_line] + conflict_block + target_lines[end_line:]
             return new_lines, start_line + len(conflict_block)
         else:
-            raise PatchFailedError(f"Final fallback failed: Best fuzzy block ratio ({best_ratio:.2f}) is below conflict threshold ({conflict_threshold}).")
-
+            raise PatchFailedError(
+                f"Final fallback failed: Best fuzzy block ratio ({best_ratio:.2f}) is below conflict threshold ({conflict_threshold})."
+            )
 
     if best_ratio >= threshold and best_index != -1:
         i = best_index
-        new_lines = target_lines[:i] + new_content + target_lines[i + m:]
+        new_lines = target_lines[:i] + new_content + target_lines[i + m :]
 
         return new_lines, i + len(new_content)
 
@@ -666,16 +735,16 @@ def patch_text(
                 else:
                     break
             head = old[:head_len]
-            tail = old[len(old) - tail_len:] if tail_len else ""
-            mid_new = new[head_len: len(new) - tail_len if tail_len else None]
+            tail = old[len(old) - tail_len :] if tail_len else ""
+            mid_new = new[head_len : len(new) - tail_len if tail_len else None]
             # Try structured head/tail replacement first
             if head and tail:
                 start = text.find(head)
                 if start != -1:
                     end = text.find(tail, start + len(head))
                     if end != -1:
-                        log.debug(f"[{i}] sentinel replace between head/tail (len={end-start})")
-                        text = text[:start + len(head)] + mid_new + text[end:]
+                        log.debug(f"[{i}] sentinel replace between head/tail (len={end - start})")
+                        text = text[: start + len(head)] + mid_new + text[end:]
                         continue
             # Fallback to exact replacement
             if old in text:
@@ -705,12 +774,14 @@ def patch_text(
     log.debug(f"Patch first 500 chars:\n{dedented_patch[:500]}")
     log.debug("\nChecking for standard diff pattern (@@ -N,N +N,N @@)...")
     # Look for standard unified diff header: @@ -start[,count] +start[,count] @@
-    standard_match = re.search(r"^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@", dedented_patch, re.MULTILINE)
+    standard_match = re.search(
+        r"^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@", dedented_patch, re.MULTILINE
+    )
     log.debug(f"Standard diff pattern found: {bool(standard_match)}")
 
     if not standard_match:
         # Check for simplified format
-        has_simplified = '@@' in dedented_patch
+        has_simplified = "@@" in dedented_patch
         log.debug(f"Simplified format detected (contains @@): {has_simplified}")
 
     # Decide which parser to use. If it looks like a standard diff, use the strict parser.
@@ -722,18 +793,22 @@ def patch_text(
     if not hunks:
         raise PatchFailedError("no valid hunks")
 
-    log.debug(f"\nParsed {len(hunks)} hunks using {'standard' if standard_match else 'simplified'} parser")
+    log.debug(
+        f"\nParsed {len(hunks)} hunks using {'standard' if standard_match else 'simplified'} parser"
+    )
     for i, h in enumerate(hunks):
-        log.debug(f"  Hunk {i+1}: {len(h.get('lines', []))} lines")
+        log.debug(f"  Hunk {i + 1}: {len(h.get('lines', []))} lines")
 
     current_lines = content.splitlines()
     log.debug(f"Target file has {len(current_lines)} lines")
     cursor = 0
 
     for i, h in enumerate(hunks):
-        log.debug(f"\n{'='*60}\nProcessing Hunk #{i+1}/{len(hunks)}")
+        log.debug(f"\n{'=' * 60}\nProcessing Hunk #{i + 1}/{len(hunks)}")
         lines = h.get("lines", [])
-        pure_add = all(ln.startswith("+") or ln == "" for ln in lines) and any(ln.startswith("+") for ln in lines)
+        pure_add = all(ln.startswith("+") or ln == "" for ln in lines) and any(
+            ln.startswith("+") for ln in lines
+        )
 
         # Generate start_hint: use header if available, otherwise use previous cursor.
         if h.get("new_start"):
@@ -743,18 +818,27 @@ def patch_text(
             header_hint = cursor
 
         # Use a simpler hint calculation for pure adds or when no header is present
-        start_hint = header_hint if pure_add or not h.get("new_start") else max(0, min(len(current_lines), int(round(0.7 * cursor + 0.3 * header_hint))))
+        start_hint = (
+            header_hint
+            if pure_add or not h.get("new_start")
+            else max(0, min(len(current_lines), int(round(0.7 * cursor + 0.3 * header_hint))))
+        )
 
         try:
-            current_lines, cursor = _apply_hunk_block_style(current_lines, h, threshold, start_hint, log=log)
-            log.debug(f"✓ Hunk #{i+1} applied successfully. New cursor position: {cursor}")
+            current_lines, cursor = _apply_hunk_block_style(
+                current_lines, h, threshold, start_hint, log=log
+            )
+            log.debug(f"✓ Hunk #{i + 1} applied successfully. New cursor position: {cursor}")
         except PatchFailedError as e:
-            log.debug(f"✗ Hunk #{i+1} FAILED: {e}")
+            log.debug(f"✗ Hunk #{i + 1} FAILED: {e}")
             raise PatchFailedError(f"Failed to apply hunk #{i + 1}: {e}") from e
 
     return (eol.join(current_lines)) + (eol if had_trailing_nl else "")
 
-def fuzzy_patch_partial(content: str, patch_str: str, threshold: float = 0.6, *, logger=None, log: bool = False):
+
+def fuzzy_patch_partial(
+    content: str, patch_str: str, threshold: float = 0.6, *, logger=None, log: bool = False
+):
     """
     Best-effort patching:
       - applies all hunks it can
@@ -765,12 +849,14 @@ def fuzzy_patch_partial(content: str, patch_str: str, threshold: float = 0.6, *,
 
     if not patch_str.strip():
         return content, [], []
+
     def _detect_eol(s: str) -> str:
         if "\r\n" in s:
             return "\r\n"
         if "\r" in s:
             return "\r"
         return "\n"
+
     eol = _detect_eol(content)
     had_trailing_nl = content.endswith(("\r\n", "\n", "\r"))
     hunks = _parse_patch_hunks(patch_str.strip())
@@ -780,25 +866,33 @@ def fuzzy_patch_partial(content: str, patch_str: str, threshold: float = 0.6, *,
     for i, h in enumerate(hunks):
         header_hint = min(len(current_lines), max(0, int(h.get("new_start", 1)) - 1))
         lines = h.get("lines", [])
-        pure_add = all(ln.startswith("+") or ln == "" for ln in lines) and any(ln.startswith("+") for ln in lines)
-        start_hint = header_hint if pure_add else max(0, min(len(current_lines), int(round(0.7 * cursor + 0.3 * header_hint))))
+        pure_add = all(ln.startswith("+") or ln == "" for ln in lines) and any(
+            ln.startswith("+") for ln in lines
+        )
+        start_hint = (
+            header_hint
+            if pure_add
+            else max(0, min(len(current_lines), int(round(0.7 * cursor + 0.3 * header_hint))))
+        )
         try:
-            current_lines, cursor = _apply_hunk_block_style(current_lines, h, threshold, start_hint, log=log)
+            current_lines, cursor = _apply_hunk_block_style(
+                current_lines, h, threshold, start_hint, log=log
+            )
             applied.append(i)
         except PatchFailedError as e:
             old_content, new_content, _ctx = _split_hunk_components(h["lines"])
             lead_ctx, tail_ctx = _split_lead_tail_context(h["lines"])
-            failed.append({
-                "index": i,
-                "error": str(e),
-                "lead_ctx": lead_ctx,
-                "tail_ctx": tail_ctx,
-                "old_content": old_content,
-                "new_content": new_content,
-                "header_hint": header_hint,
-            })
+            failed.append(
+                {
+                    "index": i,
+                    "error": str(e),
+                    "lead_ctx": lead_ctx,
+                    "tail_ctx": tail_ctx,
+                    "old_content": old_content,
+                    "new_content": new_content,
+                    "header_hint": header_hint,
+                }
+            )
             # continue; do not raise
     new_text = eol.join(current_lines) + (eol if had_trailing_nl else "")
     return new_text, applied, failed
-
-

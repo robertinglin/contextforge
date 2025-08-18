@@ -14,6 +14,7 @@ CONTEXT_LINES = 5
 # Fence tokenization & helpers
 # =============================
 
+
 def _line_bounds(text: str, idx: int) -> tuple[int, int]:
     if idx < 0:
         idx = 0
@@ -55,11 +56,19 @@ def _tokenize_fences(text: str) -> list[FenceToken]:
                 before = text[ls:i]
                 after = text[j:le]
                 info_tok = _first_token(after)
-                tokens.append(FenceToken(
-                    start=i, end=j, char=ch, length=run,
-                    before=before, after=after, info_first_token=info_tok,
-                    line_start=ls, line_end=le
-                ))
+                tokens.append(
+                    FenceToken(
+                        start=i,
+                        end=j,
+                        char=ch,
+                        length=run,
+                        before=before,
+                        after=after,
+                        info_first_token=info_tok,
+                        line_start=ls,
+                        line_end=le,
+                    )
+                )
                 i = j
                 continue
         i += 1
@@ -70,10 +79,11 @@ def _tokenize_fences(text: str) -> list[FenceToken]:
 # Diff heuristics
 # =============================
 
+
 def _looks_like_diff(text: str) -> bool:
     if "diff --git " in text:
         return True
-    if ("--- " in text and "+++ " in text):
+    if "--- " in text and "+++ " in text:
         return True
     return bool(re.search(r"^\s*@@\s+-\d+", text, flags=re.MULTILINE))
 
@@ -85,9 +95,9 @@ def _diff_score(text: str) -> float:
     lines = text.splitlines()
     count_diff_git = sum(1 for ln in lines if ln.startswith("diff --git "))
     count_minus_hdr = sum(1 for ln in lines if ln.startswith("--- "))
-    count_plus_hdr  = sum(1 for ln in lines if ln.startswith("+++ "))
-    count_hunks     = sum(1 for ln in lines if ln.startswith("@@"))
-    count_add_rm    = sum(1 for ln in lines if ln.startswith("+") or ln.startswith("-"))
+    count_plus_hdr = sum(1 for ln in lines if ln.startswith("+++ "))
+    count_hunks = sum(1 for ln in lines if ln.startswith("@@"))
+    count_add_rm = sum(1 for ln in lines if ln.startswith("+") or ln.startswith("-"))
     score = 0.0
     score += 5.0 * count_diff_git
     if count_minus_hdr and count_plus_hdr:
@@ -100,6 +110,7 @@ def _diff_score(text: str) -> float:
 # =============================
 # Pairing (outside-in)
 # =============================
+
 
 def _best_close_for_open(text: str, tokens: list[FenceToken], open_idx: int) -> int | None:
     """
@@ -128,7 +139,7 @@ def _best_close_for_open(text: str, tokens: list[FenceToken], open_idx: int) -> 
             continue
 
         # Provisional body for scoring only
-        body = text[body_start:close_tok.start]
+        body = text[body_start : close_tok.start]
         score = _diff_score(body)
         if opener_lang in ("diff", "patch") and not _looks_like_diff(body):
             score *= 0.2
@@ -136,7 +147,6 @@ def _best_close_for_open(text: str, tokens: list[FenceToken], open_idx: int) -> 
         # Prefer boundaries that also start another diff on the same line
         if is_inline_opener:
             score += 2.0
-
 
         if score > best_score:
             best_score = score
@@ -190,6 +200,7 @@ def _body_slice_for_open(text: str, open_tok: FenceToken, close_tok: FenceToken)
 # Multi-file splitting
 # =============================
 
+
 def _split_multi_file_diff(diff_text: str) -> list[tuple[str, str]]:
     """
     Split a (possibly multi-file) diff into per-file chunks.
@@ -218,17 +229,17 @@ def _split_multi_file_diff(diff_text: str) -> list[tuple[str, str]]:
         # Handles `diff --git a/old/path b/new/path` -> we want `new/path`
         m = re.match(r"^diff --git a/.+? b/(.+)$", line)
         if m:
-            return m.group(1).strip().split('\t')[0].replace('\\', '/')
+            return m.group(1).strip().split("\t")[0].replace("\\", "/")
 
         m = re.match(r"^\+\+\+ (?:b/)?(.+)$", line)
         if m:
-            return m.group(1).strip().split('\t')[0].replace('\\', '/')
+            return m.group(1).strip().split("\t")[0].replace("\\", "/")
 
         m = re.match(r"^--- (?:a/)?(.+)$", line)
         if m:
-            path = m.group(1).strip().split('\t')[0]
-            if path != '/dev/null':
-                return path.replace('\\', '/')
+            path = m.group(1).strip().split("\t")[0]
+            if path != "/dev/null":
+                return path.replace("\\", "/")
         return None
 
     for ln in lines:
@@ -258,6 +269,7 @@ def _split_multi_file_diff(diff_text: str) -> list[tuple[str, str]]:
 # =============================
 # Public API
 # =============================
+
 
 def extract_diffs_from_text(
     markdown_content: str,
@@ -320,7 +332,9 @@ def extract_diffs_from_text(
         # treat this as a malformed diff and raise with a helpful location.
         if is_explicit_diff and not _looks_like_diff(body):
             line_no = _line_index_for_charpos(text, open_tok.start) + 1  # 1-based
-            raise ExtractError(f"Malformed diff fence near line {line_no}: expected a unified diff body.")
+            raise ExtractError(
+                f"Malformed diff fence near line {line_no}: expected a unified diff body."
+            )
 
         if not is_explicit_diff and not _looks_like_diff(body) and _diff_score(body) < 4.0:
             i += 1
@@ -334,18 +348,28 @@ def extract_diffs_from_text(
         for file_path, chunk_text in file_chunks:
             if not chunk_text.strip():
                 continue
-            results.append({
-                "code": chunk_text.strip("\n"),
-                "lang": "diff",
-                "file_path": file_path,
-                "start": body_start,
-                "end": body_end,
-                "open_fence": {"char": open_tok.char, "length": open_tok.length,
-                               "start": open_tok.start, "end": open_tok.end},
-                "close_fence": {"char": close_tok.char, "length": close_tok.length,
-                                "start": close_tok.start, "end": close_tok.end},
-                "context": _context_before(text, open_tok.start, CONTEXT_LINES),
-            })
+            results.append(
+                {
+                    "code": chunk_text.strip("\n"),
+                    "lang": "diff",
+                    "file_path": file_path,
+                    "start": body_start,
+                    "end": body_end,
+                    "open_fence": {
+                        "char": open_tok.char,
+                        "length": open_tok.length,
+                        "start": open_tok.start,
+                        "end": open_tok.end,
+                    },
+                    "close_fence": {
+                        "char": close_tok.char,
+                        "length": close_tok.length,
+                        "start": close_tok.start,
+                        "end": close_tok.end,
+                    },
+                    "context": _context_before(text, open_tok.start, CONTEXT_LINES),
+                }
+            )
 
         # If the closer line also begins the next diff (e.g., ``````diff),
         # let the main loop see this same token again as the opener.
@@ -360,15 +384,17 @@ def extract_diffs_from_text(
     if not results and _looks_like_diff(text):
         file_chunks = _split_multi_file_diff(text) or [("", text)]
         for file_path, chunk in file_chunks:
-            results.append({
-                "code": chunk.strip(),
-                "lang": "diff",
-                "start": 0,
-                "file_path": file_path,
-                "end": len(text),
-                "open_fence": None,
-                "close_fence": None,
-                "context": "Raw patch provided as input.",
-            })
+            results.append(
+                {
+                    "code": chunk.strip(),
+                    "lang": "diff",
+                    "start": 0,
+                    "file_path": file_path,
+                    "end": len(text),
+                    "open_fence": None,
+                    "close_fence": None,
+                    "context": "Raw patch provided as input.",
+                }
+            )
 
     return results

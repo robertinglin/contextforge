@@ -11,6 +11,7 @@ from .diffs import CONTEXT_LINES
 # Fence tokenization
 # =============================
 
+
 def _line_bounds(text: str, idx: int) -> tuple[int, int]:
     if idx < 0:
         idx = 0
@@ -44,11 +45,19 @@ def _tokenize_fences(text: str) -> list[FenceToken]:
                 before = text[ls:i]
                 after = text[j:le]
                 info_tok = _first_token(after)
-                tokens.append(FenceToken(
-                    start=i, end=j, char=ch, length=run,
-                    before=before, after=after, info_first_token=info_tok,
-                    line_start=ls, line_end=le
-                ))
+                tokens.append(
+                    FenceToken(
+                        start=i,
+                        end=j,
+                        char=ch,
+                        length=run,
+                        before=before,
+                        after=after,
+                        info_first_token=info_tok,
+                        line_start=ls,
+                        line_end=le,
+                    )
+                )
                 i = j
                 continue
         i += 1
@@ -71,32 +80,33 @@ def _line_index_for_charpos(text: str, pos: int) -> int:
 # =============================
 
 # NOTE: CHANGE — allow bare filenames like README.md (no slashes)
-_PATH_UNIX = r'(?:\.?/)?(?:[\w.\-]+/)+[\w.\-]+\.[A-Za-z0-9]{1,8}'
-_PATH_WIN  = r'(?:[A-Za-z]:\\)?(?:[\w.\-]+\\)+[\w.\-]+\.[A-Za-z0-9]{1,8}'
-_FILENAME  = r'[\w.\-]+\.[A-Za-z0-9]{1,8}'  # NEW
-_PATH_ANY  = rf'(?:{_PATH_UNIX}|{_PATH_WIN}|{_FILENAME})'  # UPDATED
+_PATH_UNIX = r"(?:\.?/)?(?:[\w.\-]+/)+[\w.\-]+\.[A-Za-z0-9]{1,8}"
+_PATH_WIN = r"(?:[A-Za-z]:\\)?(?:[\w.\-]+\\)+[\w.\-]+\.[A-Za-z0-9]{1,8}"
+_FILENAME = r"[\w.\-]+\.[A-Za-z0-9]{1,8}"  # NEW
+_PATH_ANY = rf"(?:{_PATH_UNIX}|{_PATH_WIN}|{_FILENAME})"  # UPDATED
 
 _LABELLED_PATH_RE = re.compile(
     rf'(?i)\b(?:new|create(?:d)?|add(?:ed)?|write|save|file(?:name)?|filepath|path)\b\s*:?\s*["\'`]*'
-    rf'(?P<path>{_PATH_ANY})'
+    rf"(?P<path>{_PATH_ANY})"
 )
-_UNLABELLED_PATH_RE = re.compile(rf'(?P<path>{_PATH_ANY})')
+_UNLABELLED_PATH_RE = re.compile(rf"(?P<path>{_PATH_ANY})")
 
 
 def _extract_path_hint_from_lines(lines: list[str]) -> str | None:
     buf = "\n".join(lines)
     m = _LABELLED_PATH_RE.search(buf)
     if m:
-        return m.group("path").replace('\\', '/')
+        return m.group("path").replace("\\", "/")
     m = _UNLABELLED_PATH_RE.search(buf)
     if m:
-        return m.group("path").replace('\\', '/')
+        return m.group("path").replace("\\", "/")
     return None
 
 
 # =============================
 # File-block pairing (outside-in)
 # =============================
+
 
 def _file_score(body: str, language: str) -> float:
     """
@@ -121,12 +131,16 @@ def _file_score(body: str, language: str) -> float:
         score += 1.0 * len(re.findall(r"^\s*#\!", text, re.MULTILINE))
         score += 0.5 * (text.count("{") + text.count("}"))
         score += 1.0 * len(re.findall(r"^\s*(def|class|import|package)\b", text, re.MULTILINE))
-        score += 1.0 * len(re.findall(r'^\s*"(?:\\.|[^"])*"\s*:', text, re.MULTILINE))  # naive JSON-ish
+        score += 1.0 * len(
+            re.findall(r'^\s*"(?:\\.|[^"])*"\s*:', text, re.MULTILINE)
+        )  # naive JSON-ish
 
     return score
 
 
-def _body_slice_for_open_file(text: str, open_tok: FenceToken, close_tok: FenceToken) -> tuple[int, int]:
+def _body_slice_for_open_file(
+    text: str, open_tok: FenceToken, close_tok: FenceToken
+) -> tuple[int, int]:
     """
     Compute [start, end) for a generic code fence body.
     - Prefer starting after the opener line's newline.
@@ -143,7 +157,7 @@ def _body_slice_for_open_file(text: str, open_tok: FenceToken, close_tok: FenceT
         trimmed = after.lstrip()
         lang_tok = _first_token(trimmed)
         if lang_tok:
-            trimmed2 = trimmed[len(lang_tok):]
+            trimmed2 = trimmed[len(lang_tok) :]
             if trimmed2.startswith(" "):
                 trimmed2 = trimmed2[1:]
             start = open_tok.end + (len(after) - len(trimmed2))
@@ -152,6 +166,8 @@ def _body_slice_for_open_file(text: str, open_tok: FenceToken, close_tok: FenceT
 
     end = close_tok.start
     return start, end
+
+
 def _best_close_for_open_file(text: str, tokens: list[FenceToken], open_idx: int) -> int | None:
     """
     Outside-in pairing for generic file blocks.
@@ -221,6 +237,7 @@ def _find_matching_open_for_close(tokens: list[FenceToken], close_idx: int) -> i
 # Public API: File blocks
 # =============================
 
+
 def extract_file_blocks_from_text(markdown_content: str) -> list[dict[str, object]]:
     """
     Extract *full file* fenced code blocks (non-diff) using bottom-up, backwards pairing.
@@ -234,7 +251,7 @@ def extract_file_blocks_from_text(markdown_content: str) -> list[dict[str, objec
     for sp in spans:
         open_tok = sp["open_tok"]
         close_tok = sp["close_tok"]
-        lang = (open_tok.info_first_token or "")
+        lang = open_tok.info_first_token or ""
         if lang in ("diff", "patch"):
             # leave these to the diff extractor
             continue
@@ -247,27 +264,42 @@ def extract_file_blocks_from_text(markdown_content: str) -> list[dict[str, objec
         # For bare fences with no path: keep if markdown-ish or source-ish
         if lang == "" and file_path == "":
             snippet = body[:2000]
-            looks_like_markdown = bool(re.search(r"(^|\n)#{1,6}\s|(^|\n)[-*+]\s|\[[^\]]+\]\([^)]+\)", snippet))
-            looks_like_source = bool(re.search(
-                r'(^\s*#\!|^\s*(def|class|import|package)\b|[{;}])', snippet, re.MULTILINE))
+            looks_like_markdown = bool(
+                re.search(r"(^|\n)#{1,6}\s|(^|\n)[-*+]\s|\[[^\]]+\]\([^)]+\)", snippet)
+            )
+            looks_like_source = bool(
+                re.search(
+                    r"(^\s*#\!|^\s*(def|class|import|package)\b|[{;}])", snippet, re.MULTILINE
+                )
+            )
             if not (looks_like_source or looks_like_markdown):
                 continue
 
-        results.append({
-            "type": "file",
-            "language": language,
-            "code": body.strip("\n"),
-            "file_path": file_path,
-            "start": body_start,
-            "end": body_end,
-            "body_start": body_start,   # alias for tests
-            "body_end": body_end,       # alias for tests
-            "open_fence": {"char": open_tok.char, "length": open_tok.length,
-                           "start": open_tok.start, "end": open_tok.end},
-            "close_fence": {"char": close_tok.char, "length": close_tok.length,
-                            "start": close_tok.start, "end": close_tok.end},
-            "context": _context_before(text, open_tok.start, CONTEXT_LINES),
-        })
+        results.append(
+            {
+                "type": "file",
+                "language": language,
+                "code": body.strip("\n"),
+                "file_path": file_path,
+                "start": body_start,
+                "end": body_end,
+                "body_start": body_start,  # alias for tests
+                "body_end": body_end,  # alias for tests
+                "open_fence": {
+                    "char": open_tok.char,
+                    "length": open_tok.length,
+                    "start": open_tok.start,
+                    "end": open_tok.end,
+                },
+                "close_fence": {
+                    "char": close_tok.char,
+                    "length": close_tok.length,
+                    "start": close_tok.start,
+                    "end": close_tok.end,
+                },
+                "context": _context_before(text, open_tok.start, CONTEXT_LINES),
+            }
+        )
 
     return results
 
@@ -312,22 +344,24 @@ def _extract_file_spans_bottom_up(text: str) -> list[dict]:
             continue
 
         # Compute metadata
-        language = (open_tok.info_first_token or "plain")
+        language = open_tok.info_first_token or "plain"
         opener_line_idx = _line_index_for_charpos(text, open_tok.line_start)
         all_lines = text.splitlines()
         look_from = max(0, opener_line_idx - 2)
         context_lines = all_lines[look_from:opener_line_idx]
         file_path = _extract_path_hint_from_lines(context_lines) or ""
 
-        results.append({
-            "type": "file",
-            "open_tok": open_tok,
-            "close_tok": close_tok,
-            "language": language,
-            "file_path": file_path,
-            "body_start": body_start,
-            "body_end": body_end,
-        })
+        results.append(
+            {
+                "type": "file",
+                "open_tok": open_tok,
+                "close_tok": close_tok,
+                "language": language,
+                "file_path": file_path,
+                "body_start": body_start,
+                "body_end": body_end,
+            }
+        )
 
         # Mark the entire span (including the fences) as covered.
         # We expand to include the full lines of the fences via helper:
@@ -339,7 +373,9 @@ def _extract_file_spans_bottom_up(text: str) -> list[dict]:
     return results
 
 
-def _span_slice_including_fences(text: str, open_tok: FenceToken, close_tok: FenceToken) -> tuple[int, int]:
+def _span_slice_including_fences(
+    text: str, open_tok: FenceToken, close_tok: FenceToken
+) -> tuple[int, int]:
     """
     Like _body_slice_for_open_file, but returns the absolute span including the opener/closer fence lines.
     Used to 'cover' a region so nested inner fences aren't re-processed.

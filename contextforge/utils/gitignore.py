@@ -12,7 +12,7 @@ def get_gitignore(path: str) -> pathspec.PathSpec:
     If no .gitignore exists or it cannot be read, still return a valid spec
     that at least ignores '.git/'.
     """
-    defaults: List[str] = ['.git/']
+    defaults: List[str] = [".git/"]
     lines: List[str] = list(defaults)
 
     # Normalize base (allow either a file or a directory)

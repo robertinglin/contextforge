@@ -4,6 +4,7 @@ from contextforge.extract import extract_diffs_from_text as cf_extract_diffs
 # Tests
 # =============================
 
+
 def _assert(cond: bool, msg: str = "assertion failed") -> None:
     if not cond:
         raise AssertionError(msg)
@@ -17,8 +18,8 @@ def test_run_base_tests() -> None:
         "--- a/x.py\n"
         "+++ b/x.py\n"
         "@@ -1,3 +1,3 @@\n"
-        "-print(\"hi\")\n"
-        "+print(\"hello\")\n"
+        '-print("hi")\n'
+        '+print("hello")\n'
         "code with stray backticks inside: ``` and even ````\n"
         "```\n"
         "Outro\n"
@@ -62,15 +63,7 @@ def test_run_base_tests() -> None:
     _assert("+bar" in r3[0]["code"], "long-fence body incorrect")
 
     # 4) Opening with content on the same line (inline after fence)
-    s4 = (
-        "text\n"
-        "```diff --- a/a\n"
-        "+++ b/a\n"
-        "@@ -1 +1 @@\n"
-        "-a\n"
-        "+b\n"
-        "```\n"
-    )
+    s4 = "text\n```diff --- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n```\n"
     r4 = cf_extract_diffs(s4)
     _assert(len(r4) == 1, "failed opening with content after the fence")
     _assert("--- a/a" in r4[0]["code"], "missing header when opener has same-line content")
@@ -91,24 +84,12 @@ def test_run_base_tests() -> None:
     _assert("+z" in r5[0]["code"], "tilde body incorrect")
 
     # 6) Bare fences that look like diffs (heuristics)
-    s6 = (
-        "```\n"
-        "--- a/q\n"
-        "+++ b/q\n"
-        "@@ -1 +1 @@\n"
-        "-q\n"
-        "+w\n"
-        "```\n"
-    )
+    s6 = "```\n--- a/q\n+++ b/q\n@@ -1 +1 @@\n-q\n+w\n```\n"
     r6 = cf_extract_diffs(s6, allow_bare_fences_that_look_like_diff=True)
     _assert(len(r6) == 1, "bare diff detection failed")
 
     # 7) Non-diff code block should be ignored
-    s7 = (
-        "```python\n"
-        "print('hello')\n"
-        "```\n"
-    )
+    s7 = "```python\nprint('hello')\n```\n"
     r7 = cf_extract_diffs(s7)
     _assert(len(r7) == 0, "non-diff code block should not be extracted")
 
@@ -172,6 +153,11 @@ def test_run_base_tests() -> None:
     )
     r11 = cf_extract_diffs(s11)
     _assert(len(r11) == 2, "should have extracted two diffs")
-    _assert(r11[0]["code"].strip() == "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b", "first diff body incorrect")
-    _assert(r11[1]["code"].strip() == "--- a/c\n+++ b/c\n@@ -1 +1 @@\n-c\n+d", "second diff body incorrect")
-
+    _assert(
+        r11[0]["code"].strip() == "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b",
+        "first diff body incorrect",
+    )
+    _assert(
+        r11[1]["code"].strip() == "--- a/c\n+++ b/c\n@@ -1 +1 @@\n-c\n+d",
+        "second diff body incorrect",
+    )

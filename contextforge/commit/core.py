@@ -11,6 +11,7 @@ from ..errors.path import PathViolation
 @dataclass
 class Change:
     """A single file edit slated for commit."""
+
     path: str
     new_content: str
     original_content: str
@@ -20,6 +21,7 @@ class Change:
 @dataclass
 class CommitSummary:
     """Outcome of a commit operation."""
+
     success: List[str] = field(default_factory=list)
     failed: List[str] = field(default_factory=list)
     dry_run: bool = False
@@ -102,7 +104,9 @@ def commit_changes(
                 if os.path.exists(dirpath) and not os.access(dirpath, os.W_OK):
                     raise PermissionError(f"No write permission for directory '{dirpath}'")
                 action = "create" if ch.is_new else "write"
-                summary.success.append(f"DRY RUN: Would {action} {len(ch.new_content)} bytes to {ch.path}")
+                summary.success.append(
+                    f"DRY RUN: Would {action} {len(ch.new_content)} bytes to {ch.path}"
+                )
             except Exception as e:
                 summary.failed.append(ch.path)
                 summary.errors[ch.path] = str(e)

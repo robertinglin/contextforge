@@ -6,6 +6,7 @@ Public API:
   - copy_to_clipboard(text: str) -> bool
   - write_tempfile(text: str, *, suffix: str = ".txt", prefix: str = "contextforge-", dir: str | None = None, encoding: str = "utf-8") -> str
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -16,7 +17,9 @@ import tempfile
 __all__ = ["append_context", "copy_to_clipboard", "write_tempfile"]
 
 
-def append_context(existing: str, more: str, *, header: str | None = None, sep: str = "\n\n") -> str:
+def append_context(
+    existing: str, more: str, *, header: str | None = None, sep: str = "\n\n"
+) -> str:
     """
     Append `more` to an existing context string with a clean separator.
     Optionally insert a Markdown header above the appended chunk.
@@ -51,10 +54,14 @@ def copy_to_clipboard(text: str) -> bool:
             proc = subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=False)
             return proc.returncode == 0
         if _which("xclip"):
-            proc = subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode("utf-8"), check=False)
+            proc = subprocess.run(
+                ["xclip", "-selection", "clipboard"], input=text.encode("utf-8"), check=False
+            )
             return proc.returncode == 0
         if _which("xsel"):
-            proc = subprocess.run(["xsel", "--clipboard", "--input"], input=text.encode("utf-8"), check=False)
+            proc = subprocess.run(
+                ["xsel", "--clipboard", "--input"], input=text.encode("utf-8"), check=False
+            )
             return proc.returncode == 0
     except Exception:
         pass

@@ -12,7 +12,9 @@ def test_extract_file_info_patterns():
     assert info["file_path"] == "src/app.js"
 
     # Diff indicators
-    diff_code = "--- a/src/style.css\n+++ b/src/style.css\n@@ -1,1 +1,1 @@\n-body {}\n+body { color: red; }"
+    diff_code = (
+        "--- a/src/style.css\n+++ b/src/style.css\n@@ -1,1 +1,1 @@\n-body {}\n+body { color: red; }"
+    )
     info = extract_file_info_from_context_and_code("Changes for css", diff_code, "css")
     assert info["file_path"] == "src/style.css"
     assert info["change_type"] == "diff"
@@ -21,6 +23,7 @@ def test_extract_file_info_patterns():
     code_with_truncation = "line 1\n# ...\nline 100"
     info = extract_file_info_from_context_and_code("`file.txt`", code_with_truncation, "plaintext")
     assert info["change_type"] == "full_replacement"
+
 
 def test_detect_new_files():
     # Git new file mode
