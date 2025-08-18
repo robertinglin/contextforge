@@ -4,7 +4,7 @@ from __future__ import annotations
 import difflib
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from .._logging import resolve_logger
 from ..errors.patch import PatchFailedError
@@ -613,7 +613,15 @@ def _apply_hunk_block_style(
     raise PatchFailedError(f"Best match ratio {best_ratio:.2f} is below threshold {threshold:.2f}.")
 
 
-def patch_text(content: str, patch_str: str, threshold: float = 0.6, *, logger=None, log: bool = False) -> str:
+def patch_text(
+    content: str,
+    patch: Union[str, List[Dict[str, str]]],
+    threshold: float = 0.6,
+    *,
+    logger=None,
+    log: bool = False,
+    debug: Optional[bool] = None,
+) -> str:
     """
     Apply a patch string to the provided content.
 
@@ -628,7 +636,59 @@ def patch_text(content: str, patch_str: str, threshold: float = 0.6, *, logger=N
     """
     log = resolve_logger(logger=logger, enabled=log, name=__name__, level=logging.DEBUG)
 
-    if not patch_str.strip():
+    # Support 'debug=True' alias used by tests
+    if debug is not None:
+        log = log or bool(debug)
+
+    # Structured patch path: list of dicts
+    if isinstance(patch, list):
+        text = content
+        for i, spec in enumerate(patch, 1):
+            old = spec.get("old")
+            new = spec.get("new", "")
+            pattern = spec.get("pattern")
+            if not (old or pattern):
+                raise PatchFailedError("missing 'old' or 'pattern' in structured patch")
+            if pattern:
+                log.debug(f"[{i}] regex replace: pattern={pattern!r}")
+                text, n = re.subn(pattern, new, text, count=1)
+                if n == 0:
+                    raise PatchFailedError(f"pattern not found: {pattern!r}")
+                continue
+            # Sentinel replacement: compute common head/tail and replace inner span.
+            head_len = 0
+            for a, b in zip(old, new):
+                if a == b:
+                    head_len += 1
+                else:
+                    break
+            tail_len = 0
+            for a, b in zip(reversed(old), reversed(new)):
+                if a == b:
+                    tail_len += 1
+                else:
+                    break
+            head = old[:head_len]
+            tail = old[len(old) - tail_len:] if tail_len else ""
+            mid_new = new[head_len: len(new) - tail_len if tail_len else None]
+            # Try structured head/tail replacement first
+            if head and tail:
+                start = text.find(head)
+                if start != -1:
+                    end = text.find(tail, start + len(head))
+                    if end != -1:
+                        log.debug(f"[{i}] sentinel replace between head/tail (len={end-start})")
+                        text = text[:start + len(head)] + mid_new + text[end:]
+                        continue
+            # Fallback to exact replacement
+            if old in text:
+                log.debug(f"[{i}] exact replace of old block (len={len(old)})")
+                text = text.replace(old, new, 1)
+            else:
+                raise PatchFailedError("old block not found for structured patch")
+        return text
+
+    if not patch.strip():
         return content
 
     def _detect_eol(s: str) -> str:
@@ -641,7 +701,7 @@ def patch_text(content: str, patch_str: str, threshold: float = 0.6, *, logger=N
     eol = _detect_eol(content)
     had_trailing_nl = content.endswith(("\r\n", "\n", "\r"))
 
-    dedented_patch = patch_str.strip()
+    dedented_patch = patch.strip()
 
     # DEBUG: Show patch detection
     log.debug("\n=== PATCH PARSING ===")
@@ -662,7 +722,9 @@ def patch_text(content: str, patch_str: str, threshold: float = 0.6, *, logger=N
         hunks = _parse_patch_hunks(dedented_patch)
     else:
         hunks = _parse_simplified_patch_hunks(dedented_patch)
-
+    if not hunks:
+        raise PatchFailedError("no valid hunks")
+        
     log.debug(f"\nParsed {len(hunks)} hunks using {'standard' if standard_match else 'simplified'} parser")
     for i, h in enumerate(hunks):
         log.debug(f"  Hunk {i+1}: {len(h.get('lines', []))} lines")

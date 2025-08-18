@@ -16,16 +16,20 @@ from typing import Optional
 __all__ = ["append_context", "copy_to_clipboard", "write_tempfile"]
 
 
-def append_context(existing: str, more: str, *, header: Optional[str] = None, sep: str = "\n\n") -> str:
+def append_context(existing: str, more: str, *, header: str | None = None, sep: str = "\n\n") -> str:
     """
     Append `more` to an existing context string with a clean separator.
     Optionally insert a Markdown header above the appended chunk.
     """
-    parts = [existing.rstrip()]
+    out = existing.rstrip("\n") + "\n"
     if header:
-        parts.append(str(header).rstrip())
-    parts.append(more.strip("\n"))
-    return sep.join(parts) + "\n"
+        out += f"{sep}{header.strip()}\n{sep}"
+    else:
+        out += sep
+    if not out.endswith("\n"):
+        out += "\n"
+    out += more.rstrip("\n") + "\n"
+    return out
 
 
 def copy_to_clipboard(text: str) -> bool:

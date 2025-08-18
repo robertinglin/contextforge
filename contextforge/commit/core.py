@@ -78,7 +78,7 @@ def commit_changes(
     summary = CommitSummary(dry_run=dry_run)
     base_real = os.path.realpath(base_path)
 
-    # Normalize and deterministically order by resolved path
+    # Normalize by resolved path
     normalized: List[Tuple[Change, str]] = []
     for ch in changes:
         try:
@@ -89,7 +89,6 @@ def commit_changes(
             summary.errors[ch.path] = str(e)
             if mode == "fail_fast":
                 return summary
-    normalized.sort(key=lambda t: t[1])
 
     # Dry-run: only validate directory writability and report the plan
     if dry_run:

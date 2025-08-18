@@ -28,17 +28,9 @@ class NoopLogger:
 
 
 def _ensure_default_handler(lg: logging.Logger) -> None:
-    """Attach a basic stream handler only if the logger has no handlers."""
-    if lg.handlers:
-        return
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
-    handler.setFormatter(formatter)
-    lg.addHandler(handler)
-    # Avoid duplicate messages if root handlers exist
-    lg.propagate = False
+    # Let logs bubble to the root so pytest's caplog can capture them.
+    # Avoid attaching our own handler to prevent duplicate output.
+    lg.propagate = True
 
 
 def resolve_logger(
@@ -55,11 +47,12 @@ def resolve_logger(
     - Else if `enabled` is True, create/get a named logger.
     - Else return a NoopLogger that ignores calls.
     """
-    if isinstance(logger, logging.Logger):
+    # Duck-typed: if the caller gave us an object with .debug(...), use it.
+    if logger is not None:
         return logger
     if enabled:
         lg = logging.getLogger(name or "contextforge")
-        _ensure_default_handler(lg)
         lg.setLevel(level)
+        _ensure_default_handler(lg)
         return lg
     return NoopLogger()
