@@ -81,15 +81,6 @@ md = """
 +new
 ````
 
-"""
-
-for block in extract\_blocks\_from\_text(md):
-print(block\["type"], block.get("file\_path"), block.get("language"))
-
-# e.g.: ("diff", "file.txt", "diff")
-
-````
-
 ### 3) End-to-end: Parse → Plan → Commit
 
 ```python
