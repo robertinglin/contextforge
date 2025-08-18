@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import re
-import sys
-from typing import List, Dict, Optional, Tuple
-from ..errors import ExtractError
 
+from ..errors import ExtractError
 from ..models.fence import FenceToken
 
 CONTEXT_LINES = 5
@@ -16,9 +14,11 @@ CONTEXT_LINES = 5
 # Fence tokenization & helpers
 # =============================
 
-def _line_bounds(text: str, idx: int) -> Tuple[int, int]:
-    if idx < 0: idx = 0
-    if idx > len(text): idx = len(text)
+def _line_bounds(text: str, idx: int) -> tuple[int, int]:
+    if idx < 0:
+        idx = 0
+    if idx > len(text):
+        idx = len(text)
     ls = text.rfind("\n", 0, idx) + 1
     le_pos = text.find("\n", idx)
     le = le_pos if le_pos != -1 else len(text)
@@ -27,7 +27,8 @@ def _line_bounds(text: str, idx: int) -> Tuple[int, int]:
 
 def _line_index_for_charpos(text: str, pos: int) -> int:
     """Return 0-based line index for the given absolute char position."""
-    if pos <= 0: return 0
+    if pos <= 0:
+        return 0
     return text.count("\n", 0, pos)
 
 
@@ -38,9 +39,9 @@ def _first_token(s: str) -> str:
     return s.split()[0].lower()
 
 
-def _tokenize_fences(text: str) -> List[FenceToken]:
+def _tokenize_fences(text: str) -> list[FenceToken]:
     """Return all 3+ backtick/tilde runs found anywhere in the text."""
-    tokens: List[FenceToken] = []
+    tokens: list[FenceToken] = []
     i, n = 0, len(text)
     while i < n:
         ch = text[i]
@@ -74,9 +75,7 @@ def _looks_like_diff(text: str) -> bool:
         return True
     if ("--- " in text and "+++ " in text):
         return True
-    if re.search(r"^\s*@@\s+-\d+", text, flags=re.MULTILINE):
-        return True
-    return False
+    return bool(re.search(r"^\s*@@\s+-\d+", text, flags=re.MULTILINE))
 
 
 def _diff_score(text: str) -> float:
@@ -102,7 +101,7 @@ def _diff_score(text: str) -> float:
 # Pairing (outside-in)
 # =============================
 
-def _best_close_for_open(text: str, tokens: List[FenceToken], open_idx: int) -> Optional[int]:
+def _best_close_for_open(text: str, tokens: list[FenceToken], open_idx: int) -> int | None:
     """
     Choose the best closing fence for tokens[open_idx] by scanning from the end backward.
     A valid closer:
@@ -156,7 +155,7 @@ def _context_before(text: str, idx: int, lines: int = CONTEXT_LINES) -> str:
     return "\n".join(parts)
 
 
-def _body_slice_for_open(text: str, open_tok: FenceToken, close_tok: FenceToken) -> Tuple[int, int]:
+def _body_slice_for_open(text: str, open_tok: FenceToken, close_tok: FenceToken) -> tuple[int, int]:
     """
     Compute [start, end) of the body between the opener and closer.
     - Normally body starts on the NEXT line.
@@ -191,17 +190,17 @@ def _body_slice_for_open(text: str, open_tok: FenceToken, close_tok: FenceToken)
 # Multi-file splitting
 # =============================
 
-def _split_multi_file_diff(diff_text: str) -> List[Tuple[str, str]]:
+def _split_multi_file_diff(diff_text: str) -> list[tuple[str, str]]:
     """
     Split a (possibly multi-file) diff into per-file chunks.
     Keeps 'diff --git' and 'index' lines WITH the file they belong to.
     Returns: List[(file_path (maybe ''), chunk_text)]
     """
     lines = diff_text.splitlines()
-    chunks: List[List[str]] = []
-    paths: List[str] = []
-    cur: List[str] = []
-    cur_path: Optional[str] = None
+    chunks: list[list[str]] = []
+    paths: list[str] = []
+    cur: list[str] = []
+    cur_path: str | None = None
     cur_has_diff_git = False
     cur_has_header = False  # saw '--- ' in current chunk
 
@@ -215,7 +214,7 @@ def _split_multi_file_diff(diff_text: str) -> List[Tuple[str, str]]:
         cur_has_diff_git = False
         cur_has_header = False
 
-    def extract_path_from_line(line: str) -> Optional[str]:
+    def extract_path_from_line(line: str) -> str | None:
         # Handles `diff --git a/old/path b/new/path` -> we want `new/path`
         m = re.match(r"^diff --git a/.+? b/(.+)$", line)
         if m:
@@ -265,7 +264,7 @@ def extract_diffs_from_text(
     *,
     allow_bare_fences_that_look_like_diff: bool = True,
     split_per_file: bool = True,
-) -> List[Dict[str, object]]:
+) -> list[dict[str, object]]:
     """
     Robust, "outside-in" diff extractor.
 
@@ -288,7 +287,7 @@ def extract_diffs_from_text(
     """
     text = markdown_content
     tokens = _tokenize_fences(text)
-    results: List[Dict[str, object]] = []
+    results: list[dict[str, object]] = []
     consumed_until = -1
     i = 0
 
@@ -323,10 +322,9 @@ def extract_diffs_from_text(
             line_no = _line_index_for_charpos(text, open_tok.start) + 1  # 1-based
             raise ExtractError(f"Malformed diff fence near line {line_no}: expected a unified diff body.")
 
-        if not is_explicit_diff and not _looks_like_diff(body):
-            if _diff_score(body) < 4.0:
-                i += 1
-                continue
+        if not is_explicit_diff and not _looks_like_diff(body) and _diff_score(body) < 4.0:
+            i += 1
+            continue
 
         # Per-file split
         file_chunks = _split_multi_file_diff(body) if split_per_file else [("", body)]

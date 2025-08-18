@@ -45,7 +45,7 @@ def test_readme_block_extraction() -> None:
 """    -   Color picker (eyedropper) to sample colors from the canvas.\n"""
 """    -   Automatically saved color history for quick access.\n"""
 """-   **Deployment**:\n"""
-"""    -   Continuous deployment to GitHub Pages using GitHub Actions.\n""" 
+"""    -   Continuous deployment to GitHub Pages using GitHub Actions.\n"""
 """\n"""
 """## Tech Stack\n"""
 """\n"""
@@ -75,19 +75,19 @@ def test_readme_block_extraction() -> None:
 """    ```sh\n"""
 """    git clone https://github.com/your-username/draw-practice-3.git\n"""
 """    cd draw-practice-3\n"""
-"""    ```\n""" 
+"""    ```\n"""
 """\n"""
 """2.  Install NPM packages:\n"""
 """    ```sh\n"""
 """    npm install\n"""
-"""    ```\n""" 
+"""    ```\n"""
 """\n"""
 """### Running the Application\n"""
 """\n"""
 """To start the Vite development server, run:\n"""
 """```sh\n"""
 """npm run dev\n"""
-"""```\n""" 
+"""```\n"""
 """Open [http://localhost:5173](http://localhost:5173) (or the port shown in your terminal) to view it in the browser.\n"""
 """\n"""
 """## Available Scripts\n"""
@@ -131,7 +131,6 @@ def test_nested_fences_bottom_up() -> None:
     files = [b for b in blocks if b.get("type") == "file"]
     _assert(len(files) == 1, f"expected 1 file block, got {len(files)}")
     assert files[0]["file_path"].endswith("src/file.md")
-    print(files[0])
     body = s[files[0]["start"]:files[0]["end"]]
     _assert("export const x = 1;" in body, "inner ts content should be preserved in body")
 
@@ -262,4 +261,3 @@ def test_general_run_tests() -> None:
     _assert(any(b.get("type") == "diff" for b in blocks_raw), "raw diff fallback missing")
 
 
-    print("All tests passed ✅")

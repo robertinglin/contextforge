@@ -1,10 +1,12 @@
 # contextforge/commit/core.py
+import contextlib
 import os
 import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 from ..errors.path import PathViolation
+
 
 @dataclass
 class Change:
@@ -132,10 +134,8 @@ def commit_changes(
         if staging_failed and mode == "fail_fast":
             # Nothing promoted yet: delete stage files; filesystem unchanged.
             for tmp, _ch in [v for v in staged.values()]:
-                try:
+                with contextlib.suppress(Exception):
                     os.remove(tmp)
-                except Exception:
-                    pass
             return summary
 
         # Promote staged files (best-effort or all-or-nothing in fail_fast)

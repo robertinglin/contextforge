@@ -19,7 +19,7 @@ def _contains_truncation_marker(code: str) -> bool:
         re.MULTILINE
     )
     return truncation_pattern.search(code) is not None
-    
+
 def _try_parse_comment_header(content: str) -> Optional[Dict[str, str]]:
     """
     Checks if the first line of content is a comment containing a file path.

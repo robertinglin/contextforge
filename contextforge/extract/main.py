@@ -1,5 +1,5 @@
 # contextforge/extract/main.py
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 from .diffs import extract_diffs_from_text
 from .files import extract_file_blocks_from_text

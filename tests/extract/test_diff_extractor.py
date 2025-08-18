@@ -175,4 +175,3 @@ def test_run_base_tests() -> None:
     _assert(r11[0]["code"].strip() == "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b", "first diff body incorrect")
     _assert(r11[1]["code"].strip() == "--- a/c\n+++ b/c\n@@ -1 +1 @@\n-c\n+d", "second diff body incorrect")
 
-    print("All tests passed ✅")

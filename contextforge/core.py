@@ -1,14 +1,15 @@
 # contextforge/core.py
+import logging
 import os
-from typing import Dict, Generator, List, Optional
+from typing import Dict, Generator, List
+
+from patch import fromstring as patch_fromstring
 
 from .commit import patch_text
-from patch import fromstring as patch_fromstring
 from .errors import PatchFailedError
 from .extract import extract_blocks_from_text
 from .extract.metadata import extract_file_info_from_context_and_code
 from .utils.parsing import _contains_truncation_marker
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -54,14 +55,14 @@ def plan_and_generate_changes(planned_changes: List[Dict], codebase_dir: str) ->
     This is a non-LLM, non-streaming function that applies patches and prepares content.
     """
     final_changes = []
-    for i, plan in enumerate(planned_changes):
+    for _i, plan in enumerate(planned_changes):
         metadata, block = plan['metadata'], plan['block']
         file_path, change_type = metadata['file_path'], metadata['change_type']
         original_content = ""
         target_path = os.path.join(codebase_dir, file_path)
         if os.path.exists(target_path):
             try:
-                with open(target_path, 'r', encoding='utf-8') as f:
+                with open(target_path, encoding='utf-8') as f:
                     original_content = f.read()
             except Exception as e:
                 logger.warning(f"  - WARNING: Could not read original file, proceeding as if empty. Error: {e}")

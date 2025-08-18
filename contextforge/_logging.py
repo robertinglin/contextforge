@@ -17,7 +17,6 @@ Design goals:
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 
 class NoopLogger:
@@ -34,10 +33,10 @@ def _ensure_default_handler(lg: logging.Logger) -> None:
 
 
 def resolve_logger(
-    logger: Optional[logging.Logger] = None,
+    logger: logging.Logger | None = None,
     *,
     enabled: bool = False,
-    name: Optional[str] = None,
+    name: str | None = None,
     level: int = logging.INFO,
 ) -> logging.Logger | NoopLogger:
     """

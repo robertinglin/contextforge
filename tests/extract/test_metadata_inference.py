@@ -1,5 +1,5 @@
-import pytest
-from contextforge.extract.metadata import extract_file_info_from_context_and_code, detect_new_files
+from contextforge.extract.metadata import detect_new_files, extract_file_info_from_context_and_code
+
 
 def test_extract_file_info_patterns():
     # Backticked filename

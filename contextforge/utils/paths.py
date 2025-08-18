@@ -28,7 +28,7 @@ def _resolve_bare_filename(file_path: str, codebase_dir: str) -> Tuple[str, List
                     # Normalize to forward slashes for consistency.
                     relative_path = os.path.relpath(full_path, codebase_dir).replace(os.sep, '/')
                     found_paths.append(relative_path)
-            
+
             if len(found_paths) == 1:
                 new_path = found_paths[0]
                 logs.append(f"  - Found unique match: '{new_path}'. Updating path.")

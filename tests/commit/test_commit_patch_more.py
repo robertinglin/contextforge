@@ -1,6 +1,6 @@
 
-import pytest
-from contextforge.commit.patch import patch_text, PatchFailedError
+from contextforge.commit.patch import patch_text
+
 
 def test_sentinel_branch_replacement_unique_edges():
     A16 = "A"*16
@@ -18,4 +18,4 @@ def test_debug_logger_path():
     original = "log me"
     patch = dict(old="log", new="LOG")
     out = patch_text(original, [patch], debug=True, logger=Logger())
-    assert "LOG me" == out and logs
+    assert out == "LOG me" and logs

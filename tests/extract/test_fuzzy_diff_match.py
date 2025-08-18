@@ -1,7 +1,9 @@
 
 # Import the contextforge version for testing
 import textwrap
+
 from contextforge import patch_text as cf_fuzzy_patch
+
 
 # -----------------------
 # Tests
@@ -132,4 +134,3 @@ def test_run_tests():
     _assert_eq(out, expected, "block-first")
     tests_passed += 1
 
-    print(f"All tests passed: {tests_passed} cases ✔️")

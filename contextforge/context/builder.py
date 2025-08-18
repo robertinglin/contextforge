@@ -41,11 +41,11 @@ def _build_context_string(request: Any) -> str:
                 )
                 continue
 
-            with open(resolved_path, 'r', encoding='utf-8', errors='ignore') as f:
+            with open(resolved_path, encoding='utf-8', errors='ignore') as f:
                 content = f.read()
             lang = os.path.splitext(file_path)[1].lstrip('.')
             context_str += f"File: {file_path}\n```{lang}\n{content}\n```\n\n"
-        except (IOError, OSError) as e:
+        except OSError as e:
             raise ContextError(f"Failed to read file '{file_path}': {e}") from e
 
     context_str += "</file_contents>\n\n"

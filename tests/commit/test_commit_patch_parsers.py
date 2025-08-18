@@ -1,7 +1,15 @@
-import pytest
-import textwrap
 import logging
-from contextforge.commit.patch import patch_text, fuzzy_patch_partial, PatchFailedError, _parse_simplified_patch_hunks
+import textwrap
+
+import pytest
+
+from contextforge.commit.patch import (
+    PatchFailedError,
+    _parse_simplified_patch_hunks,
+    fuzzy_patch_partial,
+    patch_text,
+)
+
 
 def test_simplified_patch_parser():
     patch_str = textwrap.dedent("""
@@ -25,7 +33,7 @@ def test_eol_preservation():
     crlf_patch = "@@\r\n-line2\r\n+line two\r\n"
     expected_crlf = "line1\r\nline two\r\n"
     assert patch_text(crlf_content, crlf_patch) == expected_crlf
-    
+
     lf_content = "line1\nline2" # No trailing newline
     lf_patch = "@@\n-line2\n+line two\n"
     expected_lf = "line1\nline two"

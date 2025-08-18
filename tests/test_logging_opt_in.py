@@ -1,5 +1,6 @@
 import logging
-from contextforge._logging import resolve_logger, NoopLogger
+
+from contextforge._logging import NoopLogger, resolve_logger
 
 
 def test_resolve_logger_default_noop():

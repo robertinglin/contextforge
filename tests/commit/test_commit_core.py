@@ -1,9 +1,8 @@
-import os
 from contextforge.commit.core import Change, commit_changes
 
 
 def read(path):
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         return f.read()
 
 

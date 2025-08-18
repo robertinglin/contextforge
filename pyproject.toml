@@ -48,7 +48,7 @@ docstring-code-format = true
 # Forbid print() in library code
 extend-select = ["T201"]
 select = ["E", "F", "I", "UP", "B", "SIM", "W"]
-ignore = []
+ignore = ["E501"]
 
 
 [tool.mypy]

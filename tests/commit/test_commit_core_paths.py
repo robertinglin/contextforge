@@ -1,8 +1,11 @@
 import os
 import sys
+
 import pytest
+
 from contextforge.commit.core import _normalized_path
 from contextforge.errors.path import PathViolation
+
 
 def test_normalized_path_enforces_containment(tmp_path):
     base = str(tmp_path.resolve())
@@ -24,9 +27,9 @@ def test_normalized_path_blocks_symlink_escapes(tmp_path):
     base = tmp_path.resolve()
     outside = tmp_path.parent / "outside.txt"
     outside.write_text("OUTSIDE")
-    
+
     (base / "a").mkdir()
     os.symlink(outside, base / "a" / "link_to_outside")
-    
+
     with pytest.raises(PathViolation):
         _normalized_path(str(base), "a/link_to_outside")

@@ -3,20 +3,19 @@
 from __future__ import annotations
 
 import re
-import sys
-from typing import List, Dict, Optional, Tuple
 
-from .diffs import CONTEXT_LINES
 from ..models.fence import FenceToken
-
+from .diffs import CONTEXT_LINES
 
 # =============================
 # Fence tokenization
 # =============================
 
-def _line_bounds(text: str, idx: int) -> Tuple[int, int]:
-    if idx < 0: idx = 0
-    if idx > len(text): idx = len(text)
+def _line_bounds(text: str, idx: int) -> tuple[int, int]:
+    if idx < 0:
+        idx = 0
+    if idx > len(text):
+        idx = len(text)
     ls = text.rfind("\n", 0, idx) + 1
     le_pos = text.find("\n", idx)
     le = le_pos if le_pos != -1 else len(text)
@@ -30,8 +29,8 @@ def _first_token(s: str) -> str:
     return s.split()[0].lower()
 
 
-def _tokenize_fences(text: str) -> List[FenceToken]:
-    tokens: List[FenceToken] = []
+def _tokenize_fences(text: str) -> list[FenceToken]:
+    tokens: list[FenceToken] = []
     i, n = 0, len(text)
     while i < n:
         ch = text[i]
@@ -84,7 +83,7 @@ _LABELLED_PATH_RE = re.compile(
 _UNLABELLED_PATH_RE = re.compile(rf'(?P<path>{_PATH_ANY})')
 
 
-def _extract_path_hint_from_lines(lines: List[str]) -> Optional[str]:
+def _extract_path_hint_from_lines(lines: list[str]) -> str | None:
     buf = "\n".join(lines)
     m = _LABELLED_PATH_RE.search(buf)
     if m:
@@ -127,7 +126,7 @@ def _file_score(body: str, language: str) -> float:
     return score
 
 
-def _body_slice_for_open_file(text: str, open_tok: FenceToken, close_tok: FenceToken) -> Tuple[int, int]:
+def _body_slice_for_open_file(text: str, open_tok: FenceToken, close_tok: FenceToken) -> tuple[int, int]:
     """
     Compute [start, end) for a generic code fence body.
     - Prefer starting after the opener line's newline.
@@ -153,7 +152,7 @@ def _body_slice_for_open_file(text: str, open_tok: FenceToken, close_tok: FenceT
 
     end = close_tok.start
     return start, end
-def _best_close_for_open_file(text: str, tokens: List[FenceToken], open_idx: int) -> Optional[int]:
+def _best_close_for_open_file(text: str, tokens: list[FenceToken], open_idx: int) -> int | None:
     """
     Outside-in pairing for generic file blocks.
     Valid closer:
@@ -191,7 +190,7 @@ def _best_close_for_open_file(text: str, tokens: List[FenceToken], open_idx: int
     return best_j
 
 
-def _find_matching_open_for_close(tokens: List[FenceToken], close_idx: int) -> Optional[int]:
+def _find_matching_open_for_close(tokens: list[FenceToken], close_idx: int) -> int | None:
     """
     Scan *backwards* from a closer and match the correct opener using a depth counter.
     - Opener: same fence char, len >=, and has trailing info (lang/id) on the line.
@@ -222,13 +221,13 @@ def _find_matching_open_for_close(tokens: List[FenceToken], close_idx: int) -> O
 # Public API: File blocks
 # =============================
 
-def extract_file_blocks_from_text(markdown_content: str) -> List[Dict[str, object]]:
+def extract_file_blocks_from_text(markdown_content: str) -> list[dict[str, object]]:
     """
     Extract *full file* fenced code blocks (non-diff) using bottom-up, backwards pairing.
     Also exposes body_start/body_end for test compatibility.
     """
     text = markdown_content
-    results: List[Dict[str, object]] = []
+    results: list[dict[str, object]] = []
 
     # Use the robust bottom-up spans (handles nesting; keeps siblings separate).
     spans = _extract_file_spans_bottom_up(text)
@@ -273,7 +272,7 @@ def extract_file_blocks_from_text(markdown_content: str) -> List[Dict[str, objec
     return results
 
 
-def _extract_file_spans_bottom_up(text: str) -> List[dict]:
+def _extract_file_spans_bottom_up(text: str) -> list[dict]:
     """
     Extract fenced file/code blocks from `text`.
     Bottom-up strategy:
@@ -283,16 +282,13 @@ def _extract_file_spans_bottom_up(text: str) -> List[dict]:
       3) Mark the whole span as covered so we skip any inner fences subsequently.
     """
     tokens = _tokenize_fences(text)
-    results: List[dict] = []
+    results: list[dict] = []
 
     # Keep covered character spans to avoid producing overlapping blocks.
-    covered: List[Tuple[int, int]] = []
+    covered: list[tuple[int, int]] = []
 
     def _is_covered(pos: int) -> bool:
-        for a, b in covered:
-            if a <= pos < b:
-                return True
-        return False
+        return any(a <= pos < b for a, b in covered)
 
     # Walk bottom-up so large, outer blocks are claimed first; inner fences get skipped.
     for j in range(len(tokens) - 1, -1, -1):
@@ -343,7 +339,7 @@ def _extract_file_spans_bottom_up(text: str) -> List[dict]:
     return results
 
 
-def _span_slice_including_fences(text: str, open_tok: FenceToken, close_tok: FenceToken) -> Tuple[int, int]:
+def _span_slice_including_fences(text: str, open_tok: FenceToken, close_tok: FenceToken) -> tuple[int, int]:
     """
     Like _body_slice_for_open_file, but returns the absolute span including the opener/closer fence lines.
     Used to 'cover' a region so nested inner fences aren't re-processed.

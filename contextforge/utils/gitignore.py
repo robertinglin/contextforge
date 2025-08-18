@@ -1,7 +1,9 @@
 # contextforge/utils/gitignore.py
 import os
-import pathspec
 from typing import List
+
+import pathspec
+
 
 def get_gitignore(path: str) -> pathspec.PathSpec:
     """
@@ -23,7 +25,7 @@ def get_gitignore(path: str) -> pathspec.PathSpec:
         gi = os.path.join(cur, ".gitignore")
         try:
             if os.path.exists(gi):
-                with open(gi, "r", encoding="utf-8", errors="ignore") as f:
+                with open(gi, encoding="utf-8", errors="ignore") as f:
                     # Splitlines to avoid carrying raw newline characters
                     lines.extend(f.read().splitlines())
                 break

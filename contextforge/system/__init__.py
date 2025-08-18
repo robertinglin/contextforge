@@ -8,10 +8,10 @@ Public API:
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import tempfile
-from typing import Optional
 
 __all__ = ["append_context", "copy_to_clipboard", "write_tempfile"]
 
@@ -66,7 +66,7 @@ def write_tempfile(
     *,
     suffix: str = ".txt",
     prefix: str = "contextforge-",
-    dir: Optional[str] = None,
+    dir: str | None = None,
     encoding: str = "utf-8",
 ) -> str:
     """
@@ -82,10 +82,8 @@ def write_tempfile(
             f.write(text)
     except Exception:
         # If writing fails, clean up the on-disk handle.
-        try:
+        with contextlib.suppress(Exception):
             os.remove(path)
-        except Exception:
-            pass
         raise
     return os.path.realpath(path)
 

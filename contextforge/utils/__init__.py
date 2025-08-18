@@ -1,8 +1,8 @@
 # contextforge/utils/__init__.py
+from .gitignore import get_gitignore
 from .language import _get_language_from_path
 from .parsing import _try_parse_comment_header
 from .paths import _resolve_bare_filename
-from .gitignore import get_gitignore
 from .tree import _generate_tree_string
 
 __all__ = [

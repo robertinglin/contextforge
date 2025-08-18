@@ -1,6 +1,8 @@
 # contextforge/utils/tree.py
 import os
+
 import pathspec
+
 
 def _generate_tree_string(path: str, spec: pathspec.PathSpec) -> str:
     """Generates a string representation of the file tree, respecting .gitignore."""

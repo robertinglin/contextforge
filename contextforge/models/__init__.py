@@ -1,4 +1,4 @@
-from .blocks import Block, FileBlock, DiffBlock
+from .blocks import Block, DiffBlock, FileBlock
 
 __all__ = [
     "Block",

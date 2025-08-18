@@ -1,7 +1,8 @@
 
-import re
 import pytest
-from contextforge.commit.patch import patch_text,  PatchFailedError
+
+from contextforge.commit.patch import PatchFailedError, patch_text
+
 
 def test_missing_old_and_pattern_raises():
     with pytest.raises(PatchFailedError):

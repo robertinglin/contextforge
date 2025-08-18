@@ -1,12 +1,14 @@
 import os
 import stat
-import pytest
 from unittest.mock import patch
+
+import pytest
 
 from contextforge.commit.core import Change, commit_changes
 
+
 def read(path):
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         return f.read()
 
 @pytest.mark.parametrize("atomic", [True, False])
@@ -58,19 +60,19 @@ def test_atomic_promotion_rollback(tmp_path):
     (base / "a.txt").write_text("original A")
     (base / "b.txt").write_text("original B")
     (base / "c.txt").mkdir() # Make this a directory to cause os.replace to fail
-    
+
     changes = [
         Change("a.txt", "new A", "original A", is_new=False),
         Change("b.txt", "new B", "original B", is_new=False),
         Change("c.txt", "new C", "", is_new=True), # This will fail on promotion
     ]
-    
+
     summary = commit_changes(str(base), changes, mode="fail_fast", atomic=True)
 
     assert "c.txt" in summary.failed
     assert "a.txt" not in summary.success
     assert "b.txt" not in summary.success
-    
+
     # Assert rollback
     assert read(base / "a.txt") == "original A"
     assert read(base / "b.txt") == "original B"
@@ -78,15 +80,15 @@ def test_atomic_promotion_rollback(tmp_path):
 
 @patch("tempfile.mkstemp")
 def test_staging_failure_cleanup(mock_mkstemp, tmp_path):
-    mock_mkstemp.side_effect = IOError("Disk full")
+    mock_mkstemp.side_effect = OSError("Disk full")
     base = tmp_path
     changes = [Change("a.txt", "A", "", is_new=True)]
-    
+
     summary = commit_changes(str(base), changes, mode="fail_fast", atomic=True)
-    
+
     assert "a.txt" in summary.failed
     assert "Disk full" in summary.errors["a.txt"]
-    
+
     assert not (base / "a.txt").exists()
     temp_files = [f for f in os.listdir(base) if f.startswith(".cf-")]
     assert not temp_files
@@ -103,25 +105,25 @@ def test_dry_run_permissions_probe(tmp_path):
         pytest.skip("Could not set directory to read-only")
 
     changes = [Change("unwritable/a.txt", "A", "", is_new=True)]
-    
+
     summary = commit_changes(str(base), changes, mode="fail_fast", dry_run=True)
-    
+
     if os.name != 'nt':
         assert "unwritable/a.txt" in summary.failed
         assert "PermissionError" in summary.errors["unwritable/a.txt"]
-    
+
     # cleanup
     os.chmod(unwritable_dir, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
 
 def test_directory_creation(tmp_path):
     base = tmp_path
     changes = [Change("new/deep/dir/file.txt", "content", "", is_new=True)]
-    
+
     # Non-atomic
     summary = commit_changes(str(base), changes, atomic=False)
     assert "new/deep/dir/file.txt" in summary.success
     assert read(base / "new/deep/dir/file.txt") == "content"
-    
+
     # Atomic
     (base / "new/deep/dir/file.txt").unlink()
     (base / "new/deep/dir").rmdir()
