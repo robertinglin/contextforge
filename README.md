@@ -119,51 +119,6 @@ def add(a, b):
     return a + b
 ```
 
-"""
-
-# (B) Parse into normalized blocks (diffs or whole files), with best-effort file path detection:
-
-blocks = list(parse\_markdown\_string(md))
-
-# (C) Build a simple plan by using any pre-classification (file path + change type) the parser found:
-
-planned = \[]
-for b in blocks:
-meta = b.get("pre\_classification") or b.get("synthetic\_info")
-if not meta:
-continue
-planned.append({"metadata": meta, "block": b})
-
-# (D) Materialize edits offline (no writes yet): apply diffs / prepare final file contents
-
-repo\_dir = os.getcwd()
-file\_edits = plan\_and\_generate\_changes(planned, repo\_dir)
-
-# file\_edits -> list of dicts with keys: file\_path, new\_content, original\_content, is\_new, block\_id, ...
-
-# (E) Commit to disk safely
-
-changes = \[
-Change(
-path=fe\["file\_path"],
-new\_content=fe\["new\_content"],
-original\_content=fe\["original\_content"],
-is\_new=fe\["is\_new"],
-)
-for fe in file\_edits
-]
-
-summary = commit\_changes(
-repo\_dir,
-changes,
-mode="best\_effort",  # or "fail\_fast"
-atomic=True,         # stage + atomic promote via os.replace
-backup\_ext=".bak",   # write backups for pre-existing files
-)
-print(summary.success, summary.failed)
-
-````
-
 ### 4) Build a “context bundle” (tree + files + instructions)
 
 `build_context` expects a small request object with:
