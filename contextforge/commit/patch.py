@@ -224,10 +224,7 @@ def _parse_simplified_patch_hunks(patch_str: str) -> list[dict]:
                 hunks.append({"lines": current_hunk_lines})
                 current_hunk_lines = []
         else:
-            # A line is content if it's a diff line but NOT a file header.
-            # This logic should mirror the check in the header-skipping loop.
-            is_header = line.startswith("--- ") or line.startswith("+++ ")
-            if (line == "" or line[:1] in (" ", "+", "-")) and not is_header:
+            if line == "" or line[:1] in (" ", "+", "-"):
                 current_hunk_lines.append(line)
 
     if current_hunk_lines:
@@ -244,13 +241,16 @@ def _find_block_matches(target: list[str], block: list[str], loose: bool = False
         return matches
     n = len(target)
     for i in range(n - m + 1):
-        is_match = True
-        eq_func = _eq_loose if loose else _eq
+        ok = True
         for j in range(m):
-            if not eq_func(target[i + j], block[j]):
-                is_match = False
+            if loose and not _eq_loose(target[i + j], block[j]):
+                ok = False
                 break
-        if is_match:
+        else:
+            if target[i + j] != block[j]:
+                ok = False
+                break
+        if ok:
             matches.append(i)
     return matches
 
