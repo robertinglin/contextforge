@@ -197,6 +197,58 @@ def _body_slice_for_open(text: str, open_tok: FenceToken, close_tok: FenceToken)
 
 
 # =============================
+# Custom Patch Block Extraction
+# =============================
+
+
+def _extract_custom_patch_blocks(text: str) -> list[dict[str, object]]:
+    """Extracts non-fenced diffs that use '*** Begin Patch' / '*** End Patch' delimiters."""
+    results = []
+    # Regex to find blocks. Captures the full block and the inner content separately.
+    # Group 1: full block. Group 2: inner content.
+    pattern = re.compile(
+        r"(^\s*\*\*\*\s*Begin Patch\s*$(.*?)\n^\s*\*\*\*\s*End Patch\s*$)",
+        re.DOTALL | re.MULTILINE,
+    )
+
+    for match in pattern.finditer(text):
+        inner_content = match.group(2).strip()
+
+        # Extract file path from a line like "*** Update File: path" or "*** File: path"
+        # This is loose to accommodate different prefixes as requested.
+        path_match = re.search(r"^\s*\*\*\*\s*.*:\s*(\S+)", inner_content, re.MULTILINE)
+
+        file_path = ""
+        diff_code = inner_content
+
+        if path_match:
+            file_path = path_match.group(1).strip()
+            # The diff code is what's after the path line. Use lstrip to preserve trailing whitespace.
+            diff_code = inner_content[path_match.end() :].lstrip()
+
+        # If the simplified diff content starts with @@ on its own line, strip that line.
+        # This handles the user's originally requested format without breaking standard hunk headers.
+        diff_lines = diff_code.splitlines()
+        if diff_lines and diff_lines[0].strip() == "@@":
+            diff_code = "\n".join(diff_lines[1:])
+
+        results.append(
+            {
+                "code": diff_code.strip("\n"),
+                "lang": "diff",
+                "file_path": file_path,
+                "start": match.start(2),  # Body start
+                "end": match.end(2),  # Body end
+                "open_fence": None,
+                "close_fence": None,
+                "context": _context_before(text, match.start(0), CONTEXT_LINES),
+                "_full_span": (match.start(0), match.end(0)),  # For consumption tracking
+            }
+        )
+    return results
+
+
+# =============================
 # Multi-file splitting
 # =============================
 
@@ -298,6 +350,14 @@ def extract_diffs_from_text(
       }
     """
     text = markdown_content
+
+    # First, extract custom "*** Begin Patch" blocks to avoid them being parsed by fence logic.
+    custom_blocks = _extract_custom_patch_blocks(text)
+    consumed_spans = [b.pop("_full_span") for b in custom_blocks if "_full_span" in b]
+
+    def is_consumed(idx: int) -> bool:
+        return any(start <= idx < end for start, end in consumed_spans)
+
     tokens = _tokenize_fences(text)
     results: list[dict[str, object]] = []
     consumed_until = -1
@@ -305,7 +365,7 @@ def extract_diffs_from_text(
 
     while i < len(tokens):
         tok = tokens[i]
-        if tok.end <= consumed_until:
+        if tok.end <= consumed_until or is_consumed(tok.start):
             i += 1
             continue
 
@@ -381,7 +441,7 @@ def extract_diffs_from_text(
             i += 1
 
     # Fallback: raw diff with no fences at all
-    if not results and _looks_like_diff(text):
+    if not results and not custom_blocks and _looks_like_diff(text):
         file_chunks = _split_multi_file_diff(text) or [("", text)]
         for file_path, chunk in file_chunks:
             results.append(
@@ -397,4 +457,7 @@ def extract_diffs_from_text(
                 }
             )
 
-    return results
+    all_results = custom_blocks + results
+    all_results.sort(key=lambda b: b.get("start", 0))
+
+    return all_results
