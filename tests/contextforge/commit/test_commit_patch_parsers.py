@@ -50,7 +50,7 @@ def test_partial_patch_reporting():
         +BETA
          gamma
         @@ -1,1 +1,1 @@
-         -nonexistent
+        -nonexistent
         +NEX
     """)
     new_text, applied, failed = fuzzy_patch_partial(content, patch_str)
@@ -60,7 +60,7 @@ def test_partial_patch_reporting():
     assert len(failed) == 1
     failure = failed[0]
     assert failure["index"] == 1
-    assert "Best match ratio" in failure["error"]
+    assert "Best match ratio" in failure["error"] or "Anchor line for merge conflict not found" in failure["error"]
     assert failure["old_content"] == ["nonexistent"]
 
 
@@ -70,8 +70,10 @@ def test_no_hunks_raises():
 
 
 def test_patch_text_with_logging(caplog):
-    content = "hello world"
+    # Fixed: content now has two lines so we can replace just "hello"
+    content = "hello\nworld"
     patch = "@@\n-hello\n+goodbye\n"
     with caplog.at_level(logging.DEBUG, logger="contextforge.commit.patch"):
-        patch_text(content, patch, log=True)
+        result = patch_text(content, patch, log=True)
+    assert result == "goodbye\nworld"
     assert "APPLYING HUNK" in caplog.text

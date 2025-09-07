@@ -224,7 +224,7 @@ def _parse_simplified_patch_hunks(patch_str: str) -> list[dict]:
                 hunks.append({"lines": current_hunk_lines})
                 current_hunk_lines = []
         else:
-            if line == "" or line[:1] in (" ", "+", "-"):
+            if line == "" or (line[:1] in (" ", "+", "-") and not (line.startswith("--- ") or line.startswith("+++ "))):
                 current_hunk_lines.append(line)
 
     if current_hunk_lines:
