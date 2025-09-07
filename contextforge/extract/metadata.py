@@ -25,13 +25,13 @@ def detect_deletion_from_diff(code: str) -> Optional[str]:
         path_match = re.search(r"^--- a/(.+)$", code, re.MULTILINE)
         if path_match:
             # .split('\t') handles cases like '--- a/path/to/file   <timestamp>'
-            return path_match.group(1).strip().split("\t")
+            return path_match.group(1).strip().split("\t")[0]
 
     # Look for diff to /dev/null
     if re.search(r"^\+\+\+ .*/dev/null$", code, re.MULTILINE):
         path_match = re.search(r"^--- a/(.+)$", code, re.MULTILINE)
         if path_match:
-            return path_match.group(1).strip().split("\t")
+            return path_match.group(1).strip().split("\t")[0]
 
     return None
 
@@ -109,6 +109,9 @@ def extract_file_info_from_context_and_code(
             if re.search(pattern, code, re.MULTILINE | re.IGNORECASE):
                 return {"file_path": file_path, "change_type": "full_replacement"}
 
+        # If we have a file path and it's not a diff, assume it's a full file replacement.
+        return {"file_path": file_path, "change_type": "full_replacement"}
+
     return None
 
 
@@ -130,18 +133,23 @@ def detect_new_files(markdown_content: str) -> List[str]:
     new_files = set()
     for blk in candidates:
         code = blk.get("code", "")
-        # Case 1: Explicit new file mode after a diff --git header
-        if re.search(r"^\s*new file mode\s+\d+", code, re.MULTILINE):
-            m = re.search(r"^diff\s+--git\s+a/\S+\s+b/(\S+)", code, re.MULTILINE)
-            if m:
-                new_files.add(m.group(1))
-                continue
+        # A diff is for a new file if it has the "new file mode" header or if the "from" file is /dev/null.
+        is_new_file = bool(re.search(r"^\s*new file mode\s+\d+", code, re.MULTILINE)) or bool(
+            re.search(r"^\s*---\s+(?:a/)?/dev/null\s*$", code, re.MULTILINE)
+        )
 
-        # Case 2: /dev/null old header + +++ new path
-        has_devnull = re.search(r"^\s*---\s+(?:a/)?/dev/null\s*$", code, re.MULTILINE)
-        if has_devnull:
-            m2 = re.search(r"^\s*\+\+\+\s+(?:b/)?(\S+)", code, re.MULTILINE)
-            if m2 and m2.group(1) != "/dev/null":
-                new_files.add(m2.group(1))
+        if is_new_file:
+            path = None
+            # The most reliable path is from the "+++ b/path/to/new_file.txt" line.
+            m = re.search(r"^\s*\+\+\+\s+(?:b/)?(\S+)", code, re.MULTILINE)
+            if m and m.group(1) != "/dev/null":
+                path = m.group(1).split("\t")[0]
+            # As a fallback, use the "diff --git" line.
+            elif not path:
+                m = re.search(r"^diff\s+--git\s+a/\S+\s+b/(\S+)", code, re.MULTILINE)
+                if m:
+                    path = m.group(1).split("\t")[0]
+            if path:
+                new_files.add(path)
 
     return sorted(new_files)

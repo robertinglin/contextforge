@@ -44,13 +44,17 @@ def test_gitignore_tree_rendering(tmp_path):
     assert "run.log" not in tree
     assert "node_modules" not in tree
 
-    # Check that root config.py is ignored but nested one is not
     tree_lines = tree.splitlines()
+    # Check that root config.py is ignored but nested one is not.
+    # The root `config.py` should be ignored, so it shouldn't appear at the top level.
+    # A top-level file's line would start with the connector, not indentation.
     assert not any(
-        line.endswith("├── config.py") or line.endswith("└── config.py") for line in tree_lines
-    )
-    assert any(
-        line.endswith("├── config.py") or line.endswith("└── config.py")
+        line.startswith("├── config.py") or line.startswith("└── config.py")
         for line in tree_lines
-        if "src" in line
+    )
+    # The nested 'src/config.py' should be present, which means it will be on a
+    # line that is indented (starts with a space or a vertical bar).
+    assert any(
+        "config.py" in line and (line.startswith(" ") or line.startswith("│"))
+        for line in tree_lines
     )
