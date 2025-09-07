@@ -6,6 +6,36 @@ from ..utils.parsing import _contains_truncation_marker
 from .diffs import extract_diffs_from_text
 
 
+def detect_rename_from_diff(code: str) -> Optional[Dict[str, str]]:
+    """Detects 'rename from'/'rename to' in a diff block."""
+    rename_from_match = re.search(r"^rename from (.+)$", code, re.MULTILINE)
+    rename_to_match = re.search(r"^rename to (.+)$", code, re.MULTILINE)
+    if rename_from_match and rename_to_match:
+        return {
+            "from_path": rename_from_match.group(1).strip(),
+            "to_path": rename_to_match.group(1).strip(),
+        }
+    return None
+
+
+def detect_deletion_from_diff(code: str) -> Optional[str]:
+    """Detects if a diff represents a file deletion and returns the path."""
+    # Look for 'deleted file mode' header
+    if re.search(r"^deleted file mode \d+$", code, re.MULTILINE):
+        path_match = re.search(r"^--- a/(.+)$", code, re.MULTILINE)
+        if path_match:
+            # .split('\t') handles cases like '--- a/path/to/file   <timestamp>'
+            return path_match.group(1).strip().split("\t")
+
+    # Look for diff to /dev/null
+    if re.search(r"^\+\+\+ .*/dev/null$", code, re.MULTILINE):
+        path_match = re.search(r"^--- a/(.+)$", code, re.MULTILINE)
+        if path_match:
+            return path_match.group(1).strip().split("\t")
+
+    return None
+
+
 def extract_file_info_from_context_and_code(
     context: str, code: str, lang: str
 ) -> Optional[Dict[str, str]]:

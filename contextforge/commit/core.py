@@ -1,21 +1,22 @@
 # contextforge/commit/core.py
 import contextlib
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ..errors.path import PathViolation
 
 
 @dataclass
 class Change:
-    """A single file edit slated for commit."""
-
+    """A single filesystem operation slated for commit."""
+    action: str  # "create", "modify", "delete", "rename"
     path: str
-    new_content: str
-    original_content: str
-    is_new: bool
+    new_content: Optional[str] = None
+    original_content: Optional[str] = None
+    from_path: Optional[str] = None
 
 
 @dataclass
@@ -29,13 +30,18 @@ class CommitSummary:
     errors: Dict[str, str] = field(default_factory=dict)
 
 
-def _normalized_path(base_real: str, rel_path: str) -> str:
+def _normalized_path(base_real: str, rel_path: str, check_exists: bool = False) -> str:
     """
     Join and normalize a repository-relative path while enforcing containment.
     Raises PathViolation if the resolved path escapes base_real.
+    If check_exists is False, we don't require the path to exist (for new files/dirs).
     """
     target_path = os.path.join(base_real, *rel_path.split("/"))
-    resolved = os.path.realpath(target_path)
+    # For non-existent paths, realpath can fail or return cwd. Normalize manually.
+    if not check_exists:
+        resolved = os.path.abspath(target_path)
+    else:
+        resolved = os.path.realpath(target_path)
     # Use commonpath for robust containment check (prefix checks are error-prone).
     if os.path.commonpath([base_real, resolved]) != base_real:
         raise PathViolation(f"Path traversal attempt detected for '{rel_path}'")
@@ -71,7 +77,7 @@ def commit_changes(
         dry_run: If True, perform validation and planning only—no writes.
         backup_ext: Optional extension used to write backups of pre-existing
                     files (e.g., ".bak" or "bak"). For new files, no backup
-                    is written.
+                    is written. Deletes and renames ignore this.
 
     Returns:
         CommitSummary describing successes/failures deterministically.
@@ -86,7 +92,15 @@ def commit_changes(
     normalized: List[Tuple[Change, str]] = []
     for ch in changes:
         try:
-            resolved = _normalized_path(base_real, ch.path)
+            # For renames, normalize both paths.
+            if ch.action == "rename" and ch.from_path:
+                from_resolved = _normalized_path(base_real, ch.from_path, check_exists=True)
+                # The target path for rename does not exist yet.
+                resolved = _normalized_path(base_real, ch.path, check_exists=False)
+                # We will operate on the resolved 'from' path
+                normalized.append((ch, from_resolved))
+            else:
+                resolved = _normalized_path(base_real, ch.path, check_exists=True)
             normalized.append((ch, resolved))
         except Exception as e:
             summary.failed.append(ch.path)
@@ -98,15 +112,23 @@ def commit_changes(
     if dry_run:
         for ch, resolved in normalized:
             try:
-                # Check containing directory is or can be created
-                dirpath = os.path.dirname(resolved)
-                # No actual creation; just a simple permission probe if exists
-                if os.path.exists(dirpath) and not os.access(dirpath, os.W_OK):
-                    raise PermissionError(f"No write permission for directory '{dirpath}'")
-                action = "create" if ch.is_new else "write"
-                summary.success.append(
-                    f"DRY RUN: Would {action} {len(ch.new_content)} bytes to {ch.path}"
-                )
+                if ch.action in ("create", "modify"):
+                    # Check containing directory is or can be created
+                    dirpath = os.path.dirname(resolved)
+                    # No actual creation; just a simple permission probe if exists
+                    if os.path.exists(dirpath) and not os.access(dirpath, os.W_OK):
+                        raise PermissionError(f"No write permission for directory '{dirpath}'")
+                    summary.success.append(
+                        f"DRY RUN: Would {ch.action} file {ch.path} ({len(ch.new_content or '')} bytes)"
+                    )
+                elif ch.action == "delete":
+                    if not os.path.exists(resolved):
+                        raise FileNotFoundError(f"File to delete not found: '{ch.path}'")
+                    summary.success.append(f"DRY RUN: Would delete file {ch.path}")
+                elif ch.action == "rename" and ch.from_path:
+                    if not os.path.exists(resolved):  # resolved is from_path here
+                        raise FileNotFoundError(f"File to rename not found: '{ch.from_path}'")
+                    summary.success.append(f"DRY RUN: Would rename {ch.from_path} to {ch.path}")
             except Exception as e:
                 summary.failed.append(ch.path)
                 summary.errors[ch.path] = str(e)
@@ -121,6 +143,9 @@ def commit_changes(
         staging_failed = False
 
         for ch, resolved in normalized:
+            # Skip staging for deletes/renames, they are handled later.
+            if ch.action in ("delete", "rename"):
+                continue
             try:
                 dirpath = os.path.dirname(resolved)
                 os.makedirs(dirpath, exist_ok=True)
@@ -142,39 +167,64 @@ def commit_changes(
                     os.remove(tmp)
             return summary
 
-        # Promote staged files (best-effort or all-or-nothing in fail_fast)
+        # Phase 2: Apply all changes (deletes, renames, promotions)
         promoted: List[Tuple[str, Change]] = []
-        for dest, (tmp, ch) in staged.items():
+        for ch, resolved in normalized:  # Re-iterate to get all changes in order
             try:
-                # Optional backup of existing file before replacement
-                if backup_ext and os.path.exists(dest) and not ch.is_new:
-                    with open(_backup_path(dest, backup_ext), "w", encoding="utf-8") as b:
-                        b.write(ch.original_content or "")
-                os.replace(tmp, dest)  # atomic within a filesystem
-                summary.success.append(ch.path)
-                promoted.append((dest, ch))
+                if ch.action in ("create", "modify"):
+                    dest = resolved
+                    tmp, _ = staged[dest]
+                    # Optional backup of existing file before replacement
+                    if backup_ext and os.path.exists(dest) and ch.action == "modify":
+                        with open(_backup_path(dest, backup_ext), "w", encoding="utf-8") as b:
+                            b.write(ch.original_content or "")
+                    os.replace(tmp, dest)  # atomic within a filesystem
+                    summary.success.append(ch.path)
+                    promoted.append((dest, ch))
+                elif ch.action == "delete":
+                    if os.path.exists(resolved):
+                        os.remove(resolved)
+                    summary.success.append(ch.path)
+                    promoted.append((resolved, ch))  # Use for rollback
+                elif ch.action == "rename" and ch.from_path:
+                    from_path = resolved  # 'resolved' was the from_path for renames
+                    to_path = _normalized_path(base_real, ch.path, check_exists=False)
+                    os.rename(from_path, to_path)
+                    summary.success.append(f"{ch.from_path} -> {ch.path}")
+                    promoted.append((to_path, ch))  # Use to_path for rollback
+
             except Exception as e:
                 summary.failed.append(ch.path)
                 summary.errors[ch.path] = str(e)
                 # Ensure staged blob is cleaned up if replace failed
-                try:
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
-                except Exception:
-                    pass
+                if ch.action in ("create", "modify"):
+                    tmp, _ = staged[resolved]
+                    with contextlib.suppress(Exception):
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+
                 if mode == "fail_fast":
                     # Roll back previous promotions—restore original contents.
                     for pth, pch in reversed(promoted):
                         try:
-                            if pch.is_new:
-                                if os.path.exists(pth):
+                            if pch.action == "create":
+                                with contextlib.suppress(Exception):
                                     os.remove(pth)
-                            else:
+                            elif pch.action == "modify":
                                 with open(pth, "w", encoding="utf-8") as f:
                                     f.write(pch.original_content or "")
+                            elif pch.action == "delete":
+                                # This is tricky, we'd need original content to restore
+                                with open(pth, "w", encoding="utf-8") as f:
+                                    f.write(pch.original_content or "")
+                            elif pch.action == "rename" and pch.from_path:
+                                from_path_rb = _normalized_path(base_real, pch.from_path, check_exists=False)
+                                with contextlib.suppress(Exception):
+                                    os.rename(pth, from_path_rb)
                         except Exception:
                             # Best-effort rollback; remain silent per library default.
                             pass
+                    summary.success.clear()
                     return summary
         return summary
 
@@ -182,15 +232,27 @@ def commit_changes(
     written: List[Tuple[str, Change]] = []
     for ch, resolved in normalized:
         try:
-            dirpath = os.path.dirname(resolved)
-            os.makedirs(dirpath, exist_ok=True)
-            if backup_ext and os.path.exists(resolved) and not ch.is_new:
-                with open(_backup_path(resolved, backup_ext), "w", encoding="utf-8") as b:
-                    b.write(ch.original_content or "")
-            with open(resolved, "w", encoding="utf-8") as f:
-                f.write(ch.new_content)
-            summary.success.append(ch.path)
-            written.append((resolved, ch))
+            if ch.action in ("create", "modify"):
+                dirpath = os.path.dirname(resolved)
+                os.makedirs(dirpath, exist_ok=True)
+                if backup_ext and os.path.exists(resolved) and ch.action == "modify":
+                    shutil.copy2(resolved, _backup_path(resolved, backup_ext))
+                with open(resolved, "w", encoding="utf-8") as f:
+                    f.write(ch.new_content or "")
+                summary.success.append(ch.path)
+                written.append((resolved, ch))
+            elif ch.action == "delete":
+                if os.path.exists(resolved):
+                    os.remove(resolved)
+                summary.success.append(ch.path)
+                written.append((resolved, ch))
+            elif ch.action == "rename" and ch.from_path:
+                from_path = resolved
+                to_path = _normalized_path(base_real, ch.path, check_exists=False)
+                os.rename(from_path, to_path)
+                summary.success.append(f"{ch.from_path} -> {ch.path}")
+                written.append((to_path, ch))
+
         except Exception as e:
             summary.failed.append(ch.path)
             summary.errors[ch.path] = str(e)

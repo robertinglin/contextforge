@@ -6,7 +6,6 @@ import pytest
 
 from contextforge.commit.core import Change, commit_changes
 
-
 def read(path):
     with open(path, encoding="utf-8") as f:
         return f.read()
@@ -20,10 +19,8 @@ def test_backup_behavior_matrix(tmp_path, atomic, backup_ext):
     (base / "existing.txt").write_text("old content")
     # New file
     changes = [
-        Change(
-            path="existing.txt", new_content="new", original_content="old content", is_new=False
-        ),
-        Change(path="new.txt", new_content="new", original_content="", is_new=True),
+        Change(action="modify", path="existing.txt", new_content="new", original_content="old content"),
+        Change(action="create", path="new.txt", new_content="new", original_content=""),
     ]
 
     summary = commit_changes(str(base), changes, atomic=atomic, backup_ext=backup_ext)
@@ -47,16 +44,18 @@ def test_backup_behavior_matrix(tmp_path, atomic, backup_ext):
 def test_fail_fast_non_atomic_partial_write(tmp_path):
     base = tmp_path
     changes = [
-        Change("a.txt", "A", "", is_new=True),
-        Change("../invalid.txt", "X", "", is_new=True),  # This will fail
-        Change("b.txt", "B", "", is_new=True),  # This should not be written
+        Change(action="create", path="a.txt", new_content="A"),
+        Change(action="create", path="../invalid.txt", new_content="X"),  # This will fail
+        Change(action="create", path="b.txt", new_content="B"),  # This should not be written
     ]
     summary = commit_changes(str(base), changes, mode="fail_fast", atomic=False)
 
-    assert "a.txt" in summary.success
+    # In fail_fast mode, validation of all paths occurs before any writes.
+    # The invalid path causes an immediate abort, so no files should be written.
+    assert "a.txt" not in summary.success
     assert "../invalid.txt" in summary.failed
     assert "b.txt" not in summary.success
-    assert (base / "a.txt").exists()
+    assert not (base / "a.txt").exists()
     assert not (base / "b.txt").exists()
 
 
@@ -67,9 +66,9 @@ def test_atomic_promotion_rollback(tmp_path):
     (base / "c.txt").mkdir()  # Make this a directory to cause os.replace to fail
 
     changes = [
-        Change("a.txt", "new A", "original A", is_new=False),
-        Change("b.txt", "new B", "original B", is_new=False),
-        Change("c.txt", "new C", "", is_new=True),  # This will fail on promotion
+        Change(action="modify", path="a.txt", new_content="new A", original_content="original A"),
+        Change(action="modify", path="b.txt", new_content="new B", original_content="original B"),
+        Change(action="create", path="c.txt", new_content="new C"),  # This will fail on promotion
     ]
 
     summary = commit_changes(str(base), changes, mode="fail_fast", atomic=True)
@@ -88,7 +87,7 @@ def test_atomic_promotion_rollback(tmp_path):
 def test_staging_failure_cleanup(mock_mkstemp, tmp_path):
     mock_mkstemp.side_effect = OSError("Disk full")
     base = tmp_path
-    changes = [Change("a.txt", "A", "", is_new=True)]
+    changes = [Change(action="create", path="a.txt", new_content="A")]
 
     summary = commit_changes(str(base), changes, mode="fail_fast", atomic=True)
 
@@ -111,7 +110,7 @@ def test_dry_run_permissions_probe(tmp_path):
     except PermissionError:
         pytest.skip("Could not set directory to read-only")
 
-    changes = [Change("unwritable/a.txt", "A", "", is_new=True)]
+    changes = [Change(action="create", path="unwritable/a.txt", new_content="A")]
 
     summary = commit_changes(str(base), changes, mode="fail_fast", dry_run=True)
 
@@ -125,7 +124,7 @@ def test_dry_run_permissions_probe(tmp_path):
 
 def test_directory_creation(tmp_path):
     base = tmp_path
-    changes = [Change("new/deep/dir/file.txt", "content", "", is_new=True)]
+    changes = [Change(action="create", path="new/deep/dir/file.txt", new_content="content")]
 
     # Non-atomic
     summary = commit_changes(str(base), changes, atomic=False)

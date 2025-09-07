@@ -13,7 +13,6 @@ from .extract import (
     detect_new_files,
     extract_blocks_from_text,
     extract_diffs_from_text,
-    extract_file_blocks_from_text,
     extract_file_info_from_context_and_code,
 )
 from .system import append_context, copy_to_clipboard, write_tempfile
@@ -24,7 +23,6 @@ __all__ = [
     "plan_and_generate_changes",
     "extract_blocks_from_text",
     "extract_diffs_from_text",
-    "extract_file_blocks_from_text",
     "extract_file_info_from_context_and_code",
     "detect_new_files",
     "patch_text",
