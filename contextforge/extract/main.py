@@ -4,11 +4,8 @@ from typing import Any, Dict, List, Optional
 
 from .diffs import _looks_like_diff, _extract_custom_patch_blocks, _split_multi_file_diff
 from .extract import extract_all_blocks_from_text
-from .metadata import (
-    detect_deletion_from_diff,
-    detect_rename_from_diff,
-    extract_file_info_from_context_and_code,
-)
+from .metadata import (detect_deletion_from_diff, detect_rename_from_diff,
+                       extract_file_info_from_context_and_code)
 from ..utils.parsing import _try_parse_comment_header
 
 
@@ -144,6 +141,19 @@ def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
                 "file_path": final_file_path or None,
             })
     
+    # If we didn't find any fenced blocks but the whole text looks like a diff,
+    # emit a single diff block (raw diff fallback).
+    if not results and _looks_like_diff(markdown_content):
+        results.append({
+            "type": "diff",
+            "language": "diff",
+            "start": 0,
+            "end": len(markdown_content),
+            "code": markdown_content,
+            "file_path": None,
+            "context": None,
+        })
+
     # Remove duplicates based on start position and code content
     seen = set()
     deduped = []

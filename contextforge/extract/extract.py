@@ -3,8 +3,7 @@ from __future__ import annotations
 
 import re
 
-# This helper is retained from the previous implementation to find file paths
-# in the context preceding a code block.
+# This helper is retained to find file paths in the context
 _PATH_UNIX = r"(?:\.?/)?(?:[\w.\-]+/)+[\w.\-]+\.[A-Za-z0-9]{1,8}"
 _PATH_WIN = r"(?:[A-Za-z]:\\)?(?:[\w.\-]+\\)+[\w.\-]+\.[A-Za-z0-9]{1,8}"
 _FILENAME = r"[\w.\-]+\.[A-Za-z0-9]{1,8}"
@@ -36,35 +35,41 @@ def _context_before(text: str, idx: int, lines: int = 5) -> str:
 
 def extract_all_blocks_from_text(markdown_content: str) -> list[dict[str, object]]:
     """
-    Extracts all fenced code blocks that are not diffs.
+    Extract all **top-level** fenced code blocks (backticks or tildes, fence
+    length >= 3). Nested fences are treated as plain text inside their parent,
+    so only the outermost block is emitted.
 
-    This implementation correctly handles nested code blocks by looking ahead.
-    For each potential start fence, it expands its search window past subsequent
-    start fences until it finds a chunk that contains a closing fence. This ensures
-    that nested blocks are consumed as content of their parent block.
+    Supports:
+      - Backtick (```...```) and tilde (~~~...~~~) fences
+      - Long fences (e.g. ````go ... ````) and closers at end of line
+      - Attributes in info string (file=, from=, to=)
+      - Path hints from nearby prose
     """
     text = markdown_content
-    blocks = []
-    start_pattern = re.compile(r"```(.*)", re.MULTILINE)
-    matches = list(start_pattern.finditer(text))
+    blocks: list[dict[str, object]] = []
 
+    # Top-level opener: start of line, 3+ of the same fence char (` or ~)
+    opener_re = re.compile(r"(?m)^[ \t]*(?P<fence>(?P<ch>`|~)\2{2,})(?P<info>[^\n\r]*)")
     i = 0
-    while i < len(matches):
-        current_match = matches[i]
-        info_string = current_match.group(1).strip()
 
+    while True:
+        m = opener_re.search(text, i)
+        if not m:
+            break
+
+        fence = m.group("fence")
+        ch = m.group("ch")
+        fence_len = len(fence)
+        info_string = (m.group("info") or "").strip()
+
+        # Parse info string
         parts = info_string.split()
         lang = ""
         file_path_hint = ""
         rename_from = ""
         rename_to = ""
-
-        if parts:
-            # lang is the first part if it doesn't contain '='
-            if "=" not in parts[0]:
-                lang = parts[0].lower()
-
-        # Parse attributes for rename/move/delete
+        if parts and "=" not in parts[0]:
+            lang = parts[0].lower()
         for part in parts:
             if part.startswith("file="):
                 file_path_hint = part.split("=", 1)[1].strip("'\"")
@@ -73,78 +78,93 @@ def extract_all_blocks_from_text(markdown_content: str) -> list[dict[str, object
             elif part.startswith("to="):
                 rename_to = part.split("=", 1)[1].strip("'\"")
 
-        # Find the search window for this block's content. We need to look
-        # ahead past any nested blocks.
-        search_end_offset = -1
-        next_top_level_idx = i
+        # Code starts right after the opener line break (support CRLF)
+        code_start = m.end()
+        if code_start < len(text) and text[code_start] in "\r\n":
+            if text[code_start] == "\r" and code_start + 1 < len(text) and text[code_start + 1] == "\n":
+                code_start += 2
+            else:
+                code_start += 1
+
+        # Scan forward for the matching closer, counting inner openers of
+        # the same fence char/length as nested content.
+        same_fence_seq = re.compile(re.escape(ch) + r"{" + str(fence_len) + r",}")
+        pos = code_start
+        nesting = 0
+        code_end = None
 
         while True:
-            next_top_level_idx += 1
-            if next_top_level_idx < len(matches):
-                prospective_end = matches[next_top_level_idx].start()
-            else:
-                prospective_end = len(text)
-
-            # The chunk is from the end of the current fence to the start of the next one.
-            chunk = text[current_match.end() : prospective_end]
-
-            if "```" in chunk:
-                # This chunk contains a closer, so this is our block boundary.
-                search_end_offset = prospective_end
+            c = same_fence_seq.search(text, pos)
+            if not c:
                 break
 
-            if next_top_level_idx >= len(matches):
-                # We've reached the end of the file without finding a closer.
-                break  # search_end_offset remains -1
+            # Line boundaries around this fence sequence
+            line_start = text.rfind("\n", 0, c.start())
+            if line_start == -1:
+                line_start = 0
+            else:
+                line_start += 1
+            line_end = text.find("\n", c.end())
+            if line_end == -1:
+                line_end = len(text)
 
-        if search_end_offset == -1:
-            # Unclosed block, ignore it.
-            i += 1
+            before = text[line_start:c.start()]
+            after = text[c.end():line_end]
+            at_line_start = before.strip() == ""
+            only_space_after = after.strip() == ""
+
+            # Heuristic:
+            # - An opener appears at the start of a line and has non-empty info after the fence.
+            # - A closer has only whitespace after the fence (and may be at EOL or on its own line).
+            is_closer = only_space_after
+            is_opener = at_line_start and not only_space_after
+
+            if is_opener:
+                nesting += 1
+                pos = c.end()
+                continue
+
+            if is_closer:
+                if nesting > 0:
+                    nesting -= 1
+                    pos = c.end()
+                    continue
+                code_end = c.start()
+                # Advance i to the end of the closer line so we keep scanning top-level
+                i = line_end + (1 if line_end < len(text) and text[line_end:line_end + 1] == "\n" else 0)
+                break
+
+            # Otherwise, skip this fence-like sequence
+            pos = c.end()
+
+        # If unclosed, skip this block
+        if code_end is None:
+            i = m.end()
             continue
 
-        # The block content starts after the opening fence line.
-        code_start_offset = current_match.end()
-        nl_after_fence = text.find("\n", code_start_offset)
-        if nl_after_fence != -1 and nl_after_fence < search_end_offset:
-            code_start_offset = nl_after_fence + 1
+        code = text[code_start:code_end].rstrip("\r\n")
 
-        # We have a valid window. Find the last '```' in it to get the code.
-        content_window = text[code_start_offset:search_end_offset]
-        end_fence_pos_in_window = content_window.rfind("```")
-
-        if end_fence_pos_in_window == -1:
-            # This should not happen due to the check above, but as a safeguard:
-            i = next_top_level_idx
-            continue
-
-        code = content_window[:end_fence_pos_in_window].rstrip("\r\n")
-        code_end_offset = code_start_offset + end_fence_pos_in_window
-
-        # Extract file path from context before the block as a fallback
+        # Fallback path hint: check a couple of lines before the opener
         if not file_path_hint:
-            context_lines = text[: current_match.start()].splitlines()[-2:]
+            context_lines = text[: m.start()].splitlines()[-2:]
             file_path_hint = _extract_path_hint_from_lines(context_lines) or ""
-        language = lang if lang else "plain"
 
+        language = lang if lang else "plain"
         block_data = {
-            "type": "code",  # Generic type, will be classified later
+            "type": "code",
             "language": language,
             "code": code,
             "file_path": file_path_hint,
-            "start": code_start_offset,
-            "end": code_end_offset,
-            "body_start": code_start_offset,
-            "body_end": code_end_offset,
-            "context": _context_before(text, current_match.start()),
+            "start": code_start,
+            "end": code_end,
+            "body_start": code_start,
+            "body_end": code_end,
+            "context": _context_before(text, m.start()),
         }
-
         if rename_from and rename_to:
             block_data["rename_from"] = rename_from
             block_data["rename_to"] = rename_to
 
         blocks.append(block_data)
-
-        # Move the main loop index to the start of the next top-level block.
-        i = next_top_level_idx
 
     return blocks
