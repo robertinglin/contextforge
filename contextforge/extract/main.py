@@ -12,17 +12,6 @@ from .metadata import (
 from ..utils.parsing import _try_parse_comment_header
 
 
-def _get_deleted_path_from_diff(code: str) -> Optional[str]:
-    """If a diff represents a file deletion, return the file path."""
-    # A deletion diff has /dev/null as the new file path.
-    if re.search(r"^\+\+\+\s+(?:b/)?/dev/null", code, re.MULTILINE):
-        # The old file path is the one we want.
-        match = re.search(r"^---\s+a/(\S+)", code, re.MULTILINE)
-        if match and match.group(1) != "/dev/null":
-            # .split('\t')[0] handles cases like '--- a/path/to/file   <timestamp>'
-            return match.group(1).strip().split("\t")[0].replace("\\", "/")
-    return None
-
 
 def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
     """

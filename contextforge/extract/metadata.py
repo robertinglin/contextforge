@@ -124,32 +124,28 @@ def detect_new_files(markdown_content: str) -> List[str]:
       - Unified diffs with `--- /dev/null` paired with `+++ b/<path>` (or `+++ <path>`).
     Returns a sorted, de-duplicated list of file paths.
     """
-    candidates = extract_diffs_from_text(
+    from contextforge.extract.main import extract_blocks_from_text
+
+    candidates = extract_blocks_from_text(
         markdown_content,
-        allow_bare_fences_that_look_like_diff=True,
-        split_per_file=True,
     )
 
     new_files = set()
     for blk in candidates:
         code = blk.get("code", "")
-        # A diff is for a new file if it has the "new file mode" header or if the "from" file is /dev/null.
-        is_new_file = bool(re.search(r"^\s*new file mode\s+\d+", code, re.MULTILINE)) or bool(
-            re.search(r"^\s*---\s+(?:a/)?/dev/null\s*$", code, re.MULTILINE)
-        )
 
-        if is_new_file:
-            path = None
-            # The most reliable path is from the "+++ b/path/to/new_file.txt" line.
-            m = re.search(r"^\s*\+\+\+\s+(?:b/)?(\S+)", code, re.MULTILINE)
-            if m and m.group(1) != "/dev/null":
-                path = m.group(1).split("\t")[0]
-            # As a fallback, use the "diff --git" line.
-            elif not path:
-                m = re.search(r"^diff\s+--git\s+a/\S+\s+b/(\S+)", code, re.MULTILINE)
-                if m:
-                    path = m.group(1).split("\t")[0]
-            if path:
-                new_files.add(path)
+        # Case 1: /dev/null old header + +++ new path (most reliable)
+        has_devnull = re.search(r"^\s*---\s+(?:a/)?/dev/null\s*$", code, re.MULTILINE)
+        if has_devnull:
+            m2 = re.search(r"^\s*\+\+\+\s+(?:b/)?(\S+)", code, re.MULTILINE)
+            if m2 and m2.group(1) != "/dev/null":
+                new_files.add(m2.group(1))
+                continue  # Found it, we're good for this block
+
+        # Case 2: Explicit new file mode (often for empty files without a diff hunk)
+        if re.search(r"^\s*new file mode\s+\d+", code, re.MULTILINE):
+            m = re.search(r"^diff\s+--git\s+a/\S+\s+b/(\S+)", code, re.MULTILINE)
+            if m:
+                new_files.add(m.group(1))
 
     return sorted(new_files)
