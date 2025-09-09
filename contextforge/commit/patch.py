@@ -5,6 +5,7 @@ import itertools
 import difflib
 import logging
 import re
+import unicodedata
 
 
 from .._logging import resolve_logger
@@ -158,6 +159,103 @@ def _flatten_ws_outside_quotes(text: str) -> str:
                 i += 1
 
     return "".join(out)
+
+_LEADING_WS_RE = re.compile(r"^[\t ]*")
+
+def _leading_ws(s: str) -> str:
+    """Return the exact leading whitespace (tabs/spaces)."""
+    m = _LEADING_WS_RE.match(s)
+    return m.group(0) if m else ""
+
+def _normalize_quotes(s: str) -> str:
+    """
+    Normalize a few common Unicode quotes to ASCII to reduce spurious mismatches.
+    """
+    tbl = {
+        "\u2018": "'", "\u2019": "'", "\u201B": "'",
+        "\u201C": '"', "\u201D": '"',
+    }
+    return "".join(tbl.get(ch, ch) for ch in s)
+
+def _similarity(a_lines: list[str], b_lines: list[str]) -> float:
+    """
+    Line-wise similarity using SequenceMatcher on trimmed, quote-normalized lines.
+    """
+    a = [_normalize_quotes(x.strip()) for x in a_lines]
+    b = [_normalize_quotes(x.strip()) for x in b_lines]
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+
+_NUMBAR_RE = re.compile(r"^\s*\d+\s*\|\s?")
+def _strip_line_numbers_block(lines: list[str]) -> list[str]:
+    """
+    Remove leading 'NN | ' prefixes that sometimes appear in AI-provided diffs.
+    """
+    changed = False
+    out: list[str] = []
+    for ln in lines:
+        new = _NUMBAR_RE.sub("", ln)
+        changed = changed or (new != ln)
+        out.append(new)
+    # Only return stripped version if anything actually changed—helps avoid loops.
+    return out if changed else lines
+
+def _reindent_relative(new_lines: list[str], search_first: str, matched_first: str) -> list[str]:
+    """
+    Adjust indentation of replacement lines so that the indentation that *search_first*
+    had is replaced by the indentation actually found at *matched_first*.
+
+    Example:
+      search_first indent = "    "  (4 spaces)
+      matched_first indent = "\t"   (tab)
+      For each line in new_lines, if it starts with >= that many spaces, replace
+      that leading prefix with the tab; otherwise, conservatively prefix with tab.
+    """
+    if not new_lines:
+        return new_lines
+    ref_in = _leading_ws(search_first)
+    ref_out = _leading_ws(matched_first)
+    if ref_in == ref_out:
+        return new_lines
+    adjusted: list[str] = []
+    for ln in new_lines:
+        ws = _leading_ws(ln)
+        body = ln[len(ws):]
+        if len(ws) >= len(ref_in):
+            new_ws = ref_out + ws[len(ref_in):]
+        else:
+            # If the line had less indentation than the reference baseline,
+            # still anchor it under the matched indentation.
+            new_ws = ref_out + ws
+        adjusted.append(new_ws + body)
+    return adjusted
+
+def _middle_out_best_window(
+    target: list[str],
+    needle: list[str],
+    start_hint: int,
+    lo: int,
+    hi: int,
+) -> tuple[int, float]:
+    """
+    Search for best fuzzy match by scanning outward from start_hint within [lo, hi).
+    Returns (best_index, best_ratio) or (-1, -1.0) if impossible.
+    """
+    if not target or not needle:
+        return -1, -1.0
+    m = min(len(needle), max(0, hi - lo))
+    if m <= 0:
+        return -1, -1.0
+    mid = max(lo, min(start_hint, hi - m))
+    best_idx, best_ratio = -1, -1.0
+    max_delta = max(mid - lo, (hi - m) - mid)
+    for d in range(0, max_delta + 1):
+        for pos in ([mid] if d == 0 else [mid - d, mid + d]):
+            if pos < lo or pos > hi - m:
+                continue
+            ratio = _similarity(needle[:m], target[pos:pos + m])
+            if ratio > best_ratio:
+                best_idx, best_ratio = pos, ratio
+    return best_idx, best_ratio
 
 def _structure_penalty(
     target: list[str], pos: int, new_content: list[str], lead_ctx: list[str]
@@ -447,7 +545,12 @@ def _apply_hunk_block_style(
         )
         if hits:
             i = min(hits, key=lambda p: abs(p - start_hint))
-            new_lines = target_lines[:i] + to_lines + target_lines[i + len(from_lines) :]
+            # Preserve local indentation of the matched block
+            if to_lines:
+                to_lines_adj = _reindent_relative(to_lines, from_lines[0], target_lines[i])
+            else:
+                to_lines_adj = to_lines
+            new_lines = target_lines[:i] + to_lines_adj + target_lines[i + len(from_lines) :]
             return new_lines, i + len(to_lines)
 
         # Try loose, nearest to hint
@@ -457,11 +560,17 @@ def _apply_hunk_block_style(
         )
         if hits_loose:
             i = min(hits_loose, key=lambda p: abs(p - start_hint))
-            new_lines = target_lines[:i] + to_lines + target_lines[i + len(from_lines) :]
+            # Preserve local indentation of the matched block
+            if to_lines:
+                to_lines_adj = _reindent_relative(to_lines, from_lines[0], target_lines[i])
+            else:
+                to_lines_adj = to_lines
+            new_lines = target_lines[:i] + to_lines_adj + target_lines[i + len(from_lines) :]
             return new_lines, i + len(to_lines)
 
         # JS-ish brace-aware fallback: if lead has a likely function signature,
         # anchor there and replace to the balanced brace end.
+        # Re-indent the replacement to match the target function's indentation.
         sig = next(
             (
                 ln
@@ -478,8 +587,32 @@ def _apply_hunk_block_style(
                 if block_end > len(target_lines) or block_end <= start:
                     block_end = _find_block_end_by_braces(target_lines, start)
                 if block_end != -1 and block_end > start:
-                    new_lines = target_lines[:start] + to_lines + target_lines[block_end:]
-                    return new_lines, start + len(to_lines)
+                    # --- Re-indent to_lines so its baseline (from hunk) maps to the
+                    #     actual indentation of the matched function line in the file.
+                    import re as _re_mod
+
+                    def _lead_ws(s: str) -> str:
+                        m = _re_mod.match(r"^[ \t]*", s or "")
+                        return m.group(0) if m else ""
+
+                    def _reindent_block(lines: list[str], search_ws: str, target_ws: str) -> list[str]:
+                        out = []
+                        for ln in lines:
+                            m = _re_mod.match(r"^[ \t]*", ln)
+                            ws = m.group(0) if m else ""
+                            body = ln[len(ws):]
+                            if len(ws) >= len(search_ws):
+                                new_ws = target_ws + ws[len(search_ws):]
+                            else:
+                                new_ws = target_ws + ws
+                            out.append(new_ws + body)
+                        return out
+
+                    search_ws = _lead_ws(sig)
+                    target_ws = _lead_ws(target_lines[start])
+                    to_lines_adj = _reindent_block(to_lines, search_ws, target_ws)
+                    new_lines = target_lines[:start] + to_lines_adj + target_lines[block_end:]
+                    return new_lines, start + len(to_lines_adj)
 
     # Pure addition (no old_content to find): insert using both lead & tail anchors.
     if not old_content:
@@ -527,8 +660,13 @@ def _apply_hunk_block_style(
             return (abs(p - start_hint), -(lead_hit + tail_hit), struct_pen, p)
 
         i = sorted(exact, key=_score_exact)[0]
-        new_lines = target_lines[:i] + new_content + target_lines[i + len(old_content) :]
-        return new_lines, i + len(new_content)
+        # Adopt indentation from the file where we matched the old block
+        if new_content:
+            new_adj = _reindent_relative(new_content, old_content[0], target_lines[i])
+        else:
+            new_adj = new_content
+        new_lines = target_lines[:i] + new_adj + target_lines[i + len(old_content) :]
+        return new_lines, i + len(new_adj)
 
     # 2) Loose block match(es)
     loose = _find_block_matches(target_lines, old_content, loose=True)
@@ -539,12 +677,12 @@ def _apply_hunk_block_style(
             return (abs(p - start_hint), _structure_penalty(target_lines, p, new_content, lead_ctx))
 
         i = sorted(loose, key=_score_loose)[0]
-        new_lines = target_lines[:i] + new_content + target_lines[i + len(old_content) :]
-        return new_lines, i + len(new_content)
+        new_adj = _reindent_relative(new_content, old_content[0], target_lines[i]) if new_content else new_content
+        new_lines = target_lines[:i] + new_adj + target_lines[i + len(old_content) :]
+        return new_lines, i + len(new_adj)
 
     # 3) Fuzzy window (trimmed tokens). Be robust when old_content is longer than target.
     log.debug("\nFuzzy window search:")
-    log.debug(f"  Looking for {len(old_content)} lines in {len(target_lines)} total lines")
     log.debug("  First 3 lines to match (trimmed):")
     for i, line in enumerate(old_content[:3]):
         log.debug(f"    {i}: {repr(line.strip())}")
@@ -586,6 +724,41 @@ def _apply_hunk_block_style(
                 break
 
     log.debug(f"  Best fuzzy match: ratio={best_ratio:.3f} at position {best_index}")
+    # --- 3b) Middle-out bounded search around the hint (roo-code inspired) ---
+    if best_ratio < threshold:
+        BUF = 40  # small search buffer around the hint
+        lo = max(0, start_hint - (BUF + 1))
+        hi = min(len(target_lines), start_hint + len(old_content) + BUF)
+        mid_idx, mid_ratio = _middle_out_best_window(target_lines, old_content, start_hint, lo, hi)
+        if mid_ratio > best_ratio:
+            log.debug(f"  Middle-out bounded search improved ratio from {best_ratio:.3f} to {mid_ratio:.3f} at {mid_idx}")
+            best_ratio, best_index = mid_ratio, mid_idx
+
+    # --- 3c) Aggressive line-number stripping fallback (e.g., '12 | code') ---
+    if best_ratio < threshold and any(_NUMBAR_RE.match(x) for x in old_content if x):
+        log.debug("  💡 Attempting aggressive line-number stripping on search block...")
+        stripped_old = _strip_line_numbers_block(old_content)
+        # Re-run bounded middle-out search first (fast), then global if needed
+        BUF = 40
+        lo = max(0, start_hint - (BUF + 1))
+        hi = min(len(target_lines), start_hint + len(stripped_old) + BUF)
+        s_idx, s_ratio = _middle_out_best_window(target_lines, stripped_old, start_hint, lo, hi)
+        if s_ratio < threshold:
+            # as a last try, scan globally with normalized comparisons
+            s_best_ratio, s_best_index = -1.0, -1
+            m = min(len(stripped_old), len(target_lines))
+            a_trim = [_normalize_quotes(x.strip()) for x in stripped_old[:m]]
+            for i in range(len(target_lines) - m + 1):
+                b_trim = [_normalize_quotes(x.strip()) for x in target_lines[i:i+m]]
+                r = difflib.SequenceMatcher(None, a_trim, b_trim, autojunk=False).ratio()
+                if r > s_best_ratio:
+                    s_best_ratio, s_best_index = r, i
+            s_idx, s_ratio = s_best_index, s_best_ratio
+        if s_ratio >= threshold and s_idx != -1:
+            log.debug(f"  ✅ Stripped-number match at {s_idx} with ratio={s_ratio:.3f}")
+            best_ratio, best_index = s_ratio, s_idx
+            # Treat as if we matched the original block; replacement still uses new_content
+
     if best_ratio < threshold:
         log.debug("\n  ⚠️  MATCH FAILURE ANALYSIS:")
         log.debug("  Expected to find these lines:")
@@ -687,9 +860,13 @@ def _apply_hunk_block_style(
 
     if best_ratio >= threshold and best_index != -1:
         i = best_index
-        new_lines = target_lines[:i] + new_content + target_lines[i + m :]
-
-        return new_lines, i + len(new_content)
+        # Adopt indentation even in fuzzy mode, if possible
+        if old_content and new_content:
+            new_adj = _reindent_relative(new_content, old_content[0], target_lines[i])
+        else:
+            new_adj = new_content
+        new_lines = target_lines[:i] + new_adj + target_lines[i + m :]
+        return new_lines, i + len(new_adj)
 
     raise PatchFailedError(f"Best match ratio {best_ratio:.2f} is below threshold {threshold:.2f}.")
 

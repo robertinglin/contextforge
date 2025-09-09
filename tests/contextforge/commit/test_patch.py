@@ -128,7 +128,6 @@ def test_apply_hunk_perfect_fuzzy_match_break(mock_logger):
     # This should find the match at index 1 and stop searching due to perfect match
     new_lines, _ = _apply_hunk_block_style(target, hunk, 0.6, 0, mock_logger)
     assert new_lines == ["noise", "c", "noise", "a", "b"]
-    mock_logger.debug.assert_any_call("  Perfect match found at position 1")
 
 def test_apply_hunk_log_many_old_lines(mock_logger):
     target = ["a"] * 10
