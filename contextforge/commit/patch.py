@@ -1,9 +1,11 @@
 # contextforge/apply/patch.py
 from __future__ import annotations
 
+import itertools
 import difflib
 import logging
 import re
+
 
 from .._logging import resolve_logger
 from ..errors.patch import PatchFailedError
@@ -12,6 +14,7 @@ __all__ = ["patch_text", "fuzzy_patch_partial"]
 
 
 # ---------- core helpers ----------
+
 
 
 def _compose_from_to(hunk_lines: list[str]) -> tuple[list[str], list[str]]:
@@ -25,13 +28,12 @@ def _compose_from_to(hunk_lines: list[str]) -> tuple[list[str], list[str]]:
             to_lines.append("")
             continue
         tag = ln[0]
-        body = ln[1:] if tag in " +-+" else ln  # tag handled below
+        body = ln[1:] if tag in " +-+" else ln  # tag handled below (keep raw body incl. leading space)
         if tag != "+":
             from_lines.append(body)
         if tag != "-":
             to_lines.append(body)
     return from_lines, to_lines
-
 
 def _find_block_end_by_braces(lines: list[str], start: int) -> int:
     """
@@ -53,12 +55,6 @@ def _find_block_end_by_braces(lines: list[str], start: int) -> int:
             return i + 1
     return -1
 
-
-def _eq(a: str, b: str) -> bool:
-    """Strict line equality (default)."""
-    return a == b
-
-
 def _eq_loose(a: str, b: str) -> bool:
     """Whitespace-insensitive equality for fuzzy/context matching."""
     return a == b or a.strip() == b.strip()
@@ -76,84 +72,120 @@ def _indent(s: str) -> int:
             break
     return spaces
 
-
-def _brace_depth(lines: list[str], upto: int) -> int:
-    """Very light brace-depth heuristic for C/JS-like code."""
-    depth = 0
-    for ln in lines[: max(0, min(upto, len(lines)))]:
-        for ch in ln:
-            if ch in "{[(":
-                depth += 1
-            elif ch in "}])":
-                depth -= 1
-    return depth
-
-
 def _flatten_ws_outside_quotes(text: str) -> str:
     """
-    Remove comments and non-essential whitespace (spaces/tabs/newlines) from a
-    code block, crucially preserving content inside string literals.
-    Handles both // and # style comments.
+    Remove comments and *all* whitespace (spaces/tabs/newlines) from a code block,
+    including inside string literals. Supports single (' / ") and triple (''' / \"\"\")
+    quotes and strips '#' and '//' comments when not inside a string.
+    Escapes inside strings are preserved.
     """
-    comment_markers = ("#", "//")
     out: list[str] = []
+    i, n = 0, len(text)
+    q: str | None = None  # None | "'" | '"' | "'''" | '"""'
 
-    for line in text.splitlines():
-        # --- Pass 1: Find end of code, respecting quotes ---
-        q: str | None = None
-        code_end_idx = len(line)
-        i = 0
-        while i < len(line):
-            char = line[i]
-            if q:  # Inside a string
-                if char == "\\" and i + 1 < len(line):
+    def starts_with(s: str) -> bool:
+        return text.startswith(s, i)
+
+    while i < n:
+        if q is None:
+            # Handle comments (only when not inside a string)
+            if starts_with("//"):
+                # Skip to end of line
+                while i < n and text[i] != "\n":
+                    i += 1
+                # We drop the newline too because we flatten all whitespace anyway
+                i += 1 if i < n else 0
+                continue
+            if text[i] == "#":
+                while i < n and text[i] != "\n":
+                    i += 1
+                i += 1 if i < n else 0
+                continue
+
+            # Enter string mode (triple quotes first)
+            if starts_with("'''"):
+                q = "'''"
+                out.extend(["'", "'", "'"])
+                i += 3
+                continue
+            if starts_with('"""'):
+                q = '"""'
+                out.extend(['"', '"', '"'])
+                i += 3
+                continue
+            if text[i] in ("'", '"'):
+                q = text[i]
+                out.append(text[i])
+                i += 1
+                continue
+
+            # Outside any string: drop whitespace, keep non-whitespace
+            ch = text[i]
+            if ch not in (" ", "\t", "\r", "\n"):
+                out.append(ch)
+            i += 1
+        else:
+            # Inside a string: preserve escapes and quotes, drop whitespace
+            if q in ("'''", '"""'):
+                if starts_with(q):
+                    out.extend(list(q))
+                    i += 3
+                    q = None
+                    continue
+                ch = text[i]
+                if ch == "\\" and i + 1 < n:
+                    out.append("\\")
+                    out.append(text[i + 1])
                     i += 2
                     continue
-                if char == q:
-                    q = None
-            else:  # Outside a string
-                if char in ("'", '"'):
-                    q = char
-                if any(line[i:].startswith(m) for m in comment_markers):
-                    code_end_idx = i
-                    break
-            i += 1
-
-        code_part = line[:code_end_idx]
-
-        # --- Pass 2: Flatten whitespace on the code part ---
-        q = None
-        i, n = 0, len(code_part)
-        while i < n:
-            ch = code_part[i]
-            if q:
-                out.append(ch)
+                if ch not in (" ", "\t", "\r", "\n"):
+                    out.append(ch)
+                i += 1
+            else:
+                ch = text[i]
                 if ch == "\\" and i + 1 < n:
-                    out.append(code_part[i + 1])
+                    out.append("\\")
+                    out.append(text[i + 1])
                     i += 2
                     continue
                 if ch == q:
+                    out.append(ch)
                     q = None
-            elif ch in ("'", '"'):
-                q = ch
-                out.append(ch)
-            elif ch not in (" ", "\t", "\r", "\n"):
-                out.append(ch)
-            i += 1
+                    i += 1
+                    continue
+                if ch not in (" ", "\t", "\r", "\n"):
+                    out.append(ch)
+                i += 1
 
     return "".join(out)
-
 
 def _structure_penalty(
     target: list[str], pos: int, new_content: list[str], lead_ctx: list[str]
 ) -> int:
     """Lower is better. Penalize positions whose indentation resembles context poorly."""
-    want_indent = (
-        _indent(lead_ctx[-1]) if lead_ctx else _indent(new_content[0] if new_content else "")
-    )
+    # Prefer the indentation of the incoming content if available; fall back to lead context.
+    want_indent = _indent(new_content[0]) if new_content else (_indent(lead_ctx[-1]) if lead_ctx else 0)
     have_indent = _indent(target[pos - 1]) if pos > 0 else 0
     indent_pen = abs(want_indent - have_indent)
     return min(indent_pen, 8)
+
+
+def _split_lead_tail_context(hunk_lines: list[str]) -> tuple[list[str], list[str]]:
+    """Extract leading and trailing context (signs removed)."""
+    lead: list[str] = []
+    tail: list[str] = []
+    n = len(hunk_lines)
+    i = 0
+    while i < n and (hunk_lines[i] == "" or hunk_lines[i].startswith(" ")):
+        lead.append(hunk_lines[i][1:] if hunk_lines[i] != "" else "")
+        i += 1
+    j = n
+    while j > i and (hunk_lines[j - 1] == "" or hunk_lines[j - 1].startswith(" ")):
+        tail.append(hunk_lines[j - 1][1:] if hunk_lines[j - 1] != "" else "")
+        j -= 1
+    tail.reverse()
+    return lead, tail
+
 
 
 def _parse_patch_hunks(patch_str: str) -> list[dict]:
@@ -189,8 +221,6 @@ def _parse_patch_hunks(patch_str: str) -> list[dict]:
     if not hunks:
         raise PatchFailedError("Patch string contains no valid hunks.")
     return hunks
-
-
 def _parse_simplified_patch_hunks(patch_str: str) -> list[dict]:
     """
     Parse patch string using '@@' as a simple hunk separator, ignoring line numbers.
@@ -243,18 +273,17 @@ def _find_block_matches(target: list[str], block: list[str], loose: bool = False
     for i in range(n - m + 1):
         ok = True
         for j in range(m):
-            if loose and not _eq_loose(target[i + j], block[j]):
-                ok = False
-                break
-        else:
-            if target[i + j] != block[j]:
-                ok = False
-                break
+            if loose:
+                if not _eq_loose(target[i + j], block[j]):
+                    ok = False
+                    break
+            else:
+                if target[i + j] != block[j]:
+                    ok = False
+                    break
         if ok:
             matches.append(i)
     return matches
-
-
 def _split_hunk_components(hunk_lines: list[str]) -> tuple[list[str], list[str], list[str]]:
     """Split hunk into old content, new content, and pure context (signs removed)."""
     old_content: list[str] = []
@@ -275,9 +304,16 @@ def _split_hunk_components(hunk_lines: list[str]) -> tuple[list[str], list[str],
             new_content.append(content)
             context_only.append(content)
         elif tag == "-":
-            old_content.append(line[1:])
+            content = line[1:]
+            # Unified diffs usually include one space after the sign; drop that single space.
+            if content.startswith(" "):
+                content = content[1:]
+            old_content.append(content)
         elif tag == "+":
-            new_content.append(line[1:])
+            content = line[1:]
+            if content.startswith(" "):
+                content = content[1:]
+            new_content.append(content)
         else:
             # ignore unknown tags
             pass
@@ -301,7 +337,6 @@ def _split_lead_tail_context(hunk_lines: list[str]) -> tuple[list[str], list[str
     tail.reverse()
     return lead, tail
 
-
 def _adaptive_ctx_window(lead_ctx: list[str], tail_ctx: list[str]) -> int:
     """Pick a context slice size between 3 and 10 based on available context."""
     total = len(lead_ctx) + len(tail_ctx)
@@ -310,7 +345,6 @@ def _adaptive_ctx_window(lead_ctx: list[str], tail_ctx: list[str]) -> int:
     if total >= 20:
         return 10
     return max(3, min(10, 3 + (total - 3) * (10 - 3) // (20 - 3)))
-
 
 def _locate_insertion_index(
     target: list[str],
@@ -339,11 +373,16 @@ def _locate_insertion_index(
         return (abs(pos - start_hint), -anchor_bonus)
 
     if lead_hits and tail_hits:
+        # Prefer an insertion point within [L_end, T] closest to start_hint;
+        # if start_hint is within the range, pick it; otherwise pick the nearer boundary
         for L in lead_hits:
             L_end = L + len(lead_slice)
             for T in tail_hits:
                 if L_end <= T:
-                    pos = max(L_end, min(T, n))
+                    if L_end <= start_hint <= T:
+                        pos = start_hint
+                    else:
+                        pos = L_end if abs(start_hint - L_end) <= abs(T - start_hint) else T
                     key = score_insert(pos, anchor_bonus=2)
                     if best is None or key < best_key:
                         best, best_key = pos, key
@@ -611,49 +650,20 @@ def _apply_hunk_block_style(
                         new_lines = target_lines[:start] + new_content + target_lines[end:]
                         return new_lines, start + len(new_content)
 
-        # --- FINAL FALLBACK: FIND BEST FUZZY BLOCK AND CREATE MERGE CONFLICT ---
-        log.debug(
-            "\n  💡 All precise fallbacks failed. Attempting to find best fuzzy block for merge conflict..."
-        )
+        # --- FINAL FALLBACK: FUZZY WINDOW (NO ANCHOR) MERGE CONFLICT ATTEMPT ---
+        log.debug("\n  💡 All precise fallbacks failed. Attempting fuzzy window merge conflict (no anchor)...")
         if not old_content:
-            raise PatchFailedError(
-                "All patch methods failed and cannot generate conflict for an empty block."
-            )
+            raise PatchFailedError("All patch methods failed and cannot generate conflict for an empty block.")
 
-        anchor_line_stripped = old_content[0].strip()
-        anchor_hits = [
-            i for i, line in enumerate(target_lines) if line.strip() == anchor_line_stripped
-        ]
+        # Reuse best_index/best_ratio computed above on trimmed lines
+        conflict_threshold = 0.25  # lower bar for conflict creation
+        start_line = max(0, best_index)
+        window_len = min(len(old_content), len(target_lines) - start_line) if target_lines else 0
+        end_line = start_line + window_len
 
-        if not anchor_hits:
-            raise PatchFailedError(
-                "Final fallback failed: Anchor line for merge conflict not found."
-            )
-
-        sorted_anchors = sorted(anchor_hits, key=lambda i: abs(i - start_hint))
-        anchor_index = sorted_anchors[0]
-        flat_old_block = _flatten_ws_outside_quotes("\n".join(old_content))
-        best_ratio = -1.0
-        best_end_line = -1
-
-        search_end = min(
-            len(target_lines), anchor_index + len(old_content) * 2 + 20
-        )  # Search a reasonable distance
-        for i in range(anchor_index, search_end):  # Expand window from anchor
-            flat_current_block = _flatten_ws_outside_quotes(
-                "\n".join(target_lines[anchor_index : i + 1])
-            )
-            ratio = difflib.SequenceMatcher(
-                None, flat_current_block, flat_old_block, autojunk=False
-            ).ratio()
-            if ratio > best_ratio:
-                best_ratio, best_end_line = ratio, i + 1
-
-        conflict_threshold = 0.25  # Lower threshold for creating a conflict vs. a clean patch
-        if best_ratio >= conflict_threshold:
-            start_line, end_line = anchor_index, best_end_line
+        if len(old_content) >= 2 and best_ratio >= conflict_threshold and window_len > 0:
             log.debug(
-                f"  ✅ Found best fuzzy block match (ratio={best_ratio:.2f}) on lines [{start_line}-{end_line - 1}]. Inserting merge conflict."
+                f"  ✅ Fuzzy window suitable for conflict (ratio={best_ratio:.2f}) on lines [{start_line}-{end_line - 1}]"
             )
             original_block = target_lines[start_line:end_line]
             conflict_block = []
@@ -662,12 +672,17 @@ def _apply_hunk_block_style(
             conflict_block.append("=======")
             conflict_block.extend(new_content)
             conflict_block.append(">>>>>>> INCOMING CHANGE (from patch)")
-
             new_lines = target_lines[:start_line] + conflict_block + target_lines[end_line:]
             return new_lines, start_line + len(conflict_block)
-        else:
+
+        # If we can't create a reasonable conflict, surface a clear threshold error
+        if len(old_content) >= 2:
             raise PatchFailedError(
                 f"Final fallback failed: Best fuzzy block ratio ({best_ratio:.2f}) is below conflict threshold ({conflict_threshold})."
+            )
+        else:
+            raise PatchFailedError(
+                f"Best match ratio {best_ratio:.2f} is below threshold {threshold:.2f}."
             )
 
     if best_ratio >= threshold and best_index != -1:

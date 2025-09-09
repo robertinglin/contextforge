@@ -87,3 +87,48 @@ def test_custom_patch_flexible_prefix_and_no_path():
     block_no_path = blocks[1]
     assert block_no_path["file_path"] == ""
     assert block_no_path["code"].strip() == "- no path here"
+
+
+def test_extract_unclosed_and_mixed_custom_patches():
+    # Test case with one unclosed patch followed by a regular one.
+    content1 = textwrap.dedent("""
+        Some introductory text.
+
+        *** Begin Patch
+        *** Update File: path/to/unclosed.py
+        @@
+        - unclosed patch content
+
+        *** Begin Patch
+        *** File: path/to/closed.py
+        - closed patch content
+        *** End Patch
+
+        Trailing text.
+    """)
+    blocks1 = extract_diffs_from_text(content1)
+    assert len(blocks1) == 2
+
+    unclosed_block = blocks1[0]
+    assert unclosed_block["file_path"] == "path/to/unclosed.py"
+    assert unclosed_block["code"].strip() == "- unclosed patch content"
+    assert "*** Begin Patch" not in unclosed_block["code"]
+
+    closed_block = blocks1[1]
+    assert closed_block["file_path"] == "path/to/closed.py"
+    assert closed_block["code"].strip() == "- closed patch content"
+
+    # Test case with an unclosed patch at the end of the file.
+    content2 = textwrap.dedent("""
+        Another file.
+
+        *** Begin Patch
+        *** Update File: contextforge/commit/patch.py
+        @@
+        -def _find_block_matches(target: list[str], block: list[str], loose: bool = False) -> list[int]:
+    """)
+    blocks2 = extract_diffs_from_text(content2)
+    assert len(blocks2) == 1
+    block_user = blocks2[0]
+    assert block_user["file_path"] == "contextforge/commit/patch.py"
+    assert block_user["code"].strip() == "-def _find_block_matches(target: list[str], block: list[str], loose: bool = False) -> list[int]:"

@@ -204,18 +204,37 @@ def _body_slice_for_open(text: str, open_tok: FenceToken, close_tok: FenceToken)
 def _extract_custom_patch_blocks(text: str) -> list[dict[str, object]]:
     """Extracts non-fenced diffs that use '*** Begin Patch' / '*** End Patch' delimiters."""
     results = []
-    # Regex to find blocks. Captures the full block and the inner content separately.
-    # Group 1: full block. Group 2: inner content.
-    pattern = re.compile(
-        r"(^\s*\*\*\*\s*Begin Patch\s*$(.*?)\n^\s*\*\*\*\s*End Patch\s*$)",
-        re.DOTALL | re.MULTILINE,
-    )
+    begin_pattern = re.compile(r"^\s*\*\*\*\s*Begin Patch\s*$", re.MULTILINE)
+    begin_matches = list(begin_pattern.finditer(text))
 
-    for match in pattern.finditer(text):
-        inner_content = match.group(2).strip()
+    for i, start_match in enumerate(begin_matches):
+        block_start_pos = start_match.start()
+        content_start_pos = start_match.end()
+        # Skip leading newline if present
+        if content_start_pos < len(text) and text[content_start_pos] == "\n":
+            content_start_pos += 1
+
+        # Determine the end of the current block's content
+        next_begin_match = begin_matches[i + 1] if i + 1 < len(begin_matches) else None
+        search_end_limit = next_begin_match.start() if next_begin_match else len(text)
+
+        end_patch_pattern = re.compile(r"^\s*\*\*\*\s*End Patch\s*$", re.MULTILINE)
+        end_match = end_patch_pattern.search(text, content_start_pos, search_end_limit)
+
+        content_end_pos = 0
+        full_block_end_pos = 0
+        if end_match:
+            # Found an explicit end marker
+            content_end_pos = end_match.start()
+            full_block_end_pos = end_match.end()
+        else:
+            # Block ends at the start of the next block or at the end of the text
+            content_end_pos = search_end_limit
+            full_block_end_pos = search_end_limit
+
+        inner_content = text[content_start_pos:content_end_pos].strip()
 
         # Extract file path from a line like "*** Update File: path" or "*** File: path"
-        # This is loose to accommodate different prefixes as requested.
         path_match = re.search(r"^\s*\*\*\*\s*.*:\s*(\S+)", inner_content, re.MULTILINE)
 
         file_path = ""
@@ -232,19 +251,17 @@ def _extract_custom_patch_blocks(text: str) -> list[dict[str, object]]:
         if diff_lines and diff_lines[0].strip() == "@@":
             diff_code = "\n".join(diff_lines[1:])
 
-        results.append(
-            {
-                "code": diff_code.strip("\n"),
-                "lang": "diff",
-                "file_path": file_path,
-                "start": match.start(2),  # Body start
-                "end": match.end(2),  # Body end
-                "open_fence": None,
-                "close_fence": None,
-                "context": _context_before(text, match.start(0), CONTEXT_LINES),
-                "_full_span": (match.start(0), match.end(0)),  # For consumption tracking
-            }
-        )
+        results.append({
+            "code": diff_code.strip("\n"),
+            "lang": "diff",
+            "file_path": file_path,
+            "start": content_start_pos,
+            "end": content_end_pos,
+            "open_fence": None,
+            "close_fence": None,
+            "context": _context_before(text, block_start_pos, CONTEXT_LINES),
+            "_full_span": (block_start_pos, full_block_end_pos),
+        })
     return results
 
 

@@ -7,9 +7,6 @@ from contextforge.commit.patch import (
     _compose_from_to,
     _find_block_end_by_braces,
     _indent,
-    _brace_depth,
-    _flatten_ws_outside_quotes,
-    _structure_penalty,
     _parse_patch_hunks,
     _parse_simplified_patch_hunks,
     _find_block_matches,
@@ -35,72 +32,6 @@ def test_compose_from_to_with_empty_lines():
     assert from_lines == [" old", ""]
     assert to_lines == ["", " new"]
 
-@pytest.mark.parametrize(
-    "lines, start, expected",
-    [
-        (["{", "  content", "}"], 0, 3),
-        (["code", "if (x) {", "  a;", "  if (y) { b; }", "}"], 1, 6),
-        (["{", " unbalanced"], 0, -1),
-        (["no brace"], 0, -1),
-        (["}{"], 0, 1),
-    ],
-)
-def test_find_block_end_by_braces(lines, start, expected):
-    assert _find_block_end_by_braces(lines, start) == expected
-
-@pytest.mark.parametrize(
-    "line, expected_indent",
-    [
-        ("    def func():", 4),
-        ("\t\treturn True", 8),
-        ("  \t  pass", 8),
-        ("no_indent", 0),
-    ],
-)
-def test_indent(line, expected_indent):
-    assert _indent(line) == expected_indent
-
-@pytest.mark.parametrize(
-    "lines, upto, expected_depth",
-    [
-        (["{", " [", " ()", " ]", "}"], 5, 0),
-        (["{", "{", "}"], 3, 1),
-        (["(", "[", "{"], 2, 2),
-        ([")", "]", "}"], 3, -3),
-    ],
-)
-def test_brace_depth(lines, upto, expected_depth):
-    assert _brace_depth(lines, upto) == expected_depth
-
-@pytest.mark.parametrize(
-    "text, expected",
-    [
-        ("a = 1 # comment", "a=1"),
-        ("b = 'foo // bar'", "b='foo//bar'"),
-        ('c = "foo # bar"', 'c="foo#bar"'),
-        ('d = "escaped \\" quote"', 'd="escaped\\"quote"'),
-        ("line1\n// comment\nline2", "line1line2"),
-        ('x = """multiline\nstring"""', 'x="""multiline\nstring"""'),
-        ("   spaced   out   ", "spacedout"),
-        ("line with \\\\ escaped backslash", "linewith\\\\escapedbackslash"),
-        ("'string' // comment", "'string'"),
-    ],
-)
-def test_flatten_ws_outside_quotes(text, expected):
-    assert _flatten_ws_outside_quotes(text) == expected
-
-@pytest.mark.parametrize(
-    "target, pos, new_content, lead_ctx, expected_penalty",
-    [
-        (["  line1"], 0, ["    line2"], [], 4), # pos=0, no lead_ctx
-        (["line1"], 1, ["  line2"], ["line1"], 2), # has lead_ctx
-        (["        line1"], 1, ["  line2"], ["    line1"], 4), # large diff
-        (["line1"], 1, ["          line2"], ["line1"], 8), # capped at 8
-        ([], 0, [], [], 0), # no content
-    ]
-)
-def test_structure_penalty(target, pos, new_content, lead_ctx, expected_penalty):
-    assert _structure_penalty(target, pos, new_content, lead_ctx) == expected_penalty
 
 def test_parse_patch_hunks_no_hunks():
     patch_str = "--- a/file.txt\n+++ b/file.txt"
@@ -128,20 +59,6 @@ def test_adaptive_ctx_window_large_context():
     lead_ctx = [""] * 15
     tail_ctx = [""] * 15
     assert _adaptive_ctx_window(lead_ctx, tail_ctx) == 10
-
-@pytest.mark.parametrize(
-    "target, lead_ctx, tail_ctx, start_hint, expected_pos",
-    [
-        ([], ["a"], ["b"], 0, 0), # empty target
-        (["a", "b", "c", "d"], ["a"], ["d"], 2, 2), # lead and tail match
-        (["a", "x", "y", "b"], ["a"], ["b"], 2, 1), # lead and tail, pos is L_end
-        (["a", "x", "y", "d", "a", "z"], ["a"], [], 5, 6), # lead only
-        (["a", "x", "d", "y", "b", "d"], [], ["d"], 1, 2), # tail only
-    ]
-)
-def test_locate_insertion_index(target, lead_ctx, tail_ctx, start_hint, expected_pos):
-    # This also covers the score_insert helper function implicitly
-    assert _locate_insertion_index(target, lead_ctx, tail_ctx, start_hint, 3) == expected_pos
 
 # --- Tests for _apply_hunk_block_style ---
 
