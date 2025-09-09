@@ -4,6 +4,12 @@ import textwrap
 from unittest.mock import MagicMock
 
 from contextforge.commit.patch import (
+    _flatten_ws_outside_quotes,
+    _reindent_relative,
+    _strip_line_numbers_block,
+    _middle_out_best_window,
+    _structure_penalty,
+    _find_block_end_by_braces,
     _compose_from_to,
     _find_block_end_by_braces,
     _indent,
@@ -16,6 +22,7 @@ from contextforge.commit.patch import (
     _apply_hunk_block_style,
     patch_text,
     fuzzy_patch_partial,
+    _locate_insertion_index,
 )
 from contextforge.errors.patch import PatchFailedError
 
@@ -265,6 +272,153 @@ def test_fuzzy_patch_partial_eol():
     content_cr = "line1\rline2"
     result_cr, _, _ = fuzzy_patch_partial(content_cr, patch)
     assert result_cr.startswith("line one\r")
+
+
+# ---------- Additional coverage tests ----------
+
+def test_find_block_end_by_braces_balanced():
+    lines = ["function f() {", "  doWork();", "}", "next();"]
+    assert _find_block_end_by_braces(lines, 0) == 3  # exclusive end index
+
+def test_find_block_end_by_braces_unbalanced_returns_minus_one():
+    lines = ["function f() {", "  // missing closing brace"]
+    assert _find_block_end_by_braces(lines, 0) == -1
+
+def test_indent_counts_tabs_as_four():
+    assert _indent("\t  x") == 6  # 4 (tab) + 2 (spaces)
+    assert _indent("    x") == 4
+    assert _indent("x") == 0
+
+def test_flatten_ws_outside_quotes_comments_and_strings():
+    text = (
+        "a // comment trimmed\n"
+        "b # hash comment\n"
+        "t = 'a b\\n c'\n"
+        'u = "x\\t y"\n'
+        "v = '''A B\\nC'''"
+    )
+    out = _flatten_ws_outside_quotes(text)
+    # outside comments/whitespace removed; escapes preserved inside strings; quotes kept
+    assert out == "abt='ab\\nc'u=\"x\\ty\"v='''AB\\nC'''"
+
+def test_strip_line_numbers_block_changes_only_when_present():
+    lines_with = [" 12 | foo", "  7| bar", "baz"]
+    stripped = _strip_line_numbers_block(lines_with)
+    assert stripped == ["foo", "bar", "baz"]
+
+    lines_no = ["alpha", "beta"]
+    same_ref = _strip_line_numbers_block(lines_no)
+    # When nothing changes, function returns original list object to avoid loops
+    assert same_ref is lines_no
+
+def test_reindent_relative_empty_noop():
+    # When new_lines is empty, function should return empty without modification
+    assert _reindent_relative([], "    x", "\tx") == []
+
+def test_structure_penalty_uses_new_content_and_caps():
+    target = ["prev", "  line"]  # pos will read indentation from target[pos-1]
+    pos = 1
+    # want=20 spaces, have=0 -> capped at 8
+    new_content = [" " * 20 + "x"]
+    assert _structure_penalty(target, pos, new_content, lead_ctx=[]) == 8
+
+def test_structure_penalty_uses_lead_context_when_new_empty():
+    target = ["noindent", "line"]
+    pos = 1
+    # new_content empty -> fall back to lead_ctx indentation (4)
+    assert _structure_penalty(target, pos, [], lead_ctx=["    anchor"]) == 4
+
+def test_middle_out_best_window_invalid_range_returns_negative():
+    # hi==lo -> effective window length 0 -> (-1, -1.0)
+    idx, ratio = _middle_out_best_window(["a", "b", "c"], ["x"], start_hint=0, lo=3, hi=3)
+    assert (idx, ratio) == (-1, -1.0)
+
+def test_locate_insertion_index_with_both_anchors_prefers_hint_inside_range():
+    target = ["A", "B", "C", "D", "E", "F"]
+    lead_ctx = ["B"]  # matches at index 1
+    tail_ctx = ["E"]  # matches at index 4
+    # L_end=2, T=4; start_hint inside -> pick start_hint (3)
+    pos = _locate_insertion_index(target, lead_ctx, tail_ctx, start_hint=3, ctx_probe=1)
+    assert pos == 3
+
+def test_locate_insertion_index_lead_only_and_tail_only_and_empty_target():
+    # lead only
+    target = ["a", "lead", "x"]
+    lead_ctx = ["lead"]
+    tail_ctx = []
+    pos = _locate_insertion_index(target, lead_ctx, tail_ctx, start_hint=10, ctx_probe=1)
+    # insert right after lead slice
+    assert pos == 2
+
+    # tail only
+    target = ["tail", "b", "c"]
+    lead_ctx = []
+    tail_ctx = ["tail"]
+    pos = _locate_insertion_index(target, lead_ctx, tail_ctx, start_hint=0, ctx_probe=1)
+    assert pos == 0  # before the tail slice
+
+    # empty target
+    assert _locate_insertion_index([], ["x"], ["y"], start_hint=5, ctx_probe=3) == 0
+
+def test_apply_hunk_fuzzy_perfect_match_break_replaces_window(mock_logger):
+    # target shorter than old_content -> step0/exact/loose all fail, fuzzy gets ratio==1.0 and breaks
+    target = ["A", "B"]
+    hunk = {"lines": ["- A", "- B", "- C", "+ AX", "+ BX", "+ CX"]}
+    new_lines, cursor = _apply_hunk_block_style(target, hunk, threshold=0.6, start_hint=0, log=mock_logger)
+    assert new_lines == ["AX", "BX", "CX"]
+    assert cursor == 3
+
+def test_apply_hunk_number_stripping_fallback(mock_logger):
+    # Old block has "NN | " prefixes; file doesn't. Should match after stripping, then replace.
+    target = ["line a", "line b", "line c"]
+    hunk = {"lines": ["- 10 | line a", "- 11 | line b", "+ LINE A", "+ LINE B"]}
+    new_lines, _ = _apply_hunk_block_style(target, hunk, threshold=0.95, start_hint=0, log=mock_logger)
+    assert new_lines == ["LINE A", "LINE B", "line c"]
+
+def test_patch_text_wraps_failed_hunk_error_message():
+    content = "a\nb\n"
+    bad_patch = textwrap.dedent(
+        """\
+        @@ -1,2 +1,2 @@
+        - x
+        + y
+        """
+    )
+    with pytest.raises(PatchFailedError, match=r"^Failed to apply hunk #1:"):
+        patch_text(content, bad_patch)
+
+def test_fuzzy_patch_partial_collects_failed_metadata():
+    content = "a\nb\n"
+    bad_patch = textwrap.dedent(
+        """\
+        @@ -1,2 +1,2 @@
+        - x
+        + y
+        """
+    )
+    new_text, applied, failed = fuzzy_patch_partial(content, bad_patch)
+    assert new_text == content
+    assert applied == []
+    assert len(failed) == 1
+    entry = failed[0]
+    assert entry["index"] == 0
+    # basic keys present
+    assert {"error", "lead_ctx", "tail_ctx", "old_content", "new_content", "header_hint"} <= set(entry.keys())
+
+def test_structured_patch_missing_old_or_pattern_raises():
+    with pytest.raises(PatchFailedError, match="missing 'old' or 'pattern'"):
+        patch_text("content", [{}])
+
+def test_locate_insertion_index_both_anchors_multiple_hits_choose_nearest_hint():
+    # Multiple occurrences of anchors; ensure selection uses nearest within [L_end, T]
+    target = ["s", "L", "x", "L", "y", "T", "end"]
+    lead_ctx = ["L"]
+    tail_ctx = ["T"]
+    # lead hits at 1 and 3; tail hit at 5; for ctx_probe=1, L_end in {2,4}. Range choices: [2,5] or [4,5]
+    # start_hint=4 falls inside both; should pick start_hint (4)
+    pos = _locate_insertion_index(target, lead_ctx, tail_ctx, start_hint=4, ctx_probe=1)
+    assert pos == 4
+    
 def test_duplicate_at_beginning():
     initial = "line1\ntarget\ntarget\nafter\nend\n"
     patch = textwrap.dedent("""

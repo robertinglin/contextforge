@@ -1,7 +1,7 @@
 # contextforge/core.py
 import logging
 import os
-from typing import Dict, Generator, List
+from typing import Dict, Generator, List, Any
 
 from patch import fromstring as patch_fromstring
 
@@ -14,13 +14,68 @@ from .utils.parsing import _contains_truncation_marker
 logger = logging.getLogger(__name__)
 
 
-def parse_markdown_string(markdown_content: str) -> Generator[Dict[str, str], None, None]:
+def parse_markdown_string(markdown_content: str) -> Generator[Dict[str, Any], None, None]:
     """
-    Parses markdown by delegating to the robust block_extractor.
+    Parses markdown by delegating to the robust block extractor and enriches each
+    block with convenient metadata used by downstream planning code.
+
+    Behavior expected by tests:
+      - Only yield blocks of type "diff" or "file". Ignore others.
+      - Preserve the original positional index as `block_id`.
+      - Normalize language as `lang` (diff => "diff"; otherwise use provided language).
+      - Mark synthetic diffs when metadata extraction suggests a 'diff' change.
+      - Pre-classify file blocks either from an explicit `file_path` hint or from
+        context-derived extraction.
     """
     blocks = extract_blocks_from_text(markdown_content)
-    for i, b in enumerate(blocks):
+    for i, raw in enumerate(blocks):
+        b = dict(raw)  # shallow copy so we don't mutate upstream data
         b["block_id"] = i
+
+        btype = b.get("type")
+        # Only process file/diff blocks; ignore others entirely.
+        if btype not in ("diff", "file"):
+            continue
+
+        # Normalize language for convenience in tests/downstream consumers.
+        if btype == "diff":
+            b["lang"] = "diff"
+        else:
+            if b.get("language"):
+                b["lang"] = b["language"]
+
+        # Enrichment / classification
+        context_str = b.get("context", "")
+        code_str = b.get("code", "")
+
+        if btype == "diff":
+            # Attempt to extract file info; if it classifies as a diff, treat as synthetic.
+            try:
+                info = extract_file_info_from_context_and_code(context_str, code_str)
+            except Exception:
+                info = None
+            if info and info.get("change_type") == "diff":
+                b["is_synthetic"] = True
+                b["synthetic_info"] = info
+
+        elif btype == "file":
+            # If there's a direct hint, classify as a full replacement without calling the extractor.
+            if b.get("file_path"):
+                b["is_pre_classified"] = True
+                b["pre_classification"] = {
+                    "file_path": b["file_path"],
+                    "change_type": "full_replacement",
+                }
+            else:
+                # Fall back to extracting from context/code.
+                try:
+                    info = extract_file_info_from_context_and_code(context_str, code_str)
+                except Exception:
+                    info = None
+                if info:
+                    b["is_pre_classified"] = True
+                    b["pre_classification"] = info
+
         yield b
 
 
@@ -35,7 +90,8 @@ def plan_and_generate_changes(planned_changes: List[Dict], codebase_dir: str) ->
         # Be flexible: the plan might be the block itself or nested.
         metadata = plan.get("metadata", plan)
         block = plan.get("block", plan)
-        change_type = metadata.get("type")
+        # Tests pass change_type under 'change_type' (not 'type')
+        change_type = metadata.get("change_type")
 
         # Handle rename and delete operations which don't involve content patching
         if change_type == "rename":
@@ -69,7 +125,8 @@ def plan_and_generate_changes(planned_changes: List[Dict], codebase_dir: str) ->
                 )
         new_content = None
 
-        if change_type == "file":
+        # Treat 'full_replacement' as an alias for a plain file replacement.
+        if change_type in ("file", "full_replacement"):
             if _contains_truncation_marker(block["code"]):
                 logger.warning(
                     "  - WARNING: Truncation markers detected. LLM-based merging is not part of this function. Treating as a full replacement."

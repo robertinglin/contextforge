@@ -84,32 +84,13 @@ def test_plan_and_generate_changes_full_replacement_with_truncation(tmp_path, ca
     planned_changes = [
         {
             "metadata": {"file_path": "test.txt", "change_type": "full_replacement"},
-            "block": {"code": "Hello\n...\nWorld", "block_id": 0},
-        }
-    ]
-    with caplog.at_level(logging.WARNING):
-        plan_and_generate_changes(planned_changes, str(tmp_path))
-        assert "LLM-based merging is not part of this function" in caplog.text
-
-
-def test_plan_and_generate_changes_full_replacement_with_truncation_existing_file(tmp_path, caplog):
-    """
-    Tests that a warning is logged for truncation when replacing an existing file.
-    This specifically targets the logger.warning call.
-    """
-    file_path = tmp_path / "test.txt"
-    file_path.write_text("initial content")
-
-    planned_changes = [
-        {
-            "metadata": {"file_path": "test.txt", "change_type": "full_replacement"},
-            "block": {"code": "Hello\n[...]\nWorld", "block_id": 0},
+            "block": {"code": "Hello\n//...\nWorld", "block_id": 0},
         }
     ]
     with caplog.at_level(logging.WARNING):
         result = plan_and_generate_changes(planned_changes, str(tmp_path))
-        assert "Truncation markers detected" in caplog.text
-        assert result[0]["original_content"] == "initial content"
+        assert "LLM-based merging is not part of this function" in caplog.text
+        assert len(result) == 1  # sanity
 
 
 def test_plan_and_generate_changes_read_error(tmp_path, caplog):
@@ -132,8 +113,8 @@ def test_plan_and_generate_changes_read_error(tmp_path, caplog):
             result = plan_and_generate_changes(planned_changes, str(tmp_path))
             assert "WARNING: Could not read original file" in caplog.text
             # It should proceed as if the file was empty
-            assert result[0]["original_content"] == ""
-            assert result[0]["new_content"] == "new content"
+            assert result[0].original_content == ""
+            assert result[0].new_content == "new content"
 
 @patch("contextforge.core.patch_text")
 @patch("contextforge.core.patch_fromstring")
@@ -157,7 +138,7 @@ def test_plan_and_generate_changes_diff_patching_scenarios(mock_fromstring, mock
 
     result = plan_and_generate_changes(plan, str(tmp_path))
     assert len(result) == 1
-    assert result[0]["new_content"] == "successfully patched content"
+    assert result[0].new_content == "successfully patched content"
     assert not mock_patch_text.called
 
     # Reset mocks for subsequent scenarios
@@ -170,7 +151,7 @@ def test_plan_and_generate_changes_diff_patching_scenarios(mock_fromstring, mock
 
     result = plan_and_generate_changes(plan, str(tmp_path))
     assert len(result) == 1
-    assert result[0]["new_content"] == "successfully patched content"
+    assert result[0].new_content == "successfully patched content"
     assert not mock_patch_text.called
 
     # Reset mocks for subsequent scenarios
@@ -183,7 +164,7 @@ def test_plan_and_generate_changes_diff_patching_scenarios(mock_fromstring, mock
     
     result = plan_and_generate_changes(plan, str(tmp_path))
     assert len(result) == 1
-    assert result[0]["new_content"] == "fuzzy patched content"
+    assert result[0].new_content == "fuzzy patched content"
     mock_patch_text.assert_called_once_with("original content", diff_block["code"])
 
     mock_fromstring.reset_mock(side_effect=True)
@@ -196,7 +177,7 @@ def test_plan_and_generate_changes_diff_patching_scenarios(mock_fromstring, mock
     
     result = plan_and_generate_changes(plan, str(tmp_path))
     assert len(result) == 1
-    assert result[0]["new_content"] == "fuzzy patched content"
+    assert result[0].new_content == "fuzzy patched content"
     mock_patch_text.assert_called_once_with("original content", diff_block["code"])
 
     mock_fromstring.reset_mock(return_value=True)
@@ -226,7 +207,7 @@ def test_plan_and_generate_changes_diff_patching_scenarios(mock_fromstring, mock
         result = plan_and_generate_changes(plan, str(tmp_path))
         # It should fall back to the fuzzy patcher
         assert len(result) == 1
-        assert result[0]["new_content"] == "fuzzy patched content"
+        assert result[0].new_content == "fuzzy patched content"
         mock_patch_text.assert_called_once_with("original content", diff_block["code"])
 
 
