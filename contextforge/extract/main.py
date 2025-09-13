@@ -153,11 +153,26 @@ def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
             "file_path": None,
             "context": None,
         })
-
+    
+    # If the same file path is provided multiple times as a full file, use the last one.
+    # This handles cases where a model refines its answer in a single response.
+    final_results = []
+    seen_full_file_paths = set()
+    for block in reversed(results):
+        # This logic applies only to full file blocks, not diffs
+        is_full_file_block = block.get("type") == "file" and block.get("file_path")
+        if is_full_file_block:
+            file_path = block["file_path"]
+            if file_path in seen_full_file_paths:
+                continue  # Skip older (earlier in text) versions of this file
+            seen_full_file_paths.add(file_path)
+        final_results.append(block)
+    final_results.reverse()  # Restore original order of kept blocks
+    
     # Remove duplicates based on start position and code content
     seen = set()
     deduped = []
-    for r in results:
+    for r in final_results:
         key = (r["start"], r["code"][:100])  # Use first 100 chars as part of key
         if key not in seen:
             seen.add(key)
