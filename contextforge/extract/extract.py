@@ -86,8 +86,8 @@ def extract_all_blocks_from_text(markdown_content: str) -> list[dict[str, object
             else:
                 code_start += 1
 
-        # Scan forward for the matching closer, counting inner openers of
-        # the same fence char/length as nested content.
+        # Scan forward for the matching closer. A fence with an info string is
+        # a nested opener. A fence with no info string is a potential closer.
         same_fence_seq = re.compile(re.escape(ch) + r"{" + str(fence_len) + r",}")
         pos = code_start
         nesting = 0
@@ -98,43 +98,25 @@ def extract_all_blocks_from_text(markdown_content: str) -> list[dict[str, object
             if not c:
                 break
 
-            # Line boundaries around this fence sequence
-            line_start = text.rfind("\n", 0, c.start())
-            if line_start == -1:
-                line_start = 0
-            else:
-                line_start += 1
             line_end = text.find("\n", c.end())
             if line_end == -1:
                 line_end = len(text)
 
-            before = text[line_start:c.start()]
-            after = text[c.end():line_end]
-            at_line_start = before.strip() == ""
-            only_space_after = after.strip() == ""
+            # Check for info string (any non-whitespace content) after the fence on the same line
+            info_present = text[c.end():line_end].strip() != ""
 
-            # Heuristic:
-            # - An opener appears at the start of a line and has non-empty info after the fence.
-            # - A closer has only whitespace after the fence (and may be at EOL or on its own line).
-            is_closer = only_space_after
-            is_opener = at_line_start and not only_space_after
-
-            if is_opener:
+            if info_present:
                 nesting += 1
-                pos = c.end()
-                continue
-
-            if is_closer:
+            else:  # No info string, this is a potential closer
                 if nesting > 0:
                     nesting -= 1
-                    pos = c.end()
-                    continue
-                code_end = c.start()
-                # Advance i to the end of the closer line so we keep scanning top-level
-                i = line_end + (1 if line_end < len(text) and text[line_end:line_end + 1] == "\n" else 0)
-                break
+                else: # Found the top-level closer
+                    code_end = c.start()
+                    # Advance i to start searching for the next block after this one
+                    i = line_end + 1 if line_end < len(text) else len(text)
+                    break
 
-            # Otherwise, skip this fence-like sequence
+            # Continue inner search after this fence sequence
             pos = c.end()
 
         # If unclosed, skip this block
