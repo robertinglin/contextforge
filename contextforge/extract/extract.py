@@ -45,6 +45,10 @@ def extract_all_blocks_from_text(markdown_content: str) -> list[dict[str, object
       - Attributes in info string (file=, from=, to=)
       - Path hints from nearby prose
     """
+    # replace all ``````diff with ```\n```diff to simplify parsing
+    markdown_content = re.sub(r"(?m)^(`{3,})(`{3,}\s*diff.*)", r"\1\n\2", markdown_content)
+   
+    
     text = markdown_content
     blocks: list[dict[str, object]] = []
 

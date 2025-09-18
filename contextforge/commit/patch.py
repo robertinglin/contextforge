@@ -201,14 +201,11 @@ def _strip_line_numbers_block(lines: list[str]) -> list[str]:
 
 def _reindent_relative(new_lines: list[str], search_first: str, matched_first: str) -> list[str]:
     """
-    Adjust indentation of replacement lines so that the indentation that *search_first*
-    had is replaced by the indentation actually found at *matched_first*.
+    Adjust indentation of replacement lines so that the indentation of *search_first*
+    is replaced by the indentation found at *matched_first*.
 
-    Example:
-      search_first indent = "    "  (4 spaces)
-      matched_first indent = "\t"   (tab)
-      For each line in new_lines, if it starts with >= that many spaces, replace
-      that leading prefix with the tab; otherwise, conservatively prefix with tab.
+    This version attempts to translate indentation style (e.g., spaces to tabs)
+    by replacing the patch's base indentation unit with the target's.
     """
     if not new_lines:
         return new_lines
@@ -216,16 +213,20 @@ def _reindent_relative(new_lines: list[str], search_first: str, matched_first: s
     ref_out = _leading_ws(matched_first)
     if ref_in == ref_out:
         return new_lines
+
+    # If the patch has no base indentation, we can't perform a reliable replacement.
+    # Prepending the target indent is a reasonable behavior for new, top-level code.
+    if not ref_in:
+        return [ref_out + ln for ln in new_lines]
+
     adjusted: list[str] = []
     for ln in new_lines:
         ws = _leading_ws(ln)
         body = ln[len(ws):]
-        if len(ws) >= len(ref_in):
-            new_ws = ref_out + ws[len(ref_in):]
-        else:
-            # If the line had less indentation than the reference baseline,
-            # still anchor it under the matched indentation.
-            new_ws = ref_out + ws
+        # Replace all occurrences of the input reference indent with the output reference indent.
+        # This correctly handles multiple levels of indentation if they are consistent
+        # (e.g., converting 8 spaces to 2 tabs if ref_in='    ' and ref_out='\t').
+        new_ws = ws.replace(ref_in, ref_out)
         adjusted.append(new_ws + body)
     return adjusted
 
@@ -589,28 +590,7 @@ def _apply_hunk_block_style(
                 if block_end != -1 and block_end > start:
                     # --- Re-indent to_lines so its baseline (from hunk) maps to the
                     #     actual indentation of the matched function line in the file.
-                    import re as _re_mod
-
-                    def _lead_ws(s: str) -> str:
-                        m = _re_mod.match(r"^[ \t]*", s or "")
-                        return m.group(0) if m else ""
-
-                    def _reindent_block(lines: list[str], search_ws: str, target_ws: str) -> list[str]:
-                        out = []
-                        for ln in lines:
-                            m = _re_mod.match(r"^[ \t]*", ln)
-                            ws = m.group(0) if m else ""
-                            body = ln[len(ws):]
-                            if len(ws) >= len(search_ws):
-                                new_ws = target_ws + ws[len(search_ws):]
-                            else:
-                                new_ws = target_ws + ws
-                            out.append(new_ws + body)
-                        return out
-
-                    search_ws = _lead_ws(sig)
-                    target_ws = _lead_ws(target_lines[start])
-                    to_lines_adj = _reindent_block(to_lines, search_ws, target_ws)
+                    to_lines_adj = _reindent_relative(to_lines, sig, target_lines[start])
                     new_lines = target_lines[:start] + to_lines_adj + target_lines[block_end:]
                     return new_lines, start + len(to_lines_adj)
 
