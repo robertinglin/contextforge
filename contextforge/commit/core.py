@@ -101,7 +101,7 @@ def commit_changes(
                 normalized.append((ch, from_resolved))
             else:
                 resolved = _normalized_path(base_real, ch.path, check_exists=True)
-            normalized.append((ch, resolved))
+                normalized.append((ch, resolved))
         except Exception as e:
             summary.failed.append(ch.path)
             summary.errors[ch.path] = str(e)
