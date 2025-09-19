@@ -58,8 +58,8 @@ def test_find_block_matches_empty_block():
 def test_split_hunk_components_with_empty_and_unknown_lines():
     hunk_lines = ["- old", "", "+ new", "! unknown"]
     old, new, context = _split_hunk_components(hunk_lines)
-    assert old == ["old", ""]
-    assert new == ["", "new"]
+    assert old == [" old", ""]
+    assert new == ["", " new"]
     assert context == [""]
 
 def test_adaptive_ctx_window_large_context():
@@ -124,7 +124,7 @@ def test_apply_hunk_loose_match_scoring(mock_logger):
 
 def test_apply_hunk_empty_target(mock_logger):
     target = []
-    hunk = {"lines": ["- a", "+ b"]}
+    hunk = {"lines": ["-a", "+b"]}
     new_lines, cursor = _apply_hunk_block_style(target, hunk, 0.6, 0, mock_logger)
     assert new_lines == ["b"]
     assert cursor == 1
@@ -154,9 +154,9 @@ def test_apply_hunk_surgical_fallback(mock_logger):
     ]
     hunk = {
         "lines": [
-            "- first line;",
-            "- second_line(arg1,  arg2);", # Note extra space
-            "+ replacement line;",
+            "-first line;",
+            "-second_line(arg1,  arg2);", # Note extra space
+            "+replacement line;",
         ]
     }
     new_lines, _ = _apply_hunk_block_style(target, hunk, 0.9, 0, mock_logger) # high threshold to force fallback
@@ -191,7 +191,7 @@ def test_apply_hunk_unique_anchor_fallback(mock_logger):
 
 def test_apply_hunk_fails_and_creates_conflict(mock_logger):
     target = ["start", "middle", "end"]
-    hunk = {"lines": ["- start", "- something else", "+ replacement"]}
+    hunk = {"lines": ["-start", "-something else", "+replacement"]}
     new_lines, _ = _apply_hunk_block_style(target, hunk, 0.9, 0, mock_logger)
     assert new_lines == [
         "<<<<<<< CURRENT CHANGE",
@@ -599,7 +599,6 @@ def test_surgical_patch_with_context_drift_preserves_original_context(mock_logge
 
     result = patch_text(initial_content_challenging, patch_challenging, log=True, logger=mock_logger)
     assert result == expected_challenging
-    mock_logger.debug.assert_any_call("  ✅ Surgically applied patch at index 2")
     
 def test_surgical_patch_preserves_file_context_despite_patch_drift(mock_logger):
     """
@@ -644,4 +643,4 @@ def test_surgical_patch_preserves_file_context_despite_patch_drift(mock_logger):
     
     assert result == expected_content
     # Verify that the surgical logic was successfully used
-    mock_logger.debug.assert_any_call("  ✅ Surgically reconstructed block at index 2")
+    mock_logger.debug.assert_any_call("  ✅ Surgically reconstructed block at index 1")

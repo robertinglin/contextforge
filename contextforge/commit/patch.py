@@ -229,7 +229,7 @@ def _reindent_relative(new_lines: list[str], search_first: str, matched_first: s
         # (e.g., converting 8 spaces to 2 tabs if ref_in='    ' and ref_out='\t').
         new_ws = ws.replace(ref_in, ref_out)
         adjusted.append(new_ws + body)
-        return adjusted
+    return adjusted
 
 def _surgical_reconstruct_block(
    hunk_lines: List[str],
@@ -267,8 +267,6 @@ def _surgical_reconstruct_block(
            elif tag == "-":
                    seg_i += 1  # drop this line from the file
            elif tag == "+":
-                   if body.startswith(" "):
-                           body = body[1:]
                    out.extend(_reindent_relative([body], search_first, matched_first))
    return out
 
@@ -446,14 +444,9 @@ def _split_hunk_components(hunk_lines: list[str]) -> tuple[list[str], list[str],
             context_only.append(content)
         elif tag == "-":
             content = line[1:]
-            # Unified diffs usually include one space after the sign; drop that single space.
-            if content.startswith(" "):
-                content = content[1:]
             old_content.append(content)
         elif tag == "+":
             content = line[1:]
-            if content.startswith(" "):
-                content = content[1:]
             new_content.append(content)
         else:
             # ignore unknown tags

@@ -118,20 +118,14 @@ def test_plan_and_generate_changes_read_error(tmp_path, caplog):
 
 @patch("contextforge.core.patch_text")
 @patch("contextforge.core.patch_fromstring")
-def test_plan_and_generate_changes_diff_patching_scenarios(mock_fromstring, mock_patch_text, tmp_path, caplog):
-    """
-    Tests various scenarios and fallbacks for applying diffs.
-    """
+def test_diff_patch_standard_success(mock_fromstring, mock_patch_text, tmp_path):
     file_path = tmp_path / "test.txt"
     file_path.write_text("original content")
-    
     diff_block = {
         "code": "--- a/test.txt\n+++ b/test.txt\n@@ -1 +1 @@\n-original content\n+new content",
         "block_id": 0
     }
     plan = [{"metadata": {"file_path": "test.txt", "change_type": "diff"}, "block": diff_block}]
-
-    # Scenario 0: Standard patch succeeds
     mock_patch_set_success = MagicMock()
     mock_patch_set_success.apply.return_value = b"successfully patched content"
     mock_fromstring.return_value = mock_patch_set_success
@@ -141,71 +135,79 @@ def test_plan_and_generate_changes_diff_patching_scenarios(mock_fromstring, mock
     assert result[0].new_content == "successfully patched content"
     assert not mock_patch_text.called
 
-    # Reset mocks for subsequent scenarios
+@patch("contextforge.core.patch_text")
+@patch("contextforge.core.patch_fromstring")
+def test_diff_patch_standard_fails_fuzzy_succeeds(mock_fromstring, mock_patch_text, tmp_path):
+    file_path = tmp_path / "test.txt"
+    file_path.write_text("original content")
+    diff_block = {
+        "code": "--- a/test.txt\n+++ b/test.txt\n@@ -1 +1 @@\n-original content\n+new content",
+        "block_id": 0
+    }
     plan = [{"metadata": {"file_path": "test.txt", "change_type": "diff"}, "block": diff_block}]
-
-    # Scenario 0: Standard patch succeeds
-    mock_patch_set_success = MagicMock()
-    mock_patch_set_success.apply.return_value = b"successfully patched content"
-    mock_fromstring.return_value = mock_patch_set_success
-
-    result = plan_and_generate_changes(plan, str(tmp_path))
-    assert len(result) == 1
-    assert result[0].new_content == "successfully patched content"
-    assert not mock_patch_text.called
-
-    # Reset mocks for subsequent scenarios
-    mock_fromstring.reset_mock()
-    mock_patch_text.reset_mock()
-
-    # Scenario 1: Standard patch fails, fuzzy patch succeeds
     mock_fromstring.side_effect = ValueError("standard patch failed")
     mock_patch_text.return_value = "fuzzy patched content"
-    
+
     result = plan_and_generate_changes(plan, str(tmp_path))
     assert len(result) == 1
     assert result[0].new_content == "fuzzy patched content"
     mock_patch_text.assert_called_once_with("original content", diff_block["code"])
 
-    mock_fromstring.reset_mock(side_effect=True)
-    mock_patch_text.reset_mock()
-
-    # Scenario 2: Standard patch returns False, fuzzy patch succeeds
+@patch("contextforge.core.patch_text")
+@patch("contextforge.core.patch_fromstring")
+def test_diff_patch_standard_returns_false_fuzzy_succeeds(mock_fromstring, mock_patch_text, tmp_path):
+    file_path = tmp_path / "test.txt"
+    file_path.write_text("original content")
+    diff_block = {
+        "code": "--- a/test.txt\n+++ b/test.txt\n@@ -1 +1 @@\n-original content\n+new content",
+        "block_id": 0
+    }
+    plan = [{"metadata": {"file_path": "test.txt", "change_type": "diff"}, "block": diff_block}]
     mock_patch_set = MagicMock()
     mock_patch_set.apply.return_value = False
     mock_fromstring.return_value = mock_patch_set
-    
+    mock_patch_text.return_value = "fuzzy patched content"
+
     result = plan_and_generate_changes(plan, str(tmp_path))
     assert len(result) == 1
     assert result[0].new_content == "fuzzy patched content"
     mock_patch_text.assert_called_once_with("original content", diff_block["code"])
 
-    mock_fromstring.reset_mock(return_value=True)
-    mock_patch_text.reset_mock()
-
-    # Scenario 3: Both standard and fuzzy patch fail
+@patch("contextforge.core.patch_text")
+@patch("contextforge.core.patch_fromstring")
+def test_diff_patch_both_fail(mock_fromstring, mock_patch_text, tmp_path, caplog):
+    file_path = tmp_path / "test.txt"
+    file_path.write_text("original content")
+    diff_block = {
+        "code": "--- a/test.txt\n+++ b/test.txt\n@@ -1 +1 @@\n-original content\n+new content",
+        "block_id": 0
+    }
+    plan = [{"metadata": {"file_path": "test.txt", "change_type": "diff"}, "block": diff_block}]
     mock_fromstring.side_effect = ValueError("standard patch failed")
     mock_patch_text.side_effect = PatchFailedError("fuzzy patch failed")
-    
+
     with caplog.at_level(logging.ERROR):
         result = plan_and_generate_changes(plan, str(tmp_path))
-        assert len(result) == 0  # Change should be skipped
+        assert len(result) == 0
         assert "ERROR: Fuzzy patch failed" in caplog.text
 
-    # Reset mocks for next scenario
-    mock_fromstring.reset_mock(side_effect=True)
-    mock_patch_text.reset_mock()
-
-    # Scenario 4: Standard patch succeeds but returns bytes that fail to decode
+@patch("contextforge.core.patch_text")
+@patch("contextforge.core.patch_fromstring")
+def test_diff_patch_bytes_decode_fails_fuzzy_succeeds(mock_fromstring, mock_patch_text, tmp_path, caplog):
+    file_path = tmp_path / "test.txt"
+    file_path.write_text("original content")
+    diff_block = {
+        "code": "--- a/test.txt\n+++ b/test.txt\n@@ -1 +1 @@\n-original content\n+new content",
+        "block_id": 0
+    }
+    plan = [{"metadata": {"file_path": "test.txt", "change_type": "diff"}, "block": diff_block}]
     mock_patch_set_bad_bytes = MagicMock()
-    # These bytes are not valid UTF-8
     mock_patch_set_bad_bytes.apply.return_value = b"\xff\xfe"
     mock_fromstring.return_value = mock_patch_set_bad_bytes
     mock_patch_text.return_value = "fuzzy patched content"
 
     with caplog.at_level(logging.DEBUG):
         result = plan_and_generate_changes(plan, str(tmp_path))
-        # It should fall back to the fuzzy patcher
         assert len(result) == 1
         assert result[0].new_content == "fuzzy patched content"
         mock_patch_text.assert_called_once_with("original content", diff_block["code"])
