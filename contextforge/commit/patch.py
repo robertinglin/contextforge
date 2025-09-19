@@ -1,6 +1,7 @@
 # contextforge/apply/patch.py
 from __future__ import annotations
 
+from typing import List
 import itertools
 import difflib
 import logging
@@ -228,11 +229,52 @@ def _reindent_relative(new_lines: list[str], search_first: str, matched_first: s
         # (e.g., converting 8 spaces to 2 tabs if ref_in='    ' and ref_out='\t').
         new_ws = ws.replace(ref_in, ref_out)
         adjusted.append(new_ws + body)
-    return adjusted
+        return adjusted
+
+def _surgical_reconstruct_block(
+   hunk_lines: List[str],
+   matched_segment: List[str],
+   search_first: str,
+   matched_first: str,
+) -> List[str]:
+   """
+   Rebuild the replacement block *surgically*:
+         - keep file context lines exactly as they appear in matched_segment
+         - drop '-' lines
+         - insert '+' lines (re-indented to match the file)
+   This prevents overwriting unrelated context drift (e.g., renamed functions).
+   """
+   out: List[str] = []
+   seg_i = 0
+   for raw in hunk_lines:
+           if raw == "":
+                   # blank-as-context: keep file line if available
+                   if seg_i < len(matched_segment):
+                           out.append(matched_segment[seg_i])
+                   else:
+                           out.append("")
+                   seg_i += 1
+                   continue
+           tag = raw[0]
+           body = raw[1:] if tag in " +-+" else raw
+           if tag == " ":
+                   # context comes from the file, not the patch
+                   if seg_i < len(matched_segment):
+                           out.append(matched_segment[seg_i])
+                   else:
+                           out.append(body.lstrip(" "))
+                   seg_i += 1
+           elif tag == "-":
+                   seg_i += 1  # drop this line from the file
+           elif tag == "+":
+                   if body.startswith(" "):
+                           body = body[1:]
+                   out.extend(_reindent_relative([body], search_first, matched_first))
+   return out
 
 def _middle_out_best_window(
-    target: list[str],
-    needle: list[str],
+        target: list[str],
+        needle: list[str],
     start_hint: int,
     lo: int,
     hi: int,
@@ -546,13 +588,16 @@ def _apply_hunk_block_style(
         )
         if hits:
             i = min(hits, key=lambda p: abs(p - start_hint))
-            # Preserve local indentation of the matched block
-            if to_lines:
-                to_lines_adj = _reindent_relative(to_lines, from_lines[0], target_lines[i])
-            else:
-                to_lines_adj = to_lines
-            new_lines = target_lines[:i] + to_lines_adj + target_lines[i + len(from_lines) :]
-            return new_lines, i + len(to_lines)
+            # Rebuild surgically so we don't overwrite drifted context lines.
+            surg = _surgical_reconstruct_block(
+                hunk["lines"],
+                target_lines[i : i + len(from_lines)],
+                from_lines[0] if from_lines else "",
+                target_lines[i] if target_lines else ""
+            )
+            new_lines = target_lines[:i] + surg + target_lines[i + len(from_lines) :]
+            log.debug(f"  ✅ Surgically applied patch at index {i}")
+            return new_lines, i + len(surg)
 
         # Try loose, nearest to hint
         hits_loose = _find_block_matches(target_lines, from_lines, loose=True)
@@ -561,13 +606,15 @@ def _apply_hunk_block_style(
         )
         if hits_loose:
             i = min(hits_loose, key=lambda p: abs(p - start_hint))
-            # Preserve local indentation of the matched block
-            if to_lines:
-                to_lines_adj = _reindent_relative(to_lines, from_lines[0], target_lines[i])
-            else:
-                to_lines_adj = to_lines
-            new_lines = target_lines[:i] + to_lines_adj + target_lines[i + len(from_lines) :]
-            return new_lines, i + len(to_lines)
+            surg = _surgical_reconstruct_block(
+                hunk["lines"],
+                target_lines[i : i + len(from_lines)],
+                from_lines[0] if from_lines else "",
+                target_lines[i] if target_lines else ""
+            )
+            new_lines = target_lines[:i] + surg + target_lines[i + len(from_lines) :]
+            log.debug(f"  ✅ Surgically applied patch at index {i}")
+            return new_lines, i + len(surg)
 
         # JS-ish brace-aware fallback: if lead has a likely function signature,
         # anchor there and replace to the balanced brace end.
@@ -606,7 +653,6 @@ def _apply_hunk_block_style(
     exact = _find_block_matches(target_lines, old_content, loose=False)
     if exact:
         log.debug(f"Exact content match: {len(exact)} hits at positions {exact[:5]}")
-
         def _score_exact(p: int) -> tuple[int, int, int, int]:
             before = target_lines[max(0, p - ctx_probe) : p]
             after = target_lines[p + len(old_content) : p + len(old_content) + ctx_probe]
@@ -640,27 +686,37 @@ def _apply_hunk_block_style(
             return (abs(p - start_hint), -(lead_hit + tail_hit), struct_pen, p)
 
         i = sorted(exact, key=_score_exact)[0]
-        # Adopt indentation from the file where we matched the old block
-        if new_content:
-            new_adj = _reindent_relative(new_content, old_content[0], target_lines[i])
-        else:
-            new_adj = new_content
-        new_lines = target_lines[:i] + new_adj + target_lines[i + len(old_content) :]
-        return new_lines, i + len(new_adj)
+        surg = _surgical_reconstruct_block(
+            hunk["lines"],
+            target_lines[i : i + len(old_content)],
+            old_content[0] if old_content else "",
+            target_lines[i] if target_lines else ""
+        )
+        new_lines = target_lines[:i] + surg + target_lines[i + len(old_content) :]
+        log.debug(f"  ✅ Surgically reconstructed block at index {i}")
+        return new_lines, i + len(surg)
 
     # 2) Loose block match(es)
     loose = _find_block_matches(target_lines, old_content, loose=True)
     if loose:
         log.debug(f"Loose content match: {len(loose)} hits at positions {loose[:5]}")
-
+        
         def _score_loose(p: int) -> tuple[int, int]:
-            return (abs(p - start_hint), _structure_penalty(target_lines, p, new_content, lead_ctx))
+                return (abs(p - start_hint), _structure_penalty(target_lines, p, new_content, lead_ctx))
 
         i = sorted(loose, key=_score_loose)[0]
-        new_adj = _reindent_relative(new_content, old_content[0], target_lines[i]) if new_content else new_content
-        new_lines = target_lines[:i] + new_adj + target_lines[i + len(old_content) :]
-        return new_lines, i + len(new_adj)
+        surg = _surgical_reconstruct_block(
+            hunk["lines"],
+            target_lines[i : i + len(old_content)],
+            old_content[0] if old_content else "",
+            target_lines[i] if target_lines else ""
+        )
+        new_lines = target_lines[:i] + surg + target_lines[i + len(old_content) :]
+        log.debug(f"  ✅ Surgically reconstructed block at index {i}")
+        return new_lines, i + len(surg)
 
+    # 3) Fuzzy window (trimmed tokens). Be robust when old_content is longer than target.
+    log.debug("\nFuzzy window search:")
     # 3) Fuzzy window (trimmed tokens). Be robust when old_content is longer than target.
     log.debug("\nFuzzy window search:")
     log.debug("  First 3 lines to match (trimmed):")
@@ -840,7 +896,19 @@ def _apply_hunk_block_style(
 
     if best_ratio >= threshold and best_index != -1:
         i = best_index
-        # Adopt indentation even in fuzzy mode, if possible
+        # If we matched a full old_content window, prefer surgical reconstruction.
+        if i + len(old_content) <= len(target_lines) and len(old_content) > 0:
+            surg = _surgical_reconstruct_block(
+                hunk["lines"],
+                target_lines[i : i + len(old_content)],
+                old_content[0],
+                target_lines[i]
+            )
+            new_lines = target_lines[:i] + surg + target_lines[i + len(old_content) :]
+            log.debug(f"  ✅ Surgically reconstructed block at index {i}")
+            return new_lines, i + len(surg)
+        # Otherwise fall back to replacing the fuzzy window, preserving tests where
+        # old_content is longer than the file (e.g., perfect-window replacement).
         if old_content and new_content:
             new_adj = _reindent_relative(new_content, old_content[0], target_lines[i])
         else:

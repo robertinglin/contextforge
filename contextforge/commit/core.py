@@ -100,7 +100,9 @@ def commit_changes(
                 # We will operate on the resolved 'from' path
                 normalized.append((ch, from_resolved))
             else:
-                resolved = _normalized_path(base_real, ch.path, check_exists=True)
+                # For create, the path does not exist yet. For modify/delete, it must.
+                must_exist = ch.action in ("modify", "delete")
+                resolved = _normalized_path(base_real, ch.path, check_exists=must_exist)
                 normalized.append((ch, resolved))
         except Exception as e:
             summary.failed.append(ch.path)
@@ -126,7 +128,8 @@ def commit_changes(
                         raise FileNotFoundError(f"File to delete not found: '{ch.path}'")
                     summary.success.append(f"DRY RUN: Would delete file {ch.path}")
                 elif ch.action == "rename" and ch.from_path:
-                    if not os.path.exists(resolved):  # resolved is from_path here
+                    from_path_for_dry_run = _normalized_path(base_real, ch.from_path, check_exists=True)
+                    if not os.path.exists(from_path_for_dry_run):
                         raise FileNotFoundError(f"File to rename not found: '{ch.from_path}'")
                     summary.success.append(f"DRY RUN: Would rename {ch.from_path} to {ch.path}")
             except Exception as e:
