@@ -204,7 +204,6 @@ def test_atomic_delete_and_rename_success(tmp_path, monkeypatch):
     assert del_rel in summary.success
     assert not (tmp_path / del_rel).exists()
     # Rename applied (string contains 'from -> to')
-    print(summary.success)
     assert any(f"{ren_from} -> {ren_to}" in s for s in summary.success)
     assert not (tmp_path / ren_from).exists()
     assert (tmp_path / ren_to).exists()

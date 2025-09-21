@@ -35,32 +35,37 @@ def append_context(
     return out
 
 
-def copy_to_clipboard(text: str) -> bool:
+def copy_to_clipboard(text: str, *, instructions: str | None = None) -> bool:
     """
     Copy `text` to the system clipboard using best-effort, cross-platform fallbacks.
+    If `instructions` are provided, they are prepended to the text.
     Returns True on apparent success, False otherwise.
     """
+    payload = text
+    if instructions:
+        payload = f"{instructions.strip()}\n\n{text}"
+
     try:
         # macOS
         if _which("pbcopy"):
-            proc = subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False)
+            proc = subprocess.run(["pbcopy"], input=payload.encode("utf-8"), check=False)
             return proc.returncode == 0
         # Windows
         if _which("clip"):
-            proc = subprocess.run(["clip"], input=text.encode("utf-8"), shell=True, check=False)
+            proc = subprocess.run(["clip"], input=payload.encode("utf-8"), shell=True, check=False)
             return proc.returncode == 0
         # Linux/BSD: try Wayland then X11
         if _which("wl-copy"):
-            proc = subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=False)
+            proc = subprocess.run(["wl-copy"], input=payload.encode("utf-8"), check=False)
             return proc.returncode == 0
         if _which("xclip"):
             proc = subprocess.run(
-                ["xclip", "-selection", "clipboard"], input=text.encode("utf-8"), check=False
+                ["xclip", "-selection", "clipboard"], input=payload.encode("utf-8"), check=False
             )
             return proc.returncode == 0
         if _which("xsel"):
             proc = subprocess.run(
-                ["xsel", "--clipboard", "--input"], input=text.encode("utf-8"), check=False
+                ["xsel", "--clipboard", "--input"], input=payload.encode("utf-8"), check=False
             )
             return proc.returncode == 0
     except Exception:
