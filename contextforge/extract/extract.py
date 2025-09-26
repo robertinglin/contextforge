@@ -1,6 +1,7 @@
 # Python 3.8+
 from __future__ import annotations
 
+import textwrap
 import re
 
 # This helper is retained to find file paths in the context
@@ -46,7 +47,7 @@ def extract_all_blocks_from_text(markdown_content: str) -> list[dict[str, object
       - Path hints from nearby prose
     """
     # replace all ``````diff with ```\n```diff to simplify parsing
-    markdown_content = re.sub(r"(?m)^(`{3,})(`{3,}\s*diff.*)", r"\1\n\2", markdown_content)
+    markdown_content = re.sub(r"(?m)^(`{3,})(`{3,}.*)", r"\1\n\2", markdown_content)
    
     
     text = markdown_content
@@ -139,7 +140,7 @@ def extract_all_blocks_from_text(markdown_content: str) -> list[dict[str, object
         block_data = {
             "type": "code",
             "language": language,
-            "code": code,
+            "code": textwrap.dedent(code),
             "file_path": file_path_hint,
             "start": code_start,
             "end": code_end,

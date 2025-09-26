@@ -173,7 +173,7 @@ def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
     seen = set()
     deduped = []
     for r in final_results:
-        key = (r["start"], r["code"][:100])  # Use first 100 chars as part of key
+        key = r["file_path"]
         if key not in seen:
             seen.add(key)
             deduped.append(r)

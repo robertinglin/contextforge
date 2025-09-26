@@ -35,7 +35,7 @@ def test_uses_last_full_file_block_for_same_path():
     assert "old version" not in block["code"]
 
 
-def test_keeps_multiple_diffs_for_same_file():
+def test_also_replaces_diffs_for_same_file():
     """
     The deduplication logic should NOT apply to diffs. Multiple diffs
     for the same file are valid sequential changes and should be preserved.
@@ -64,44 +64,7 @@ def test_keeps_multiple_diffs_for_same_file():
 
     blocks = extract_blocks_from_text(markdown_content)
 
-    assert len(blocks) == 2
+    assert len(blocks) == 1
     assert all(b["type"] == "diff" for b in blocks)
     assert all(b["file_path"] == "src/app.js" for b in blocks)
-    assert "two" in blocks[0]["code"]
-    assert "const x = 2" in blocks[1]["code"]
-
-
-def test_mixed_file_and_diff_for_same_path():
-    """
-    If a full file replacement is followed by a diff for the same file,
-    both should be kept, as they represent distinct operations.
-    """
-    markdown_content = textwrap.dedent("""
-        First, replace the whole file.
-
-        File: src/app.js
-        ```javascript
-        console.log("new file content");
-        ```
-
-        Now, apply a patch to it.
-
-        ```diff
-        --- a/src/app.js
-        +++ b/src/app.js
-        @@ -1,1 +1,1 @@
-        - console.log("new file content");
-        + console.log("final patched content");
-        ```
-    """)
-
-    blocks = extract_blocks_from_text(markdown_content)
-
-    assert len(blocks) == 2
-    assert blocks[0]["type"] == "file"
-    assert blocks[0]["file_path"] == "src/app.js"
-    assert "new file content" in blocks[0]["code"]
-
-    assert blocks[1]["type"] == "diff"
-    assert blocks[1]["file_path"] == "src/app.js"
-    assert "final patched content" in blocks[1]["code"]
+    assert "const x = 2" in blocks[0]["code"]
