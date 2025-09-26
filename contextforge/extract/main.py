@@ -154,29 +154,20 @@ def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
             "context": None,
         })
     
-    # If the same file path is provided multiple times as a full file, use the last one.
+    # If the same file path is provided multiple times, use the last one based on start position.
     # This handles cases where a model refines its answer in a single response.
-    final_results = []
-    seen_full_file_paths = set()
-    for block in reversed(results):
-        # This logic applies only to full file blocks, not diffs
-        is_full_file_block = block.get("type") == "file" and block.get("file_path")
-        if is_full_file_block:
-            file_path = block["file_path"]
-            if file_path in seen_full_file_paths:
-                continue  # Skip older (earlier in text) versions of this file
-            seen_full_file_paths.add(file_path)
-        final_results.append(block)
-    final_results.reverse()  # Restore original order of kept blocks
-    
-    # Remove duplicates based on start position and code content
-    seen = set()
-    deduped = []
-    for r in final_results:
-        key = r["file_path"]
-        if key not in seen:
-            seen.add(key)
-            deduped.append(r)
+    latest_blocks_by_path = {}
+    other_blocks = []
+    for block in results:
+        file_path = block.get("file_path")
+        if file_path:
+            if file_path not in latest_blocks_by_path or block["start"] > latest_blocks_by_path[file_path]["start"]:
+                latest_blocks_by_path[file_path] = block
+        else:
+            other_blocks.append(block)
+
+    # Combine the deduplicated blocks with the others and sort to restore order.
+    deduped = other_blocks + list(latest_blocks_by_path.values())
     
     # Sort by start position for stable ordering
     return sorted(deduped, key=lambda b: b["start"])

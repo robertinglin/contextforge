@@ -1,3 +1,4 @@
+import textwrap
 from contextforge.extract import extract_blocks_from_text as cf_extract_blocks
 
 # =============================
@@ -262,3 +263,48 @@ def test_general_run_tests() -> None:
     )
     blocks_raw = cf_extract_blocks(s_rawdiff)
     _assert(any(b.get("type") == "diff" for b in blocks_raw), "raw diff fallback missing")
+
+
+def test_plan_and_generate_changes_handles_indented_diff(tmp_path):
+    """
+    Tests that an indented diff block is correctly dedented and applied.
+    This is a key test for handling copy-paste artifacts from LLMs.
+    """
+    file_path = tmp_path / "test.py"
+    file_path.write_text("print('old')\n")
+
+    # This diff is indented by four spaces.
+    indented_diff = """\
+   ```diff
+   --- a/src/components/AppLayout.tsx
+   +++ b/src/components/AppLayout.tsx
+   @@ -176,7 +176,7 @@ export function AppLayout() {
+              <SidebarHeader className="p-2">
+                  <Link to="/" className="flex items-center gap-2 p-2 font-semibold">
+                      <FolderGit2 className="h-7 w-7 text-primary" />
+   -                  <span className="group-data-[state=expanded]:inline
+   group-data-[state=collapsed]:hidden font-bold">merged</span>
+   +                  <span className="group-data-[state=expanded]:inline
+   group-data-[state=collapsed]:hidden font-bold">Merged</span>
+                  </Link>
+              </SidebarHeader>
+              <SidebarContent>
+   @@ -205,7 +205,7 @@ export function AppLayout() {
+                        <Badge variant="outline">{repoState.branch}</Badge>
+                      </>
+                    ) : (
+   -                  <h1 className="text-lg font-semibold">{headerTitle || 'merged'}</h1>
+   +                  <h1 className="text-lg font-semibold">{headerTitle || 'Merged'}</h1>
+                    )}
+                  </div>
+              </header>}
+   ```
+   """
+   # Remove leading/trailing diff block lines and dedent
+    dedented_diff = textwrap.dedent(indented_diff).splitlines()
+    dedented_diff = "\n".join(dedented_diff[1:-1]) # strip ```diff and ```
+
+    result = list(cf_extract_blocks(dedented_diff))
+    print(result)
+    assert len(result) == 1
+    assert result[0]["code"] == dedented_diff

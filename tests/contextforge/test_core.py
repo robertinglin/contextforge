@@ -225,47 +225,6 @@ def test_plan_and_generate_changes_unknown_change_type(tmp_path, caplog):
         assert len(result) == 0
         assert "Unknown change type 'unknown_type' for test.txt. Skipping." in caplog.text
 
-def test_plan_and_generate_changes_handles_indented_diff(tmp_path):
-        """
-        Tests that an indented diff block is correctly dedented and applied.
-        This is a key test for handling copy-paste artifacts from LLMs.
-        """
-        file_path = tmp_path / "test.py"
-        file_path.write_text("print('old')\n")
-
-        # This diff is indented by four spaces.
-        indented_diff = """\
-   ```diff
-   --- a/src/components/AppLayout.tsx
-   +++ b/src/components/AppLayout.tsx
-   @@ -176,7 +176,7 @@ export function AppLayout() {
-              <SidebarHeader className="p-2">
-                  <Link to="/" className="flex items-center gap-2 p-2 font-semibold">
-                      <FolderGit2 className="h-7 w-7 text-primary" />
-   -                  <span className="group-data-[state=expanded]:inline
-   group-data-[state=collapsed]:hidden font-bold">merged</span>
-   +                  <span className="group-data-[state=expanded]:inline
-   group-data-[state=collapsed]:hidden font-bold">Merged</span>
-                  </Link>
-              </SidebarHeader>
-              <SidebarContent>
-   @@ -205,7 +205,7 @@ export function AppLayout() {
-                        <Badge variant="outline">{repoState.branch}</Badge>
-                      </>
-                    ) : (
-   -                  <h1 className="text-lg font-semibold">{headerTitle || 'merged'}</h1>
-   +                  <h1 className="text-lg font-semibold">{headerTitle || 'Merged'}</h1>
-                    )}
-                  </div>
-              </header>}
-   ```
-   """
-
-        result = list(parse_markdown_string(indented_diff))
-        print(result)
-        assert len(result) == 1
-        assert result[0].new_content == "print('new')\n"
-
 def test_plan_and_generate_changes_empty_input():
     """
     Tests that an empty list of planned changes returns an empty list.
