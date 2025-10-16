@@ -3,7 +3,6 @@ import re
 from typing import Dict, List, Optional
 
 from ..utils.parsing import _contains_truncation_marker
-from .diffs import extract_diffs_from_text
 
 
 def detect_rename_from_diff(code: str) -> Optional[Dict[str, str]]:

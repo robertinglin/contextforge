@@ -37,8 +37,8 @@ def test_uses_last_full_file_block_for_same_path():
 
 def test_also_replaces_diffs_for_same_file():
     """
-    The deduplication logic should NOT apply to diffs. Multiple diffs
-    for the same file are valid sequential changes and should be preserved.
+    The deduplication logic should apply to diffs. Multiple diffs
+    for the same file should only return the last diff.
     """
     markdown_content = textwrap.dedent("""
         Here are some changes.

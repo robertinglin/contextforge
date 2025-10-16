@@ -1,4 +1,5 @@
 # contextforge/extract/main.py
+import pprint
 import re
 from typing import Any, Dict, List, Optional
 
@@ -171,3 +172,41 @@ def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
     
     # Sort by start position for stable ordering
     return sorted(deduped, key=lambda b: b["start"])
+
+
+if __name__ == "__main__":
+    test = """
+Of course. It's a common issue for single-page applications where `index.html` gets cached by the browser, preventing new frontend builds from being loaded.
+
+To solve this, we can instruct browsers to never cache the `index.html` file by adding a `Cache-Control` header to the HTTP response when it's served. I'll modify your FastAPI backend to include this header for `index.html`.
+
+Here are the changes for `backend/app/main.py`:
+
+```diff
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -201,7 +201,7 @@
+     if not os.path.exists(index_path):
+         raise HTTPException(status_code=404, detail="Frontend application not found. Please run 'npm run build'.")
+     
+-    return FileResponse(index_path)
++    return FileResponse(index_path, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+ 
+ @app.get("/{full_path:path}", tags=["Frontend"])
+ async def serve_frontend_catch_all(request: Request, full_path: str):
+@@ -218,4 +218,4 @@
+     if not os.path.exists(index_path):
+         raise HTTPException(status_code=404, detail="Frontend application not found. Please run 'npm run build'.")
+     
+-    return FileResponse(index_path)
++    return FileResponse(index_path, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+
+```
+
+I've updated the two routes that serve your `index.html` to include headers that prevent caching. This ensures that your users will always get the latest version of the frontend after you deploy a new build. Other static assets (like hashed JS and CSS files) will still be cached by the browser, as they should be.
+
+    """
+    
+    result = extract_blocks_from_text(test)
+    
+    pprint.pprint(result)

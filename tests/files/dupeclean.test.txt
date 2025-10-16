@@ -1,0 +1,410 @@
+import asyncio
+import sys
+import os
+import json
+from typing import Dict, Optional
+import logging
+from app.core.paths import CONTROL_FILE_PATH
+from watchdog.observers import Observer
+from dotenv import load_dotenv
+load_dotenv() # This should be at the top        
+from fastapi.concurrency import asynccontextmanager
+
+from fastapi.staticfiles import StaticFiles
+from starlette.responses import FileResponse
+from starlette.exceptions import HTTPException
+from fastapi import Depends, FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from app.api.endpoints import (
+    snapshot, projects, files, indexing, tasks, proposals, auth, push, context_bundles,
+    scratchpad, settings, validators, search, notifications, conflicts, file_watcher,
+    smart_paste, context, workspace, proxy, app_management, usage)
+from app.core.db import init_database, connect_db, close_db 
+from app.core import security
+from app.api.endpoints import console, scratchpad
+from app.services.env_watcher import EnvFileHandler
+from app.services import console_service, tool_availability, peerjs_service
+from app.services.llm_providers.qwen import QwenProvider
+from app.services.llm_providers.gemini import GeminiProvider
+from app.services.llm_providers.codex import CodexProvider
+from app.services.llm_providers.claude import ClaudeProvider
+from app.services.llm_providers.copilot import CopilotProvider
+from app.services.vector_db import init_vector_db
+from app.services.projects import list_projects
+
+# Define the path to the frontend build directory
+FRONTEND_DIST_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'dist'))
+from app.services.indexer import start_indexing
+from app.services.file_watcher import file_watcher_task
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+watcher_tasks: Dict[str, asyncio.Task] = {}
+
+CLI_PROVIDER_CLASSES = [
+    QwenProvider,
+    GeminiProvider,
+    CodexProvider,
+    ClaudeProvider,
+    CopilotProvider,
+]
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handles application startup and shutdown events."""
+    # On startup, create the control file with the current PID
+    try:
+        with open(CONTROL_FILE_PATH, "w") as f:
+            json.dump({"pid": os.getpid(), "command": "running"}, f)
+        print(f"Control file created at {CONTROL_FILE_PATH} with PID {os.getpid()}")
+    except IOError as e:
+        print(f"FATAL: Could not write control file to {CONTROL_FILE_PATH}. Shutting down. Error: {e}")
+        sys.exit(1)
+
+
+    await init_database()
+    await init_vector_db()
+
+    # Initialize and start the PeerProxyService
+    peer_proxy_service = peerjs_service.get_peer_service()
+    asyncio.create_task(peer_proxy_service.start())
+
+    # New: Check for CLI tool availability
+    print("Checking availability of external CLI tools...")
+    for provider_class in CLI_PROVIDER_CLASSES:
+        provider_instance = provider_class()
+        is_available = await provider_class.is_available()
+        tool_availability.register_tool(provider_instance.provider_id, is_available)
+
+    # Setup .env file watcher
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
+    event_handler = EnvFileHandler()
+    observer = Observer()
+    observer.schedule(event_handler, path=os.path.dirname(env_path), recursive=False)
+    observer.start()  # This starts the observer in a new background thread.
+    print(f"Started .env file watcher in a background thread for path: {os.path.dirname(env_path)}")
+
+    # Index all existing projects on startup
+    conn = None
+    try:
+        conn = await connect_db()
+        all_projects = await list_projects(conn)
+        print(f"Found {len(all_projects)} projects to index on startup.")
+        for project in all_projects:
+            print(f"Starting indexing for project: {project.name}")
+            # if project.name == "Brando":
+            #     start_indexing(project, reindex=True)
+            # else:
+            start_indexing(project)
+        
+        # Start persistent file watchers for each project
+        for project in all_projects:
+            print(f"Starting persistent file watcher for project: {project.name}")
+            task = asyncio.create_task(file_watcher_task(project))
+            watcher_tasks[project.id] = task
+
+    finally:
+        if conn:
+            await close_db(conn)
+
+    yield  # Application is running here
+
+    # Cleanup on shutdown
+    for task in watcher_tasks.values():
+        task.cancel()
+    await asyncio.gather(*watcher_tasks.values(), return_exceptions=True)
+    print("Shutting down... Stopping .env file watcher.")
+    observer.stop()
+    await console_service._cleanup_all_sessions()
+
+    # On shutdown, remove the control file
+    try:
+        if os.path.exists(CONTROL_FILE_PATH):
+            os.remove(CONTROL_FILE_PATH)
+            print("Control file removed.")
+    except IOError as e:
+        print(f"Warning: Could not remove control file at {CONTROL_FILE_PATH}. Error: {e}")
+
+app = FastAPI(title="Sprocket", lifespan=lifespan)
+
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],  # Adjust for your frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# Include the auth router without the global dependency
+app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
+app.include_router(push.router, prefix="/api/push", tags=["Push Notifications"])
+
+# Define the security dependency to be applied
+auth_dep = [Depends(security.require_auth_if_remote)]
+
+# Include API routers
+app.include_router(snapshot.router, prefix="/api", tags=["State Management"], dependencies=auth_dep)
+app.include_router(settings.router, prefix="/api/settings", tags=["Settings"], dependencies=auth_dep)
+app.include_router(projects.router, prefix="/api/projects", tags=["Projects"], dependencies=auth_dep)
+app.include_router(files.router, prefix="/api/files", tags=["Files"], dependencies=auth_dep)
+app.include_router(indexing.router, prefix="/api/indexing", tags=["Indexing"], dependencies=auth_dep)
+app.include_router(tasks.router, prefix="/api", tags=["Tasks & Context"], dependencies=auth_dep)
+app.include_router(context.router, prefix="/api/context", tags=["Context Building"], dependencies=auth_dep)
+app.include_router(context_bundles.router, prefix="/api/context-bundles", tags=["Context Bundles"], dependencies=auth_dep)
+app.include_router(proposals.router, prefix="/api/proposals", tags=["Proposals"], dependencies=auth_dep)
+app.include_router(validators.router, prefix="/api/validators", tags=["Validators"], dependencies=auth_dep)
+app.include_router(search.router, prefix="/api/search", tags=["Search"], dependencies=auth_dep)
+app.include_router(notifications.router, prefix="/api/notifications", tags=["Notifications"], dependencies=auth_dep)
+app.include_router(conflicts.router, prefix="/api/conflicts", tags=["Conflicts"], dependencies=auth_dep)
+app.include_router(smart_paste.router, prefix="/api", tags=["Smart Paste"], dependencies=auth_dep)
+app.include_router(workspace.router, prefix="/api/workspace", tags=["Workspace"], dependencies=auth_dep)
+app.include_router(console.router, prefix="/api/console", tags=["console"], dependencies=auth_dep)
+app.include_router(scratchpad.router, prefix="/api/scratchpad", tags=["Scratchpad"], dependencies=auth_dep)
+app.include_router(proxy.router, prefix="/api", tags=["Proxy"])
+app.include_router(usage.router, prefix="/api/usage", tags=["Usage"], dependencies=auth_dep)
+app.include_router(app_management.router, prefix="/api/app", tags=["Application"], dependencies=auth_dep)
+app.include_router(file_watcher.router, prefix="/api", tags=["WebSockets"])
+
+
+@app.get("/", tags=["Frontend"])
+async def serve_frontend_catch_all():
+    index_path = os.path.join(FRONTEND_DIST_DIR, 'index.html')
+    if not os.path.exists(index_path):
+        raise HTTPException(status_code=404, detail="Frontend application not found. Please run 'npm run build'.")
+    
+    return FileResponse(index_path)
+
+@app.get("/{full_path:path}", tags=["Frontend"])
+async def serve_frontend_catch_all(request: Request, full_path: str):
+    """
+    Serves the single-page application.
+    This catch-all route must be last. It serves any static files from the 'dist'
+    directory and serves index.html for any path that doesn't match an API route
+    or a static file, enabling SPA routing.
+    """
+    static_file_path = os.path.join(FRONTEND_DIST_DIR, full_path)
+    if os.path.isfile(static_file_path):
+        return FileResponse(static_file_path)
+
+    index_path = os.path.join(FRONTEND_DIST_DIR, 'index.html')
+    if not os.path.exists(index_path):
+        raise HTTPException(status_code=404, detail="Frontend application not found. Please run 'npm run build'.")
+    
+    return FileResponse(index_path)
+
+# === TEST ===
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -201,7 +201,7 @@
+     if not os.path.exists(index_path):
+         raise HTTPException(status_code=404, detail="Frontend application not found. Please run 'npm run build'.")
+     
+-    return FileResponse(index_path)
++    return FileResponse(index_path, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+ 
+ @app.get("/{full_path:path}", tags=["Frontend"])
+ async def serve_frontend_catch_all(request: Request, full_path: str):
+@@ -218,4 +218,4 @@
+     if not os.path.exists(index_path):
+         raise HTTPException(status_code=404, detail="Frontend application not found. Please run 'npm run build'.")
+     
+-    return FileResponse(index_path)
++    return FileResponse(index_path, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+# === RESULT ===
+import asyncio
+import sys
+import os
+import json
+from typing import Dict, Optional
+import logging
+from app.core.paths import CONTROL_FILE_PATH
+from watchdog.observers import Observer
+from dotenv import load_dotenv
+load_dotenv() # This should be at the top        
+from fastapi.concurrency import asynccontextmanager
+
+from fastapi.staticfiles import StaticFiles
+from starlette.responses import FileResponse
+from starlette.exceptions import HTTPException
+from fastapi import Depends, FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from app.api.endpoints import (
+    snapshot, projects, files, indexing, tasks, proposals, auth, push, context_bundles,
+    scratchpad, settings, validators, search, notifications, conflicts, file_watcher,
+    smart_paste, context, workspace, proxy, app_management, usage)
+from app.core.db import init_database, connect_db, close_db 
+from app.core import security
+from app.api.endpoints import console, scratchpad
+from app.services.env_watcher import EnvFileHandler
+from app.services import console_service, tool_availability, peerjs_service
+from app.services.llm_providers.qwen import QwenProvider
+from app.services.llm_providers.gemini import GeminiProvider
+from app.services.llm_providers.codex import CodexProvider
+from app.services.llm_providers.claude import ClaudeProvider
+from app.services.llm_providers.copilot import CopilotProvider
+from app.services.vector_db import init_vector_db
+from app.services.projects import list_projects
+
+# Define the path to the frontend build directory
+FRONTEND_DIST_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'dist'))
+from app.services.indexer import start_indexing
+from app.services.file_watcher import file_watcher_task
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+watcher_tasks: Dict[str, asyncio.Task] = {}
+
+CLI_PROVIDER_CLASSES = [
+    QwenProvider,
+    GeminiProvider,
+    CodexProvider,
+    ClaudeProvider,
+    CopilotProvider,
+]
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handles application startup and shutdown events."""
+    # On startup, create the control file with the current PID
+    try:
+        with open(CONTROL_FILE_PATH, "w") as f:
+            json.dump({"pid": os.getpid(), "command": "running"}, f)
+        print(f"Control file created at {CONTROL_FILE_PATH} with PID {os.getpid()}")
+    except IOError as e:
+        print(f"FATAL: Could not write control file to {CONTROL_FILE_PATH}. Shutting down. Error: {e}")
+        sys.exit(1)
+
+
+    await init_database()
+    await init_vector_db()
+
+    # Initialize and start the PeerProxyService
+    peer_proxy_service = peerjs_service.get_peer_service()
+    asyncio.create_task(peer_proxy_service.start())
+
+    # New: Check for CLI tool availability
+    print("Checking availability of external CLI tools...")
+    for provider_class in CLI_PROVIDER_CLASSES:
+        provider_instance = provider_class()
+        is_available = await provider_class.is_available()
+        tool_availability.register_tool(provider_instance.provider_id, is_available)
+
+    # Setup .env file watcher
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
+    event_handler = EnvFileHandler()
+    observer = Observer()
+    observer.schedule(event_handler, path=os.path.dirname(env_path), recursive=False)
+    observer.start()  # This starts the observer in a new background thread.
+    print(f"Started .env file watcher in a background thread for path: {os.path.dirname(env_path)}")
+
+    # Index all existing projects on startup
+    conn = None
+    try:
+        conn = await connect_db()
+        all_projects = await list_projects(conn)
+        print(f"Found {len(all_projects)} projects to index on startup.")
+        for project in all_projects:
+            print(f"Starting indexing for project: {project.name}")
+            # if project.name == "Brando":
+            #     start_indexing(project, reindex=True)
+            # else:
+            start_indexing(project)
+        
+        # Start persistent file watchers for each project
+        for project in all_projects:
+            print(f"Starting persistent file watcher for project: {project.name}")
+            task = asyncio.create_task(file_watcher_task(project))
+            watcher_tasks[project.id] = task
+
+    finally:
+        if conn:
+            await close_db(conn)
+
+    yield  # Application is running here
+
+    # Cleanup on shutdown
+    for task in watcher_tasks.values():
+        task.cancel()
+    await asyncio.gather(*watcher_tasks.values(), return_exceptions=True)
+    print("Shutting down... Stopping .env file watcher.")
+    observer.stop()
+    await console_service._cleanup_all_sessions()
+
+    # On shutdown, remove the control file
+    try:
+        if os.path.exists(CONTROL_FILE_PATH):
+            os.remove(CONTROL_FILE_PATH)
+            print("Control file removed.")
+    except IOError as e:
+        print(f"Warning: Could not remove control file at {CONTROL_FILE_PATH}. Error: {e}")
+
+app = FastAPI(title="Sprocket", lifespan=lifespan)
+
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],  # Adjust for your frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# Include the auth router without the global dependency
+app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
+app.include_router(push.router, prefix="/api/push", tags=["Push Notifications"])
+
+# Define the security dependency to be applied
+auth_dep = [Depends(security.require_auth_if_remote)]
+
+# Include API routers
+app.include_router(snapshot.router, prefix="/api", tags=["State Management"], dependencies=auth_dep)
+app.include_router(settings.router, prefix="/api/settings", tags=["Settings"], dependencies=auth_dep)
+app.include_router(projects.router, prefix="/api/projects", tags=["Projects"], dependencies=auth_dep)
+app.include_router(files.router, prefix="/api/files", tags=["Files"], dependencies=auth_dep)
+app.include_router(indexing.router, prefix="/api/indexing", tags=["Indexing"], dependencies=auth_dep)
+app.include_router(tasks.router, prefix="/api", tags=["Tasks & Context"], dependencies=auth_dep)
+app.include_router(context.router, prefix="/api/context", tags=["Context Building"], dependencies=auth_dep)
+app.include_router(context_bundles.router, prefix="/api/context-bundles", tags=["Context Bundles"], dependencies=auth_dep)
+app.include_router(proposals.router, prefix="/api/proposals", tags=["Proposals"], dependencies=auth_dep)
+app.include_router(validators.router, prefix="/api/validators", tags=["Validators"], dependencies=auth_dep)
+app.include_router(search.router, prefix="/api/search", tags=["Search"], dependencies=auth_dep)
+app.include_router(notifications.router, prefix="/api/notifications", tags=["Notifications"], dependencies=auth_dep)
+app.include_router(conflicts.router, prefix="/api/conflicts", tags=["Conflicts"], dependencies=auth_dep)
+app.include_router(smart_paste.router, prefix="/api", tags=["Smart Paste"], dependencies=auth_dep)
+app.include_router(workspace.router, prefix="/api/workspace", tags=["Workspace"], dependencies=auth_dep)
+app.include_router(console.router, prefix="/api/console", tags=["console"], dependencies=auth_dep)
+app.include_router(scratchpad.router, prefix="/api/scratchpad", tags=["Scratchpad"], dependencies=auth_dep)
+app.include_router(proxy.router, prefix="/api", tags=["Proxy"])
+app.include_router(usage.router, prefix="/api/usage", tags=["Usage"], dependencies=auth_dep)
+app.include_router(app_management.router, prefix="/api/app", tags=["Application"], dependencies=auth_dep)
+app.include_router(file_watcher.router, prefix="/api", tags=["WebSockets"])
+
+
+@app.get("/", tags=["Frontend"])
+async def serve_frontend_catch_all():
+    index_path = os.path.join(FRONTEND_DIST_DIR, 'index.html')
+    if not os.path.exists(index_path):
+        raise HTTPException(status_code=404, detail="Frontend application not found. Please run 'npm run build'.")
+    
+    return FileResponse(index_path, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+
+@app.get("/{full_path:path}", tags=["Frontend"])
+async def serve_frontend_catch_all(request: Request, full_path: str):
+    """
+    Serves the single-page application.
+    This catch-all route must be last. It serves any static files from the 'dist'
+    directory and serves index.html for any path that doesn't match an API route
+    or a static file, enabling SPA routing.
+    """
+    static_file_path = os.path.join(FRONTEND_DIST_DIR, full_path)
+    if os.path.isfile(static_file_path):
+        return FileResponse(static_file_path)
+
+    index_path = os.path.join(FRONTEND_DIST_DIR, 'index.html')
+    if not os.path.exists(index_path):
+        raise HTTPException(status_code=404, detail="Frontend application not found. Please run 'npm run build'.")
+    
+    return FileResponse(index_path, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})

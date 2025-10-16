@@ -45,6 +45,17 @@ def _build_context_string(request: Any) -> str:
                 content = f.read()
             lang = os.path.splitext(file_path)[1].lstrip(".")
             context_str += f"File: {file_path}\n```{lang}\n{content}\n```\n\n"
+        except FileNotFoundError as e:
+            if getattr(request, "ignore_missing_files", False):
+                context_str += (
+                    f"File: {file_path}\n"
+                    "---\n"
+                    "Info: File not found and was skipped as requested.\n"
+                    "---\n\n"
+                )
+                continue
+            else:
+                raise ContextError(f"Failed to read file '{file_path}': {e}") from e
         except OSError as e:
             raise ContextError(f"Failed to read file '{file_path}': {e}") from e
 

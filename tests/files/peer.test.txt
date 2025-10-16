@@ -1,0 +1,553 @@
+import asyncio
+import json
+import os
+import secrets
+import traceback
+from typing import Any, Dict, Optional
+
+import aiosqlite
+import httpx
+from peerjs_py import Peer, PeerOptions, MediaConnection
+import websockets
+from websockets.exceptions import ConnectionClosed
+
+from app.api import models
+from app.core.db import connect_db, close_db
+from app.services import mobile_auth as mobile_auth_service
+from app.core import security as security_service
+
+# Added PeerJS server configuration from environment variables
+PEERJS_HOST = os.getenv("PEERJS_HOST", "0.peerjs.com")
+PEERJS_PORT = int(os.getenv("PEERJS_PORT", 443))
+PEERJS_SECURE = os.getenv("PEERJS_SECURE", "true").lower() == "true"
+
+class PeerProxyService:
+    _instance: Optional["PeerProxyService"] = None
+
+    def __init__(self, proxy_target_base: str):
+        if PeerProxyService._instance is not None:
+            raise Exception("This class is a singleton!")
+
+        self.proxy_target_base = proxy_target_base
+        self.persistent_peer_id = self._load_or_generate_peer_id()
+        self.main_peer: Optional[Peer] = None
+        self.temporary_listeners: Dict[str, Peer] = {} # otp -> Peer
+        self.active_connections: Dict[str, Any] = {} # conn.id -> {conn, ws_proxies, authenticated, etc.}
+        PeerProxyService._instance = self
+
+    @staticmethod
+    def get_instance(proxy_target_base: str = "http://localhost:8004") -> "PeerProxyService":
+        if PeerProxyService._instance is None:
+            PeerProxyService(proxy_target_base)
+        return PeerProxyService._instance
+
+    def _load_or_generate_peer_id(self) -> str:
+        # Persist peer ID to avoid needing to re-pair on server restart
+        peer_id_file = os.path.join(os.path.dirname(__file__), "..", ".peer_id")
+        if os.path.exists(peer_id_file):
+            with open(peer_id_file, 'r') as f:
+                return f.read().strip()
+
+        peer_id = f"sprocket-backend-{secrets.token_hex(8)}"
+        with open(peer_id_file, 'w') as f:
+            f.write(peer_id)
+        return peer_id
+
+    async def start(self):
+        print(f"[PeerJS] Starting persistent peer listener on ID: {self.persistent_peer_id}")
+        options = PeerOptions(host=PEERJS_HOST, port=PEERJS_PORT, secure=PEERJS_SECURE)
+        self.main_peer = Peer(self.persistent_peer_id, options)
+
+        self.main_peer.on("connection", lambda conn: self._handle_persistent_connection(conn))
+        self.main_peer.on("error", lambda e: print(f"[PeerJS Main Error] {e}"))
+        self.main_peer.on("open", lambda peer_id: print(f"[PeerJS] Main peer connection to server established with ID: {peer_id}"))
+        # The new library connects on instantiation; await peer.start() is not needed.
+
+    async def listen_on_temporary_id(self, otp: str):
+        temp_peer_id = f"sprocket-otp-{otp.upper()}"
+        print(f"[PeerJS] Starting temporary listener on ID: {temp_peer_id}")
+
+        if otp in self.temporary_listeners:
+            self.temporary_listeners[otp].destroy() # Replaced await with sync call
+
+        options = PeerOptions(host=PEERJS_HOST, port=PEERJS_PORT, secure=PEERJS_SECURE)
+        temp_peer = Peer(temp_peer_id, options)
+
+        def on_connection_callback(conn):
+            asyncio.create_task(self._handle_handshake_connection(conn, otp))
+
+        temp_peer.on("connection", on_connection_callback)
+        temp_peer.on("error", lambda e: print(f"[PeerJS Temp Error {temp_peer_id}] {e}"))
+
+        self.temporary_listeners[otp] = temp_peer
+        # Removed await temp_peer.start()
+
+        # Schedule cleanup after 5 minutes
+        asyncio.get_running_loop().call_later(300, lambda: asyncio.create_task(self.stop_listening_on_temporary_id(otp)))
+
+    async def stop_listening_on_temporary_id(self, otp: str):
+        if otp in self.temporary_listeners:
+            peer = self.temporary_listeners.pop(otp)
+            print(f"[PeerJS] Stopping temporary listener for OTP: {otp}")
+            peer.destroy() # Replaced await with sync call
+
+    async def _handle_handshake_connection(self, conn: MediaConnection, otp: str):
+        print(f"[PeerJS] Received handshake connection on {conn.remote_id}")
+
+        async def process_data(data):
+            # This is the single handshake message expected.
+            if data.get("type") == "init-handshake":
+                print("[PeerJS] Handshake initiated by client.")
+                db_conn = None
+                try:
+                    await mobile_auth_service.verify_otp_in_memory(otp)
+
+                    db_conn = await connect_db()
+                    device_id = f"mobile_p2p_{secrets.token_hex(8)}"
+                    token = await mobile_auth_service.create_session_and_token(
+                        db_conn, "P2P Device", device_id
+                    )
+
+                    conn.send({ # Replaced await with sync call
+                        "type": "auth-success",
+                        "token": token,
+                        "peerId": self.persistent_peer_id
+                    })
+                except Exception as e:
+                    print(f"[PeerJS] Handshake Error: {e}")
+                    conn.send({"type": "auth-fail", "error": str(e)}) # Replaced await with sync call
+                finally:
+                    if db_conn:
+                        await db_conn.close()
+                    await self.stop_listening_on_temporary_id(otp)
+                    conn.close() # Replaced await with sync call
+
+        conn.on("data", lambda data: asyncio.create_task(process_data(data)))
+
+    def _handle_persistent_connection(self, conn: MediaConnection):
+        print(f"[PeerJS] Received persistent connection from {conn.remote_id}")
+        conn.on("data", lambda data: asyncio.create_task(self._handle_data_proxy(conn, data)))
+        conn.on("close", lambda: self.active_connections.pop(conn.id, None))
+        conn.on("error", lambda e: print(f"[PeerJS Conn Error] {conn.remote_id}: {e}"))
+        self.active_connections[conn.id] = {"conn": conn, "ws_proxies": {}}
+
+    async def _handle_data_proxy(self, conn: MediaConnection, data: Any):
+        if not isinstance(data, dict) or "type" not in data:
+            return
+
+        request_type = data.get("type")
+        connection_details = self.active_connections.get(conn.id, {})
+
+        if request_type == "auth":
+            await self._handle_re_auth(conn, data.get("payload", {}))
+        elif connection_details.get("authenticated"): # Changed from conn.metadata
+            if request_type == "api-request":
+                await self._proxy_api_request(conn, data.get("payload", {}))
+            elif request_type == "ws-connect":
+                 asyncio.create_task(self._proxy_websocket_connection(conn, data.get("payload", {})))
+            elif request_type == "ws-send":
+                await self._forward_ws_message(conn, data.get("payload", {}))
+            elif request_type == "ws-close":
+                await self._close_ws_proxy(conn, data.get("payload", {}))
+        else:
+             conn.send({"type": "auth-required", "error": "Connection not authenticated."}) # Replaced await with sync call
+
+    async def _handle_re_auth(self, conn: MediaConnection, payload: Dict):
+        token = payload.get("token")
+        db_conn = None
+        try:
+            db_conn = await connect_db()
+            session = await security_service.validate_token_and_get_session(token, db_conn)
+            new_token = await mobile_auth_service.rotate_token_for_device(session["device_id"], db_conn)
+
+            # Store auth state in the service's dictionary instead of conn.metadata
+            conn_details = self.active_connections.setdefault(conn.id, {})
+            conn_details["authenticated"] = True
+            conn_details["device_id"] = session["device_id"]
+            conn_details["token"] = new_token
+
+            conn.send({"type": "token-rotated", "newToken": new_token}) # Replaced await with sync call
+            print(f"[PeerJS] Re-authentication successful for {conn.remote_id}")
+        except Exception as e:
+            print(f"[PeerJS] Re-authentication failed for {conn.remote_id}: {e}")
+            conn.send({"type": "auth-fail", "error": "Authentication failed."}) # Replaced await with sync call
+            conn.close() # Replaced await with sync call
+        finally:
+            if db_conn: await db_conn.close()
+
+    async def _proxy_api_request(self, conn: MediaConnection, payload: Dict):
+        request_id = payload.get("id")
+        url = payload.get("url")
+        init = payload.get("init", {})
+
+        target_url = f"{self.proxy_target_base}{url}"
+        headers = init.get("headers", {})
+        # Fetch token from the service's dictionary
+        token = self.active_connections.get(conn.id, {}).get('token')
+        headers["Authorization"] = f"Bearer {token}"
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.request(
+                    method=init.get("method", "GET"),
+                    url=target_url,
+                    headers=headers,
+                    content=init.get("body"),
+                    timeout=30.0,
+                )
+
+                response_payload = {
+                    "id": request_id,
+                    "ok": response.is_success,
+                    "status": response.status_code,
+                    "statusText": response.reason_phrase,
+                    "headers": dict(response.headers),
+                    "body": response.text,
+                }
+                conn.send({"type": "api-response", "payload": response_payload}) # Replaced await with sync call
+        except Exception as e:
+            conn.send({ # Replaced await with sync call
+                "type": "api-response",
+                "payload": {"id": request_id, "ok": False, "status": 503, "error": f"Proxy error: {traceback.format_exc()}"}
+            })
+
+    async def _proxy_websocket_connection(self, conn: MediaConnection, payload: Dict):
+        path = payload.get("path")
+        if not path: return
+
+        token = self.active_connections.get(conn.id, {}).get('token')
+        target_ws_url = f"ws://localhost:8004{path}?token={token}"
+        print(f"[PeerJS] Proxying WebSocket connection to {target_ws_url}")
+
+        try:
+            upstream_ws = await websockets.connect(target_ws_url)
+            self.active_connections[conn.id]["ws_proxies"][path] = upstream_ws
+
+            async for message in upstream_ws:
+                conn.send({"type": "ws-message", "payload": {"path": path, "data": message}}) # Replaced await with sync call
+
+        except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK):
+             print(f"[PeerJS] Upstream WebSocket for {path} closed.")
+        except Exception as e:
+            print(f"[PeerJS] WebSocket proxy error for {path}: {e}")
+        finally:
+            await self._close_ws_proxy(conn, payload)
+
+    async def _forward_ws_message(self, conn: MediaConnection, payload: Dict):
+        path = payload.get("path")
+        data = payload.get("data")
+        ws_proxies = self.active_connections.get(conn.id, {}).get("ws_proxies", {})
+
+        if path in ws_proxies:
+            await ws_proxies[path].send(data)
+
+    async def _close_ws_proxy(self, conn: MediaConnection, payload: Dict):
+        path = payload.get("path")
+        ws_proxies = self.active_connections.get(conn.id, {}).get("ws_proxies", {})
+
+        if path in ws_proxies:
+            await ws_proxies[path].close()
+            del ws_proxies[path]
+            conn.send({"type": "ws-close", "payload": {"path": path}}) # Replaced await with sync call
+            
+# === TEST ===
+--- a/backend/app/services/peerjs_service.py
++++ b/backend/app/services/peerjs_service.py
+@@ -15,22 +15,11 @@
+ PEERJS_SECURE = os.getenv("PEERJS_SECURE", "true").lower() == "true"
+ 
+ class PeerProxyService:
+-    _instance: Optional["PeerProxyService"] = None
+-
+-    def __init__(self, proxy_target_base: str):
+-        if PeerProxyService._instance is not None:
+-            raise Exception("This class is a singleton!")
+-
+-        self.proxy_target_base = proxy_target_base
++    def __init__(self, proxy_target_base: str = "http://localhost:8004"):
++        self.proxy_target_base = proxy_target_base
+         self.persistent_peer_id = self._load_or_generate_peer_id()
+         self.main_peer: Optional[Peer] = None
+         self.temporary_listeners: Dict[str, Peer] = {} # otp -> Peer
+         self.active_connections: Dict[str, Any] = {} # conn.id -> {conn, ws_proxies, authenticated, etc.}
+-        PeerProxyService._instance = self
+-
+-    @staticmethod
+-    def get_instance(proxy_target_base: str = "http://localhost:8004") -> "PeerProxyService":
+-        if PeerProxyService._instance is None:
+-            PeerProxyService(proxy_target_base)
+-        return PeerProxyService._instance
+ 
+     def _load_or_generate_peer_id(self) -> str:
+         # Persist peer ID to avoid needing to re-pair on server restart
+@@ -252,3 +241,16 @@
+             await ws_proxies[path].close()
+             del ws_proxies[path]
+             conn.send({"type": "ws-close", "payload": {"path": path}}) # Replaced await with sync call
++
++
++_instance: Optional[PeerProxyService] = None
++
++def get_peer_service(proxy_target_base: str = "http://localhost:8004") -> PeerProxyService:
++    """
++    Factory function to get the single instance of the PeerProxyService.
++    This replaces the class-based singleton pattern.
++    """
++    global _instance
++    if _instance is None:
++        _instance = PeerProxyService(proxy_target_base)
++    return _instance
+
+# === RESULT ===
+import asyncio
+import json
+import os
+import secrets
+import traceback
+from typing import Any, Dict, Optional
+
+import aiosqlite
+import httpx
+from peerjs_py import Peer, PeerOptions, MediaConnection
+import websockets
+from websockets.exceptions import ConnectionClosed
+
+from app.api import models
+from app.core.db import connect_db, close_db
+from app.services import mobile_auth as mobile_auth_service
+from app.core import security as security_service
+
+# Added PeerJS server configuration from environment variables
+PEERJS_HOST = os.getenv("PEERJS_HOST", "0.peerjs.com")
+PEERJS_PORT = int(os.getenv("PEERJS_PORT", 443))
+PEERJS_SECURE = os.getenv("PEERJS_SECURE", "true").lower() == "true"
+
+class PeerProxyService:
+    def __init__(self, proxy_target_base: str = "http://localhost:8004"):
+        self.proxy_target_base = proxy_target_base
+        self.persistent_peer_id = self._load_or_generate_peer_id()
+        self.main_peer: Optional[Peer] = None
+        self.temporary_listeners: Dict[str, Peer] = {} # otp -> Peer
+        self.active_connections: Dict[str, Any] = {} # conn.id -> {conn, ws_proxies, authenticated, etc.}
+
+    def _load_or_generate_peer_id(self) -> str:
+        # Persist peer ID to avoid needing to re-pair on server restart
+        peer_id_file = os.path.join(os.path.dirname(__file__), "..", ".peer_id")
+        if os.path.exists(peer_id_file):
+            with open(peer_id_file, 'r') as f:
+                return f.read().strip()
+
+        peer_id = f"sprocket-backend-{secrets.token_hex(8)}"
+        with open(peer_id_file, 'w') as f:
+            f.write(peer_id)
+        return peer_id
+
+    async def start(self):
+        print(f"[PeerJS] Starting persistent peer listener on ID: {self.persistent_peer_id}")
+        options = PeerOptions(host=PEERJS_HOST, port=PEERJS_PORT, secure=PEERJS_SECURE)
+        self.main_peer = Peer(self.persistent_peer_id, options)
+
+        self.main_peer.on("connection", lambda conn: self._handle_persistent_connection(conn))
+        self.main_peer.on("error", lambda e: print(f"[PeerJS Main Error] {e}"))
+        self.main_peer.on("open", lambda peer_id: print(f"[PeerJS] Main peer connection to server established with ID: {peer_id}"))
+        # The new library connects on instantiation; await peer.start() is not needed.
+
+    async def listen_on_temporary_id(self, otp: str):
+        temp_peer_id = f"sprocket-otp-{otp.upper()}"
+        print(f"[PeerJS] Starting temporary listener on ID: {temp_peer_id}")
+
+        if otp in self.temporary_listeners:
+            self.temporary_listeners[otp].destroy() # Replaced await with sync call
+
+        options = PeerOptions(host=PEERJS_HOST, port=PEERJS_PORT, secure=PEERJS_SECURE)
+        temp_peer = Peer(temp_peer_id, options)
+
+        def on_connection_callback(conn):
+            asyncio.create_task(self._handle_handshake_connection(conn, otp))
+
+        temp_peer.on("connection", on_connection_callback)
+        temp_peer.on("error", lambda e: print(f"[PeerJS Temp Error {temp_peer_id}] {e}"))
+
+        self.temporary_listeners[otp] = temp_peer
+        # Removed await temp_peer.start()
+
+        # Schedule cleanup after 5 minutes
+        asyncio.get_running_loop().call_later(300, lambda: asyncio.create_task(self.stop_listening_on_temporary_id(otp)))
+
+    async def stop_listening_on_temporary_id(self, otp: str):
+        if otp in self.temporary_listeners:
+            peer = self.temporary_listeners.pop(otp)
+            print(f"[PeerJS] Stopping temporary listener for OTP: {otp}")
+            peer.destroy() # Replaced await with sync call
+
+    async def _handle_handshake_connection(self, conn: MediaConnection, otp: str):
+        print(f"[PeerJS] Received handshake connection on {conn.remote_id}")
+
+        async def process_data(data):
+            # This is the single handshake message expected.
+            if data.get("type") == "init-handshake":
+                print("[PeerJS] Handshake initiated by client.")
+                db_conn = None
+                try:
+                    await mobile_auth_service.verify_otp_in_memory(otp)
+
+                    db_conn = await connect_db()
+                    device_id = f"mobile_p2p_{secrets.token_hex(8)}"
+                    token = await mobile_auth_service.create_session_and_token(
+                        db_conn, "P2P Device", device_id
+                    )
+
+                    conn.send({ # Replaced await with sync call
+                        "type": "auth-success",
+                        "token": token,
+                        "peerId": self.persistent_peer_id
+                    })
+                except Exception as e:
+                    print(f"[PeerJS] Handshake Error: {e}")
+                    conn.send({"type": "auth-fail", "error": str(e)}) # Replaced await with sync call
+                finally:
+                    if db_conn:
+                        await db_conn.close()
+                    await self.stop_listening_on_temporary_id(otp)
+                    conn.close() # Replaced await with sync call
+
+        conn.on("data", lambda data: asyncio.create_task(process_data(data)))
+
+    def _handle_persistent_connection(self, conn: MediaConnection):
+        print(f"[PeerJS] Received persistent connection from {conn.remote_id}")
+        conn.on("data", lambda data: asyncio.create_task(self._handle_data_proxy(conn, data)))
+        conn.on("close", lambda: self.active_connections.pop(conn.id, None))
+        conn.on("error", lambda e: print(f"[PeerJS Conn Error] {conn.remote_id}: {e}"))
+        self.active_connections[conn.id] = {"conn": conn, "ws_proxies": {}}
+
+    async def _handle_data_proxy(self, conn: MediaConnection, data: Any):
+        if not isinstance(data, dict) or "type" not in data:
+            return
+
+        request_type = data.get("type")
+        connection_details = self.active_connections.get(conn.id, {})
+
+        if request_type == "auth":
+            await self._handle_re_auth(conn, data.get("payload", {}))
+        elif connection_details.get("authenticated"): # Changed from conn.metadata
+            if request_type == "api-request":
+                await self._proxy_api_request(conn, data.get("payload", {}))
+            elif request_type == "ws-connect":
+                 asyncio.create_task(self._proxy_websocket_connection(conn, data.get("payload", {})))
+            elif request_type == "ws-send":
+                await self._forward_ws_message(conn, data.get("payload", {}))
+            elif request_type == "ws-close":
+                await self._close_ws_proxy(conn, data.get("payload", {}))
+        else:
+             conn.send({"type": "auth-required", "error": "Connection not authenticated."}) # Replaced await with sync call
+
+    async def _handle_re_auth(self, conn: MediaConnection, payload: Dict):
+        token = payload.get("token")
+        db_conn = None
+        try:
+            db_conn = await connect_db()
+            session = await security_service.validate_token_and_get_session(token, db_conn)
+            new_token = await mobile_auth_service.rotate_token_for_device(session["device_id"], db_conn)
+
+            # Store auth state in the service's dictionary instead of conn.metadata
+            conn_details = self.active_connections.setdefault(conn.id, {})
+            conn_details["authenticated"] = True
+            conn_details["device_id"] = session["device_id"]
+            conn_details["token"] = new_token
+
+            conn.send({"type": "token-rotated", "newToken": new_token}) # Replaced await with sync call
+            print(f"[PeerJS] Re-authentication successful for {conn.remote_id}")
+        except Exception as e:
+            print(f"[PeerJS] Re-authentication failed for {conn.remote_id}: {e}")
+            conn.send({"type": "auth-fail", "error": "Authentication failed."}) # Replaced await with sync call
+            conn.close() # Replaced await with sync call
+        finally:
+            if db_conn: await db_conn.close()
+
+    async def _proxy_api_request(self, conn: MediaConnection, payload: Dict):
+        request_id = payload.get("id")
+        url = payload.get("url")
+        init = payload.get("init", {})
+
+        target_url = f"{self.proxy_target_base}{url}"
+        headers = init.get("headers", {})
+        # Fetch token from the service's dictionary
+        token = self.active_connections.get(conn.id, {}).get('token')
+        headers["Authorization"] = f"Bearer {token}"
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.request(
+                    method=init.get("method", "GET"),
+                    url=target_url,
+                    headers=headers,
+                    content=init.get("body"),
+                    timeout=30.0,
+                )
+
+                response_payload = {
+                    "id": request_id,
+                    "ok": response.is_success,
+                    "status": response.status_code,
+                    "statusText": response.reason_phrase,
+                    "headers": dict(response.headers),
+                    "body": response.text,
+                }
+                conn.send({"type": "api-response", "payload": response_payload}) # Replaced await with sync call
+        except Exception as e:
+            conn.send({ # Replaced await with sync call
+                "type": "api-response",
+                "payload": {"id": request_id, "ok": False, "status": 503, "error": f"Proxy error: {traceback.format_exc()}"}
+            })
+
+    async def _proxy_websocket_connection(self, conn: MediaConnection, payload: Dict):
+        path = payload.get("path")
+        if not path: return
+
+        token = self.active_connections.get(conn.id, {}).get('token')
+        target_ws_url = f"ws://localhost:8004{path}?token={token}"
+        print(f"[PeerJS] Proxying WebSocket connection to {target_ws_url}")
+
+        try:
+            upstream_ws = await websockets.connect(target_ws_url)
+            self.active_connections[conn.id]["ws_proxies"][path] = upstream_ws
+
+            async for message in upstream_ws:
+                conn.send({"type": "ws-message", "payload": {"path": path, "data": message}}) # Replaced await with sync call
+
+        except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK):
+             print(f"[PeerJS] Upstream WebSocket for {path} closed.")
+        except Exception as e:
+            print(f"[PeerJS] WebSocket proxy error for {path}: {e}")
+        finally:
+            await self._close_ws_proxy(conn, payload)
+
+    async def _forward_ws_message(self, conn: MediaConnection, payload: Dict):
+        path = payload.get("path")
+        data = payload.get("data")
+        ws_proxies = self.active_connections.get(conn.id, {}).get("ws_proxies", {})
+
+        if path in ws_proxies:
+            await ws_proxies[path].send(data)
+
+    async def _close_ws_proxy(self, conn: MediaConnection, payload: Dict):
+        path = payload.get("path")
+        ws_proxies = self.active_connections.get(conn.id, {}).get("ws_proxies", {})
+
+        if path in ws_proxies:
+            await ws_proxies[path].close()
+            del ws_proxies[path]
+            conn.send({"type": "ws-close", "payload": {"path": path}}) # Replaced await with sync call
+
+
+_instance: Optional[PeerProxyService] = None
+
+def get_peer_service(proxy_target_base: str = "http://localhost:8004") -> PeerProxyService:
+    """
+    Factory function to get the single instance of the PeerProxyService.
+    This replaces the class-based singleton pattern.
+    """
+    global _instance
+    if _instance is None:
+        _instance = PeerProxyService(proxy_target_base)
+    return _instance
