@@ -13,6 +13,7 @@ test_files = []
 if os.path.isdir(TEST_FILES_DIR):
     test_files = [f for f in os.listdir(TEST_FILES_DIR) if f.endswith('.test.txt')]
 
+print(test_files)
 
 def _write_result_to_file(directory, original_filename, actual_content):
     """Writes the actual result to a file for easy comparison."""
@@ -23,8 +24,8 @@ def _write_result_to_file(directory, original_filename, actual_content):
     return output_path
 
 
-# @pytest.mark.parametrize("filename", test_files)
-def txest_patch_from_file_scenario(filename):
+@pytest.mark.parametrize("filename", test_files)
+def test_patch_from_file_scenario(filename):
     """
     Reads a test file, splits it into original content, a diff, and an
     expected result, then applies the diff and asserts the outcome.
