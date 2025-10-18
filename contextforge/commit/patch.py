@@ -745,18 +745,20 @@ def _find_all_hunk_candidates(
             # Check leading context
             if lead_ctx:
                 hunk_start = anchor_idx - leading_context_count
-                if hunk_start <= 0:
-                    # Hunk at/near start: lead context is implicitly part of matched hunk structure
-                    context_score += 1.0
-                    context_weight += 1
-                    log.debug(f"  Anchor {anchor_idx}: lead_context at file start (implicit)")
-                else:
-                    before = target_lines[max(0, hunk_start - ctx_probe) : hunk_start]
-                    lead_slice = lead_ctx[-min(ctx_probe, len(lead_ctx)):]
-                    lead_ratio = _similarity(lead_slice, before[-len(lead_slice):] if before else [])
+
+                # Leading context is part of the hunk structure at [hunk_start, anchor_idx)
+                # Verify these lines match what's actually in the file
+                if 0 <= hunk_start and hunk_start + len(lead_ctx) <= len(target_lines):
+                    file_lead_content = target_lines[hunk_start : hunk_start + len(lead_ctx)]
+                    lead_ratio = _similarity(lead_ctx, file_lead_content)
                     context_score += lead_ratio
                     context_weight += 1
                     log.debug(f"  Anchor {anchor_idx}: lead_context_ratio={lead_ratio:.3f}")
+                else:
+                    # Hunk out of bounds - penalize
+                    context_score += 0.0
+                    context_weight += 1
+                    log.debug(f"  Anchor {anchor_idx}: lead_context out of bounds")
             
             # Check trailing context  
             if tail_ctx:
