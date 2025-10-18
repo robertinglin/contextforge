@@ -1,3 +1,4 @@
+# contextforge/commit/patch.py
 from __future__ import annotations
 
 from typing import List
@@ -359,6 +360,7 @@ def _parse_patch_hunks(patch_str: str) -> list[dict]:
     if not hunks:
         raise PatchFailedError("Patch string contains no valid hunks.")
     return hunks
+
 def _parse_simplified_patch_hunks(patch_str: str) -> list[dict]:
     """
     Parse patch string using '@@' as a simple hunk separator, ignoring line numbers.
@@ -422,6 +424,7 @@ def _find_block_matches(target: list[str], block: list[str], loose: bool = False
         if ok:
             matches.append(i)
     return matches
+
 def _split_hunk_components(hunk_lines: list[str]) -> tuple[list[str], list[str], list[str]]:
     """Split hunk into old content, new content, and pure context (signs removed)."""
     old_content: list[str] = []
@@ -453,22 +456,6 @@ def _split_hunk_components(hunk_lines: list[str]) -> tuple[list[str], list[str],
 
     return old_content, new_content, context_only
 
-
-def _split_lead_tail_context(hunk_lines: list[str]) -> tuple[list[str], list[str]]:
-    """Extract leading and trailing context (signs removed)."""
-    lead: list[str] = []
-    tail: list[str] = []
-    n = len(hunk_lines)
-    i = 0
-    while i < n and (hunk_lines[i] == "" or hunk_lines[i].startswith(" ")):
-        lead.append(hunk_lines[i][1:] if hunk_lines[i] != "" else "")
-        i += 1
-    j = n
-    while j > i and (hunk_lines[j - 1] == "" or hunk_lines[j - 1].startswith(" ")):
-        tail.append(hunk_lines[j - 1][1:] if hunk_lines[j - 1] != "" else "")
-        j -= 1
-    tail.reverse()
-    return lead, tail
 
 def _adaptive_ctx_window(lead_ctx: list[str], tail_ctx: list[str]) -> int:
     """Pick a context slice size between 3 and 10 based on available context."""
@@ -536,132 +523,228 @@ def _locate_insertion_index(
     return max(0, min(start_hint, n))
 
 
-# ---------- NEW: Two-pass location structure ----------
+# ---------- Finding ALL candidates for a hunk ----------
 
-def _locate_hunk_position(
+def _find_all_hunk_candidates(
     target_lines: list[str],
     hunk: dict,
     threshold: float,
     start_hint: int,
-    min_position: int,
+    search_min: int,
+    search_max: int,
     log: logging.Logger,
-) -> dict:
+    max_candidates: int = 10,
+) -> list[dict]:
     """
-    Locate where a hunk should be applied without modifying the file.
-    Only searches at positions >= min_position (enforces sequential ordering).
-    Returns a dict with: start_idx, end_idx, replacement_lines, match_type
-    Raises PatchFailedError if no acceptable match is found.
+    Find ALL candidate locations where a hunk could be applied.
+    Only searches between [search_min, search_max].
+    Returns a list of dicts sorted by quality, each with:
+      start_idx, end_idx, replacement_lines, match_type, confidence
+    Returns empty list if no acceptable match is found.
     """
     old_content, new_content, context_only = _split_hunk_components(hunk["lines"])
     lead_ctx, tail_ctx = _split_lead_tail_context(hunk["lines"])
     ctx_probe = _adaptive_ctx_window(lead_ctx, tail_ctx)
+    
+    candidates = []
 
-    log.debug(f"\n=== LOCATING HUNK (start_hint={start_hint}) ===")
+    log.debug(f"\n=== FINDING CANDIDATES (hint={start_hint}, range=[{search_min}, {search_max}]) ===")
     log.debug(f"Old content ({len(old_content)} lines): {old_content[:3] if old_content else '(empty)'}")
     log.debug(f"New content ({len(new_content)} lines): {new_content[:3] if new_content else '(empty)'}")
+    
+    # Log the full hunk for debugging
+    log.debug(f"Full hunk lines ({len(hunk['lines'])} lines):")
+    for i, line in enumerate(hunk["lines"]):
+        log.debug(f"  [{i}] {repr(line)}")
 
-    # Debug: Show what we're looking for in the file
-    if old_content:
-        log.debug(f"\n  SEARCHING FOR (first 3 lines of old_content):")
-        for i, line in enumerate(old_content[:3]):
-            log.debug(f"    [{i}] {repr(line)}")
-        if len(old_content) > 3:
-            log.debug(f"    ... and {len(old_content) - 3} more lines")
-        log.debug(f"  start_hint={start_hint}, lead_ctx={len(lead_ctx)} lines, tail_ctx={len(tail_ctx)} lines")
+    # Extract changed content (only the - lines, without context)
+    changed_lines = []
+    leading_context_count = 0
+    found_first_change = False
+    
+    for ln in hunk["lines"]:
+        if not found_first_change:
+            if ln == "" or (ln and ln[0] == " "):
+                leading_context_count += 1
+            elif ln and ln[0] in "-+":
+                found_first_change = True
+        
+        if ln and ln[0] == "-":
+            changed_lines.append(ln[1:])
+        
+    log.debug(f"Changed lines (- lines only, {len(changed_lines)} lines):")
+    log.debug(f"Leading context lines before first change: {leading_context_count}")
 
-    log.debug(f"  min_position={min_position} (hunks must be sequential)")
-
-    # --- Step 0: composite block replace (from_lines -> to_lines) ---
+    for i, line in enumerate(changed_lines):
+        log.debug(f"  [{i}] {repr(line)}")
+    
+    # For pure additions, extract only the + lines (not context)
+    if not changed_lines:
+        addition_lines = []
+        for ln in hunk["lines"]:
+            if ln and ln[0] == "+":
+                addition_lines.append(ln[1:])
+        
+        log.debug(f"Addition lines (+ lines only, {len(addition_lines)} lines):")
+        for i, line in enumerate(addition_lines):
+            log.debug(f"  [{i}] {repr(line)}")
+    
+    # If we have no changed lines, this is a pure addition
+    if not changed_lines:
+        log.debug("Pure addition detected (no - lines)")
+        if not old_content:
+            # Completely new content with no context
+            log.debug("No old content, treating as pure addition")
+            ins_pos = _locate_insertion_index(target_lines, lead_ctx, tail_ctx, start_hint, ctx_probe)
+            return [{
+                "start_idx": ins_pos,
+                "end_idx": ins_pos,
+                "replacement_lines": addition_lines,
+                "match_type": "pure_addition",
+                "confidence": 0.9
+            }]
+    
+    # --- Strategy: Find all locations with the changed content, then score by context ---
     from_lines, to_lines = _compose_from_to(hunk["lines"])
-    if any(ln for ln in hunk["lines"] if ln and ln[0] in " -") and len(from_lines) > 0:
-        # Try exact, nearest to hint
-        hits = _find_block_matches(target_lines, from_lines, loose=False)
-        log.debug(f"Exact block match for {len(from_lines)} lines: {len(hits)} hits at positions {hits[:5]}")
-        hits = [h for h in hits if h >= min_position]
-        if hits:
-            i = min(hits, key=lambda p: abs(p - start_hint))
-            surg = _surgical_reconstruct_block(
-                hunk["lines"],
-                target_lines[i : i + len(from_lines)],
-                from_lines[0] if from_lines else "",
-                target_lines[i] if target_lines else ""
-            )
-            log.debug(f"  ✅ Located exact block at index {i}")
-            return {
-                "start_idx": i,
-                "end_idx": i + len(from_lines),
-                "replacement_lines": surg,
-                "match_type": "exact_block"
-            }
-
-        # Try loose, nearest to hint
-        hits_loose = _find_block_matches(target_lines, from_lines, loose=True)
-        log.debug(f"Loose block match for {len(from_lines)} lines: {len(hits_loose)} hits at positions {hits_loose[:5]}")
-        hits_loose = [h for h in hits_loose if h >= min_position]
-        if hits_loose:
-            i = min(hits_loose, key=lambda p: abs(p - start_hint))
-            surg = _surgical_reconstruct_block(
-                hunk["lines"],
-                target_lines[i : i + len(from_lines)],
-                from_lines[0] if from_lines else "",
-                target_lines[i] if target_lines else ""
-            )
-            log.debug(f"  ✅ Located loose block at index {i}")
-            return {
-                "start_idx": i,
-                "end_idx": i + len(from_lines),
-                "replacement_lines": surg,
-                "match_type": "loose_block"
-            }
-
-        # JS-ish brace-aware fallback
-        sig = next(
-            (ln for ln in lead_ctx if ln.strip().startswith("function ") or "updateParentCheckboxState(" in ln),
-            None,
-        )
-        if sig:
-            sig_hits = [k for k, ln in enumerate(target_lines) if _eq_loose(ln, sig)]
-            if sig_hits:
-                start = min(sig_hits, key=lambda p: abs(p - start_hint))
-                block_end = start + len(from_lines)
-                if block_end > len(target_lines) or block_end <= start:
-                    block_end = _find_block_end_by_braces(target_lines, start)
-                if block_end != -1 and block_end > start:
-                    to_lines_adj = _reindent_relative(to_lines, sig, target_lines[start])
-                    return {
-                        "start_idx": start,
-                        "end_idx": block_end,
-                        "replacement_lines": to_lines_adj,
-                        "match_type": "brace_aware"
-                    }
-
-    # Pure addition (no old_content to find)
-    if not old_content:
-        log.debug("Pure addition detected - using context anchors")
+    log.debug(f"Composed from_lines ({len(from_lines)} lines):")
+    for i, line in enumerate(from_lines):
+        log.debug(f"  [{i}] {repr(line)}")
+    
+    # For pure additions with context, find where to insert based on context
+    if not changed_lines and old_content:
+        log.debug("Pure addition with context - locating insertion point")
         ins_pos = _locate_insertion_index(target_lines, lead_ctx, tail_ctx, start_hint, ctx_probe)
-        return {
+        return [{
             "start_idx": ins_pos,
             "end_idx": ins_pos,
-            "replacement_lines": new_content,
-            "match_type": "pure_addition"
-        }
+            "replacement_lines": addition_lines,
+            "match_type": "pure_addition",
+            "confidence": 0.9
+        }]
+    
+    # Step 1: Find all locations that contain the changed lines (fuzzy)
+    anchor_candidates = []
+    
+    if changed_lines:
+        log.debug(f"Searching for anchor (changed content): {len(changed_lines)} lines")
+        
+        # Search for changed content with fuzzy matching
+        for i in range(max(0, search_min), min(len(target_lines) - len(changed_lines) + 1, search_max)):
+            window = target_lines[i : i + len(changed_lines)]
+            
+            # Exact match on changed lines
+            exact_match = all(
+                target_lines[i + j] == changed_lines[j]
+                for j in range(len(changed_lines))
+            )
+            
+            if exact_match:
+                anchor_candidates.append(i)
+                continue
+            
+            # Loose match on changed lines (whitespace-insensitive)
+            loose_match = all(
+                _eq_loose(target_lines[i + j], changed_lines[j])
+                for j in range(len(changed_lines))
+            )
+            
+            if loose_match:
+                anchor_candidates.append(i)
+                continue
+            
+            # Fuzzy match on changed lines
+            a_trim = [x.strip() for x in changed_lines]
+            b_trim = [x.strip() for x in window]
+            ratio = difflib.SequenceMatcher(None, a_trim, b_trim, autojunk=False).ratio()
+            
+            if ratio >= 0.8:  # High similarity threshold for anchor
+                anchor_candidates.append(i)
+        
+        log.debug(f"Found {len(anchor_candidates)} anchor candidates at: {anchor_candidates}")
+    
+    # Step 2: Score each anchor candidate by surrounding context
+    if anchor_candidates:
+        scored_candidates = []
+        
+        # The anchor is the position of the changed line, not the hunk start
+        # We need to adjust by subtracting the leading context count
+        log.debug(f"Adjusting anchor positions by -{leading_context_count} (leading context)")
+        
+        for anchor_idx in anchor_candidates:
+            # Calculate how well the context matches
+            context_score = 0.0
+            context_weight = 0
 
-    # 1) Exact block match(es)
+            # Check leading context
+            if lead_ctx:
+                # The context check needs to look BEFORE the anchor
+                # But the anchor is at the changed line, and there's leading_context_count lines before it
+                # So we check context BEFORE (anchor - leading_context_count)
+                before = target_lines[max(0, anchor_idx - leading_context_count - ctx_probe) : anchor_idx - leading_context_count]
+                lead_slice = lead_ctx[-min(ctx_probe, len(lead_ctx)):]
+                lead_ratio = _similarity(lead_slice, before[-len(lead_slice):] if before else [])
+                context_score += lead_ratio
+                context_weight += 1
+                log.debug(f"  Anchor {anchor_idx}: lead_context_ratio={lead_ratio:.3f}")
+            
+            # Check trailing context  
+            if tail_ctx:
+                after_start = anchor_idx + len(changed_lines)
+                after = target_lines[after_start : after_start + ctx_probe]
+                tail_slice = tail_ctx[:min(ctx_probe, len(tail_ctx))]
+                tail_ratio = _similarity(tail_slice, after[:len(tail_slice)] if after else [])
+                context_score += tail_ratio
+                context_weight += 1
+                log.debug(f"  Anchor {anchor_idx}: tail_context_ratio={tail_ratio:.3f}")
+            
+            # Overall confidence: high base score with context adjustment
+            avg_context = (context_score / context_weight) if context_weight > 0 else 0.5
+            confidence = 0.9 + (avg_context * 0.1)  # 0.9-1.0 range
+            
+            # Calculate the actual hunk start position
+            hunk_start = anchor_idx - leading_context_count
+            
+            # Build replacement using surgical reconstruction
+            # Use old_content length for the match window
+            match_len = len(old_content) if old_content else len(changed_lines)
+            surg = _surgical_reconstruct_block(
+                hunk["lines"],
+                target_lines[hunk_start : hunk_start + match_len],
+                old_content[0] if old_content else "",
+                target_lines[hunk_start] if hunk_start < len(target_lines) else ""
+            )
+            
+            scored_candidates.append({
+                "start_idx": hunk_start,
+                "end_idx": hunk_start + match_len,
+                "replacement_lines": surg,
+                "match_type": "anchor_with_context",
+                "confidence": confidence,
+                "distance_from_hint": abs(hunk_start - start_hint)
+            })
+        
+        # Sort by confidence desc, then by distance from hint
+        scored_candidates.sort(key=lambda c: (-c["confidence"], c["distance_from_hint"]))
+        
+        log.debug(f"Scored candidates:")
+        for idx, cand in enumerate(scored_candidates[:max_candidates]):
+            log.debug(f"  [{idx}] hunk_start={cand['start_idx']}, confidence={cand['confidence']:.3f}")
+        
+        return scored_candidates[:max_candidates]
+
+
+    # 1) Exact content match
     exact = _find_block_matches(target_lines, old_content, loose=False)
-    exact = [e for e in exact if e >= min_position]
+    exact = [e for e in exact if search_min <= e < search_max]
     if exact:
-        # Debug: Show all exact matches found
-        log.debug(f"\n  EXACT MATCHES FOUND: {len(exact)} locations: {exact}")
-        for match_idx in exact[:5]:  # Show first 5 matches in detail
-            log.debug(f"    Match at line {match_idx}:")
-            for i, line in enumerate(target_lines[match_idx:match_idx + min(3, len(old_content))]):
-                log.debug(f"      [{match_idx + i}] {repr(line)}")
-            if match_idx > 0:
-                log.debug(f"      (line before: [{match_idx-1}] {repr(target_lines[match_idx-1])})")
-            if match_idx + len(old_content) < len(target_lines):
-                log.debug(f"      (line after: [{match_idx + len(old_content)}] {repr(target_lines[match_idx + len(old_content)])})")
-
-        log.debug(f"Exact content match: {len(exact)} hits at positions {exact[:5]}")
+        log.debug(f"Exact content matches: {len(exact)} hits at {exact}")
+        
+        # Show what we're matching against at each hit location
+        for hit_idx in exact:
+            log.debug(f"  Exact content match at line {hit_idx}:")
+            for i, line in enumerate(target_lines[hit_idx:hit_idx+len(old_content)]):
+                log.debug(f"    [{i}] {repr(line)}")
+        
         def _score_exact(p: int) -> tuple[int, int, int, int]:
             before = target_lines[max(0, p - ctx_probe) : p]
             after = target_lines[p + len(old_content) : p + len(old_content) + ctx_probe]
@@ -694,335 +777,263 @@ def _locate_hunk_position(
             struct_pen = _structure_penalty(target_lines, p, new_content, lead_ctx)
             return (abs(p - start_hint), -(lead_hit + tail_hit), struct_pen, p)
 
-        i = sorted(exact, key=_score_exact)[0]
-        # Debug: Show why this particular match was chosen
-        all_scores = [(p, _score_exact(p)) for p in exact[:10]]  # Score first 10
-        log.debug(f"\n  MATCH SELECTION:")
-        log.debug(f"    All scores (pos, (dist_from_hint, -ctx_match, struct_pen, tie_breaker)):")
-        for pos, score in sorted(all_scores, key=lambda x: x[1]):
-            log.debug(f"      pos={pos}: {score}")
-        log.debug(f"    SELECTED: position {i} with score {_score_exact(i)}")
-        log.debug(f"    Context: {len(lead_ctx)} lead lines, {len(tail_ctx)} tail lines")
+        for i in sorted(exact, key=_score_exact):
+            surg = _surgical_reconstruct_block(
+                hunk["lines"],
+                target_lines[i : i + len(old_content)],
+                old_content[0] if old_content else "",
+                target_lines[i] if target_lines else ""
+            )
+            candidates.append({
+                "start_idx": i,
+                "end_idx": i + len(old_content),
+                "replacement_lines": surg,
+                "match_type": "exact_content",
+                "confidence": 1.0
+            })
+        return candidates[:max_candidates]
 
-        surg = _surgical_reconstruct_block(
-            hunk["lines"],
-            target_lines[i : i + len(old_content)],
-            old_content[0] if old_content else "",
-            target_lines[i] if target_lines else ""
-        )
-        log.debug(f"  ✅ Located exact content at index {i}")
-        return {
-            "start_idx": i,
-            "end_idx": i + len(old_content),
-            "replacement_lines": surg,
-            "match_type": "exact_content"
-        }
-
-    # 2) Loose block match(es)
+    # 2) Loose content match
     loose = _find_block_matches(target_lines, old_content, loose=True)
-    loose = [l for l in loose if l >= min_position]
+    loose = [l for l in loose if search_min <= l < search_max]
     if loose:
-        log.debug(f"Loose content match: {len(loose)} hits at positions {loose[:5]}")
-        def _score_loose(p: int) -> tuple[int, int]:
-            return (abs(p - start_hint), _structure_penalty(target_lines, p, new_content, lead_ctx))
-
-        i = sorted(loose, key=_score_loose)[0]
-        surg = _surgical_reconstruct_block(
-            hunk["lines"],
-            target_lines[i : i + len(old_content)],
-            old_content[0] if old_content else "",
-            target_lines[i] if target_lines else ""
-        )
-        log.debug(f"  ✅ Located loose content at index {i}")
-        return {
-            "start_idx": i,
-            "end_idx": i + len(old_content),
-            "replacement_lines": surg,
-            "match_type": "loose_content"
-        }
+        log.debug(f"Loose content matches: {len(loose)} hits at {loose}")
+        
+        # Show what we're matching against at each hit location
+        for hit_idx in loose:
+            log.debug(f"  Loose content match at line {hit_idx}:")
+            for i, line in enumerate(target_lines[hit_idx:hit_idx+len(old_content)]):
+                log.debug(f"    [{i}] {repr(line)}")
+        
+        if len(loose) == 1:
+            # Single match = high confidence
+            i = loose[0]
+            surg = _surgical_reconstruct_block(
+                hunk["lines"],
+                target_lines[i : i + len(old_content)],
+                old_content[0] if old_content else "",
+                target_lines[i] if target_lines else ""
+            )
+            return [{
+                "start_idx": i,
+                "end_idx": i + len(old_content),
+                "replacement_lines": surg,
+                "match_type": "loose_content",
+                "confidence": 0.9
+            }]
+        else:
+            # Multiple matches
+            def _score_loose(p: int) -> tuple[int, int]:
+                return (abs(p - start_hint), _structure_penalty(target_lines, p, new_content, lead_ctx))
+            for i in sorted(loose, key=_score_loose):
+                surg = _surgical_reconstruct_block(
+                    hunk["lines"],
+                    target_lines[i : i + len(old_content)],
+                    old_content[0] if old_content else "",
+                    target_lines[i] if target_lines else ""
+                )
+                candidates.append({
+                    "start_idx": i,
+                    "end_idx": i + len(old_content),
+                    "replacement_lines": surg,
+                    "match_type": "loose_content_ambiguous",
+                    "confidence": 0.6
+                })
+            return candidates[:max_candidates]
 
     # 3) Fuzzy window
-    log.debug("\nFuzzy window search:")
-    m_full = len(old_content)
+    log.debug("Fuzzy window search:")
     n = len(target_lines)
     if n == 0:
-        return {
+        return [{
             "start_idx": 0,
             "end_idx": 0,
             "replacement_lines": new_content,
-            "match_type": "empty_file"
-        }
-    m = min(m_full, n)
+            "match_type": "empty_file",
+            "confidence": 1.0
+        }]
+    
+    m = min(len(old_content), n)
+    fuzzy_candidates = []
 
-    best_ratio = -1.0
-    best_index = -1
+    a_trim = [x.strip() for x in old_content[:m]]
+    
+    log.debug(f"Starting fuzzy window search with window size {m}")
+    log.debug(f"Search range: [{max(0, search_min)}, {min(n - m + 1, search_max)})")
 
-    a_trim_full = [x.strip() for x in old_content]
-    a_trim = a_trim_full[:m]
-
-    for i in range(n - m + 1):
+    for i in range(max(0, search_min), min(n - m + 1, search_max)):
         window = target_lines[i : i + m]
         b_trim = [x.strip() for x in window]
         ratio = difflib.SequenceMatcher(None, a_trim, b_trim, autojunk=False).ratio()
 
-        # Enforce first-line alignment for fuzzy matches
-        # A fuzzy match with high ratio but wrong starting position creates bugs.
-        # Only accept matches where the first line reasonably aligns.
+        # Enforce first-line alignment
         first_line_matches = False
         if old_content and i < len(target_lines):
             old_first = old_content[0].strip()
             file_first = target_lines[i].strip()
-            # Allow loose match: either exact or high similarity
             if old_first == file_first:
                 first_line_matches = True
             elif old_first and file_first:
-                # Allow if first lines are very similar (>0.8)
                 first_ratio = difflib.SequenceMatcher(None, old_first, file_first, autojunk=False).ratio()
                 first_line_matches = first_ratio > 0.8
         else:
-            first_line_matches = True  # Empty old_content edge case
+            first_line_matches = True
         
-        # Skip positions before min_position (enforce sequential ordering)
-        if i < min_position:
-            continue
+        if first_line_matches and ratio >= threshold:
+            fuzzy_candidates.append((i, ratio))
+            log.debug(f"  Fuzzy candidate at line {i}, ratio={ratio:.3f}")
+            if ratio >= 0.8:  # Log high-confidence fuzzy matches in detail
+                log.debug(f"    Window content:")
+                for j, line in enumerate(window[:min(5, len(window))]):
+                    log.debug(f"      [{j}] {repr(line)}")
+
+    if fuzzy_candidates:
+        # Sort by ratio desc, then by distance from hint
+        fuzzy_candidates.sort(key=lambda x: (-x[1], abs(x[0] - start_hint)))
+        log.debug(f"  Found {len(fuzzy_candidates)} fuzzy matches:")
+        for idx, (pos, ratio) in enumerate(fuzzy_candidates[:10]):  # Show top 10
+            log.debug(f"    [{idx}] line {pos}, ratio={ratio:.3f}")
+    else:
+        log.debug(f"  No fuzzy matches found (threshold={threshold:.2f})")
+        # Show best ratios even if below threshold
+        log.debug(f"  Showing all positions checked (sample):")
+        sample_positions = list(range(max(0, search_min), min(n - m + 1, search_max), max(1, (min(n - m + 1, search_max) - max(0, search_min)) // 20)))
+        for i in sample_positions[:10]:
+            window = target_lines[i : i + m]
+            b_trim = [x.strip() for x in window]
+            ratio = difflib.SequenceMatcher(None, a_trim, b_trim, autojunk=False).ratio()
+            log.debug(f"    line {i}: ratio={ratio:.3f}")
         
-        # Only update best match if first line aligns
-        if first_line_matches:
-            if ratio > best_ratio or (
-                ratio == best_ratio and abs(i - start_hint) < abs(best_index - start_hint)
-            ):
-                best_ratio = ratio
-                best_index = i
-                if best_ratio == 1.0:
-                    break
+        for i, ratio in fuzzy_candidates[:max_candidates]:
+            # Validate alignment for surgical reconstruction
+            use_surgical = False
+            if i + len(old_content) <= len(target_lines) and len(old_content) > 0:
+                alignment_checks = min(3, len(old_content))
+                matches = 0
+                for check_idx in range(alignment_checks):
+                    if i + check_idx >= len(target_lines):
+                        break
+                    old_line = old_content[check_idx].strip()
+                    file_line = target_lines[i + check_idx].strip()
+                    if old_line == file_line:
+                        matches += 1
+                
+                use_surgical = matches >= min(2, alignment_checks)
+            
+            if use_surgical:
+                actual_old_file_lines = 0
+                for ln in hunk["lines"]:
+                    if ln == "" or (ln and ln[0] in " -"):
+                        actual_old_file_lines += 1
+                
+                if i + actual_old_file_lines > len(target_lines):
+                    actual_old_file_lines = len(target_lines) - i
+                
+                surg = _surgical_reconstruct_block(
+                    hunk["lines"],
+                    target_lines[i : i + actual_old_file_lines],
+                    old_content[0],
+                    target_lines[i]
+                )
+                candidates.append({
+                    "start_idx": i,
+                    "end_idx": i + actual_old_file_lines,
+                    "replacement_lines": surg,
+                    "match_type": "fuzzy_surgical",
+                    "confidence": ratio
+                })
+            else:
+                # Simple replacement
+                m_local = min(len(old_content), len(target_lines) - i)
+                if new_content:
+                    new_adj = _reindent_relative(new_content, old_content[0], target_lines[i])
+                else:
+                    new_adj = new_content
+                candidates.append({
+                    "start_idx": i,
+                    "end_idx": i + m_local,
+                    "replacement_lines": new_adj,
+                    "match_type": "fuzzy_window",
+                    "confidence": ratio
+                })
+        
+        return candidates
 
-    log.debug(f"  Best fuzzy match: ratio={best_ratio:.3f} at position {best_index}")
+    # No candidates found
+    return []
 
-    # Middle-out bounded search
-    if best_ratio < threshold:
-        BUF = 40
-        lo = max(min_position, start_hint - (BUF + 1))
-        hi = min(len(target_lines), start_hint + len(old_content) + BUF)
-        mid_idx, mid_ratio = _middle_out_best_window(target_lines, old_content, start_hint, lo, hi)
-        if mid_ratio > best_ratio:
-            # Verify first-line alignment before accepting middle-out result
-            if old_content and mid_idx >= 0 and mid_idx < len(target_lines):
-                old_first = old_content[0].strip()
-                file_first = target_lines[mid_idx].strip()
-                if old_first != file_first:
-                    first_ratio = difflib.SequenceMatcher(None, old_first, file_first, autojunk=False).ratio()
-                    if first_ratio <= 0.8:
-                        log.debug(f"  Middle-out match at {mid_idx} rejected: first line mismatch")
-                        log.debug(f"    Expected: {repr(old_first[:60])}")
-                        log.debug(f"    Found: {repr(file_first[:60])}")
-                        log.debug(f"    Similarity: {first_ratio:.3f}")
-                        # Don't update best_ratio, reject this match
-                        mid_idx, mid_ratio = -1, -1.0
-            if mid_ratio > best_ratio:
-                log.debug(f"  Middle-out improved ratio from {best_ratio:.3f} to {mid_ratio:.3f} at {mid_idx}")
-            best_ratio, best_index = mid_ratio, mid_idx
 
-    # Line-number stripping fallback
-    if best_ratio < threshold and any(_NUMBAR_RE.match(x) for x in old_content if x):
-        log.debug("  💡 Attempting line-number stripping...")
-        stripped_old = _strip_line_numbers_block(old_content)
-        BUF = 40
-        lo = max(min_position, start_hint - (BUF + 1))
-        hi = min(len(target_lines), start_hint + len(stripped_old) + BUF)
-        s_idx, s_ratio = _middle_out_best_window(target_lines, stripped_old, start_hint, lo, hi)
-        if s_ratio < threshold:
-            s_best_ratio, s_best_index = -1.0, -1
-            m = min(len(stripped_old), len(target_lines))
-            a_trim = [_normalize_quotes(x.strip()) for x in stripped_old[:m]]
-            for i in range(len(target_lines) - m + 1):
-                b_trim = [_normalize_quotes(x.strip()) for x in target_lines[i:i+m]]
-                r = difflib.SequenceMatcher(None, a_trim, b_trim, autojunk=False).ratio()
-                # Enforce first-line alignment
-                if r > s_best_ratio and old_content and i < len(target_lines):
-                    old_first = old_content[0].strip()
-                    file_first = target_lines[i].strip()
-                    if old_first != file_first:
-                        first_ratio = difflib.SequenceMatcher(None, old_first, file_first, autojunk=False).ratio()
-                        if first_ratio <= 0.8:
-                            # Skip this position due to first-line mismatch
-                            continue
-                if r > s_best_ratio:
-                    s_best_ratio, s_best_index = r, i
-            s_idx, s_ratio = s_best_index, s_best_ratio
-        if s_ratio >= threshold and s_idx != -1:
-            log.debug(f"  ✅ Stripped-number match at {s_idx} with ratio={s_ratio:.3f}")
-            best_ratio, best_index = s_ratio, s_idx
+# ---------- Global assignment with constraints ----------
 
-    if best_ratio < threshold:
-        log.debug("\n  ⚠️  MATCH FAILURE - trying fallbacks...")
-
-        # FALLBACK 1: Anchored whitespace-insensitive
-        if old_content:
-            anchor_line_stripped = old_content[0].strip()
-            anchor_hits = [
-                i for i, line in enumerate(target_lines) if line.strip() == anchor_line_stripped
-            ]
-            # Filter to only positions >= min_position
-            anchor_hits = [i for i in anchor_hits if i >= min_position]
-            if not anchor_hits:
-                log.debug(f"  ⚠️ Anchored fallback: no valid anchors at or after min_position={min_position}")
-            if anchor_hits:
-                sorted_anchors = sorted(anchor_hits, key=lambda i: abs(i - start_hint))
-                flat_old_block = _flatten_ws_outside_quotes("\n".join(old_content))
-                for anchor_index in sorted_anchors:
-                    for i in range(anchor_index, len(target_lines)):
-                        current_consumed_lines = target_lines[anchor_index : i + 1]
-                        flat_consumed = _flatten_ws_outside_quotes("\n".join(current_consumed_lines))
-                        if not flat_old_block.startswith(flat_consumed):
-                            break
-                        if flat_consumed == flat_old_block:
-                            log.debug(f"  ✅ Fallback: anchored match at {anchor_index}")
-                            return {
-                                "start_idx": anchor_index,
-                                "end_idx": i + 1,
-                                "replacement_lines": new_content,
-                                "match_type": "anchored_fallback"
-                            }
-
-        # FALLBACK 2: Unique end-anchor
-        if old_content and len(old_content) > 1:
-            start_anchor_strip = old_content[0].strip()
-            end_anchor_strip = next(
-                (line.strip() for line in reversed(old_content) if line.strip()), None
+def _assign_hunks_to_candidates(all_candidates: list[list[dict]], log: logging.Logger) -> list[dict | None]:
+    """
+    Given candidates for each hunk, assign hunks to non-overlapping candidates
+    that respect sequential ordering and maximize overall confidence.
+    
+    Constraints:
+    1. No overlaps: Two hunks can't claim overlapping regions
+    2. Sequential ordering: Hunk[i] must come before hunk[i+1] in the file
+    
+    Returns a list of assignments (one per hunk), where each is either a candidate dict or None.
+    """
+    num_hunks = len(all_candidates)
+    
+    # Try to find a valid assignment using backtracking
+    def backtrack(hunk_idx: int, assigned: list[dict | None], used_regions: list[tuple[int, int]]) -> list[dict | None] | None:
+        if hunk_idx == num_hunks:
+            return assigned[:]
+        
+        candidates = all_candidates[hunk_idx]
+        if not candidates:
+            # No candidates - mark as None and continue
+            assigned.append(None)
+            result = backtrack(hunk_idx + 1, assigned, used_regions)
+            assigned.pop()
+            return result
+        
+        # Try each candidate for this hunk
+        for candidate in candidates:
+            start = candidate["start_idx"]
+            end = candidate["end_idx"]
+            
+            # Check if this overlaps with any already-assigned region
+            overlaps = any(
+                not (end <= used_start or start >= used_end)
+                for used_start, used_end in used_regions
             )
-            if start_anchor_strip and end_anchor_strip:
-                start_hits = [i for i, k in enumerate(target_lines) if k.strip() == start_anchor_strip]
-                end_hits = [i for i, k in enumerate(target_lines) if k.strip() == end_anchor_strip]
-                start_hits = [i for i in start_hits if i >= min_position]
-                end_hits = [i for i in end_hits if i >= min_position]
-                if len(end_hits) == 1:
-                    end_line_idx = end_hits[0]
-                    plausible_starts = [i for i in start_hits if i <= end_line_idx]
-                    if plausible_starts:
-                        start_line_idx = min(plausible_starts, key=lambda i: abs(i - start_hint))
-                        log.debug(f"  ✅ Fallback: unique end-anchor [{start_line_idx}-{end_line_idx}]")
-                        return {
-                            "start_idx": start_line_idx,
-                            "end_idx": end_line_idx + 1,
-                            "replacement_lines": new_content,
-                            "match_type": "end_anchor_fallback"
-                        }
-
-        # FINAL FALLBACK: Fuzzy window merge conflict
-        log.debug("\n  💡 Creating merge conflict...")
-        conflict_threshold = 0.25
-        start_line = max(min_position, best_index) if best_index >= 0 else min_position
-        window_len = min(len(old_content), len(target_lines) - start_line) if target_lines else 0
-        end_line = start_line + window_len
-
-        if len(old_content) >= 2 and best_ratio >= conflict_threshold and window_len > 0:
-            log.debug(f"  ✅ Conflict created at lines [{start_line}-{end_line - 1}]")
-            original_block = target_lines[start_line:end_line]
-            conflict_block = []
-            conflict_block.append("<<<<<<< CURRENT CHANGE")
-            conflict_block.extend(original_block)
-            conflict_block.append("=======")
-            conflict_block.extend(new_content)
-            conflict_block.append(">>>>>>> INCOMING CHANGE (from patch)")
-            return {
-                "start_idx": start_line,
-                "end_idx": end_line,
-                "replacement_lines": conflict_block,
-                "match_type": "merge_conflict"
-            }
-
-        if len(old_content) >= 2:
-            raise PatchFailedError(
-                f"Best fuzzy ratio ({best_ratio:.2f}) below conflict threshold ({conflict_threshold})."
+            
+            # Check sequential ordering: this hunk should come after all previous assigned hunks
+            violates_order = any(
+                assigned[i] is not None and assigned[i]["start_idx"] >= start
+                for i in range(hunk_idx)
             )
-        else:
-            raise PatchFailedError(f"Best match ratio {best_ratio:.2f} below threshold {threshold:.2f}.")
-
-    # Fuzzy match succeeded
-    if best_ratio >= threshold and best_index != -1:
-        i = best_index
-
-        # Validate alignment before using surgical reconstruction
-        # For fuzzy matches, the window might not align with the hunk structure.
-        # Only use surgical reconstruction if the first line of old_content actually matches.
-        use_surgical = False
-        if i + len(old_content) <= len(target_lines) and len(old_content) > 0:
-            # Check if first old_content line matches the file at position i
-            first_old = old_content[0].strip() if old_content else ""
-            first_file = target_lines[i].strip() if i < len(target_lines) else ""
             
-            # Verify alignment by checking if multiple lines match
-            alignment_checks = min(3, len(old_content))  # Check up to 3 lines
-            matches = 0
-            for check_idx in range(alignment_checks):
-                if i + check_idx >= len(target_lines):
-                    break
-                old_line = old_content[check_idx].strip()
-                file_line = target_lines[i + check_idx].strip()
-                if old_line == file_line:
-                    matches += 1
-            
-            # Require at least 2 out of 3 lines to match for surgical reconstruction
-            use_surgical = matches >= min(2, alignment_checks)
-            
-            log.debug(f"\n  FUZZY ALIGNMENT CHECK:")
-            log.debug(f"    Checking {alignment_checks} lines, {matches} matched")
-            log.debug(f"    First old: {repr(first_old[:60])}")
-            log.debug(f"    First file[{i}]: {repr(first_file[:60])}")
-            log.debug(f"    Use surgical: {use_surgical}")
+            if not overlaps and not violates_order:
+                # This candidate is valid
+                assigned.append(candidate)
+                used_regions.append((start, end))
+                
+                result = backtrack(hunk_idx + 1, assigned, used_regions)
+                if result is not None:
+                    return result
+                
+                # Backtrack
+                assigned.pop()
+                used_regions.pop()
         
-        if use_surgical:
-            # Calculate the ACTUAL number of file lines this hunk modifies
-            # by counting non-'+' lines in the hunk (these map to old file content).
-            # This is NOT the same as len(old_content) which excludes context lines!
-            actual_old_file_lines = 0
-            for ln in hunk["lines"]:
-                if ln == "" or (ln and ln[0] in " -"):
-                    # These lines exist in the old file
-                    actual_old_file_lines += 1
-                # '+' lines don't exist in old file, so don't count them
-            
-            # Sanity check: don't go beyond file bounds
-            if i + actual_old_file_lines > len(target_lines):
-                actual_old_file_lines = len(target_lines) - i
-            
-            log.debug(f"  Surgical segment: hunk has {len(hunk['lines'])} lines, "
-                     f"mapping to {actual_old_file_lines} old file lines")
-            
-            log.debug(f"  ✅ Using surgical reconstruction for aligned fuzzy match")
-            surg = _surgical_reconstruct_block(
-                hunk["lines"],
-                target_lines[i : i + actual_old_file_lines],
-                old_content[0],
-                target_lines[i]
-            )
-            log.debug(f"  ✅ Located fuzzy match at index {i} with surgical reconstruction")
-            return {
-                "start_idx": i,
-                "end_idx": i + actual_old_file_lines,
-                "replacement_lines": surg,
-                "match_type": "fuzzy_surgical"
-            }
-        
-        # Fallback: simple replacement with re-indentation
-        log.debug(f"  ⚠️ Fuzzy match not aligned, using simple replacement")
-        m = min(len(old_content), len(target_lines) - i)
-        if new_content:
-            new_adj = _reindent_relative(new_content, old_content[0], target_lines[i])
-        else:
-            new_adj = new_content
-        log.debug(f"  ✅ Located fuzzy match at index {i} with simple replacement (m={m} lines)")
-        return {
-            "start_idx": i,
-            "end_idx": i + m,
-            "replacement_lines": new_adj,
-            "match_type": "fuzzy_window"
-        }
-
-    raise PatchFailedError(f"Best match ratio {best_ratio:.2f} below threshold {threshold:.2f}.")
-
-
-# ---------- main application ----------
+        # No valid candidate found - mark as None and continue
+        assigned.append(None)
+        result = backtrack(hunk_idx + 1, assigned, used_regions)
+        assigned.pop()
+        return result
+    
+    result = backtrack(0, [], [])
+    if result is None:
+        log.debug("No valid assignment found, using greedy fallback")
+        # Fallback: just take the first candidate for each hunk
+        return [candidates[0] if candidates else None for candidates in all_candidates]
+    
+    return result
 
 
 def patch_text(
@@ -1035,10 +1046,12 @@ def patch_text(
     debug: bool | None = None,
 ) -> str:
     """
-    Apply a patch string to the provided content using a two-pass approach.
-
-    Pass 1: Locate all hunks in the ORIGINAL file
-    Pass 2: Apply changes from bottom to top (so line numbers stay valid)
+    Apply a patch using a four-phase algorithm:
+    
+    Phase 1: Find ALL candidate locations for each hunk
+    Phase 2: Assign hunks to candidates globally (respecting order and avoiding overlaps)
+    Phase 3: Refine failed hunks using perfect hunks as anchors
+    Phase 4: Apply all changes bottom-to-top
 
     Raises:
         PatchFailedError: if no acceptable match can be found for any hunk.
@@ -1110,12 +1123,10 @@ def patch_text(
     dedented_patch = patch.strip()
 
     log.debug("\n=== PATCH PARSING ===")
-    log.debug(f"Patch first 500 chars:\n{dedented_patch[:500]}")
 
     standard_match = re.search(
         r"^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@", dedented_patch, re.MULTILINE
     )
-    log.debug(f"Standard diff pattern found: {bool(standard_match)}")
 
     if standard_match:
         hunks = _parse_patch_hunks(dedented_patch)
@@ -1125,115 +1136,219 @@ def patch_text(
     if not hunks:
         raise PatchFailedError("no valid hunks")
 
-    log.debug(f"\nParsed {len(hunks)} hunks using {'standard' if standard_match else 'simplified'} parser")
+    log.debug(f"Parsed {len(hunks)} hunks")
 
     original_lines = content.splitlines()
     log.debug(f"Target file has {len(original_lines)} lines")
 
-    # PASS 1: Locate all hunks in the ORIGINAL file
+    # PHASE 1: Find ALL candidates for each hunk
     log.debug("\n" + "=" * 60)
-    log.debug("PASS 1: LOCATING ALL HUNKS")
+    log.debug("PHASE 1: FIND ALL CANDIDATES FOR EACH HUNK")
     log.debug("=" * 60)
     
-    match_locations = []
-    min_position = 0  # Each hunk must be at or after the previous hunk's end
-
+    all_candidates = []
+    
     for i, h in enumerate(hunks):
-        log.debug(f"\n{'=' * 60}\nLocating Hunk #{i + 1}/{len(hunks)}")
-        lines = h.get("lines", [])
-        pure_add = all(ln.startswith("+") or ln == "" for ln in lines) and any(
-            ln.startswith("+") for ln in lines
-        )
-
+        log.debug(f"\nHunk #{i + 1}/{len(hunks)}")
+        
         if h.get("new_start"):
-            header_hint = min(len(original_lines), max(0, int(h.get("new_start", 1)) - 1))
+            start_hint = min(len(original_lines), max(0, int(h.get("new_start", 1)) - 1))
         else:
-            header_hint = min_position
-
-        start_hint = (
-            header_hint
-            if pure_add or not h.get("new_start")
-            else max(min_position, min(len(original_lines), int(round(0.7 * min_position + 0.3 * header_hint))))
+            start_hint = 0
+        
+        candidates = _find_all_hunk_candidates(
+            original_lines, h, threshold, start_hint,
+            0, len(original_lines),
+            log=log
         )
-
-        try:
-            location = _locate_hunk_position(original_lines, h, threshold, start_hint, min_position, log=log)
-            location["hunk_index"] = i  # Track original hunk order
-            match_locations.append(location)
-            
-            # Next hunk can start where trailing context begins (to allow context overlap)
-            # Find where trailing context starts by looking at the hunk lines
-            hunk_lines = h.get("lines", [])
-            lead_ctx, tail_ctx = _split_lead_tail_context(hunk_lines)
-            
-            # The changes span from after leading context to before trailing context
-            # So min_position should be: start + leading_context + changes
-            # Which equals: end - trailing_context
-            changes_end_offset = len(tail_ctx)
-            
-            # Next hunk must start at or after where changes ended (but can overlap trailing context)
-            min_position = location["end_idx"] - changes_end_offset
-            
-            log.debug(f"  Hunk changes end at {min_position} (end_idx={location['end_idx']}, tail_ctx={len(tail_ctx)} lines)")
-            
-            log.debug(f"✓ Hunk #{i + 1} located. Match type: {location['match_type']}")
-        except PatchFailedError as e:
-            log.debug(f"✗ Hunk #{i + 1} FAILED: {e}")
-            raise PatchFailedError(f"Failed to locate hunk #{i + 1}: {e}") from e
-
-    # PASS 2: Apply all changes from bottom to top
+        
+        if candidates:
+            log.debug(f"  Found {len(candidates)} candidate(s):")
+            for j, cand in enumerate(candidates):
+                log.debug(f"    [{j}] line {cand['start_idx']}, confidence={cand['confidence']:.2f}, type={cand['match_type']}")
+        else:
+            log.debug(f"  No candidates found")
+        
+        all_candidates.append(candidates)
+    
+    # PHASE 2: Assign hunks to candidates globally
     log.debug("\n" + "=" * 60)
-    log.debug("PASS 2: APPLYING CHANGES (BOTTOM TO TOP)")
+    log.debug("PHASE 2: ASSIGN HUNKS TO CANDIDATES (GLOBAL OPTIMIZATION)")
     log.debug("=" * 60)
     
-    # Sort by start_idx in descending order (bottom to top)
-    match_locations.sort(key=lambda loc: loc["start_idx"], reverse=True)
+    assignments = _assign_hunks_to_candidates(all_candidates, log)
     
-    log.debug("\nApplication order (sorted by position, highest first):")
-    for i, loc in enumerate(match_locations):
-        log.debug(f"  {i + 1}. Original Hunk #{loc['hunk_index'] + 1} at lines [{loc['start_idx']}:{loc['end_idx']}]")
+    locations = []
+    for i, assignment in enumerate(assignments):
+        if assignment is None:
+            log.debug(f"Hunk #{i + 1}: no valid assignment")
+            locations.append({
+                "hunk_index": i,
+                "hunk": hunks[i],
+                "match_type": "failed",
+                "confidence": 0.0,
+                "start_idx": -1,
+                "end_idx": -1,
+                "replacement_lines": [],
+                "error": "No valid assignment"
+            })
+        else:
+            assignment["hunk_index"] = i
+            assignment["hunk"] = hunks[i]
+            locations.append(assignment)
+            log.debug(f"Hunk #{i + 1}: assigned to line {assignment['start_idx']}, confidence={assignment['confidence']:.2f}")
+    
+    # PHASE 3: Refine ambiguous/failed hunks using anchors
+    log.debug("\n" + "=" * 60)
+    log.debug("PHASE 3: REFINE USING ANCHORS")
+    log.debug("=" * 60)
+    
+    # Identify perfect vs ambiguous/failed
+    PERFECT_THRESHOLD = 0.95
+    perfect_indices = [i for i, loc in enumerate(locations) if loc["confidence"] >= PERFECT_THRESHOLD]
+    
+    log.debug(f"Perfect hunks: {[locations[i]['hunk_index'] + 1 for i in perfect_indices]}")
+    
+    for i, loc in enumerate(locations):
+        if loc["confidence"] >= PERFECT_THRESHOLD:
+            continue  # Already good
+        
+        log.debug(f"\nRefining Hunk #{loc['hunk_index'] + 1} (confidence={loc['confidence']:.2f})")
+        
+        # Find bounding perfect hunks
+        prev_perfect = None
+        next_perfect = None
+        
+        for pi in perfect_indices:
+            if pi < i:
+                prev_perfect = locations[pi]
+            elif pi > i:
+                next_perfect = locations[pi]
+                break
+        
+        # Determine search bounds
+        if prev_perfect and next_perfect:
+            search_min = prev_perfect["end_idx"]
+            search_max = next_perfect["start_idx"]
+            log.debug(f"  Bounded by hunks #{prev_perfect['hunk_index']+1} and #{next_perfect['hunk_index']+1}")
+            log.debug(f"  Search range: [{search_min}, {search_max}]")
+        elif prev_perfect:
+            search_min = prev_perfect["end_idx"]
+            search_max = len(original_lines)
+            log.debug(f"  Bounded below by hunk #{prev_perfect['hunk_index']+1}")
+        elif next_perfect:
+            search_min = 0
+            search_max = next_perfect["start_idx"]
+            log.debug(f"  Bounded above by hunk #{next_perfect['hunk_index']+1}")
+        else:
+            # No perfect hunks to anchor on
+            log.debug(f"  No perfect anchors available")
+            continue
+        
+        if search_max <= search_min:
+            log.debug(f"  ⚠️ Invalid search range, skipping refinement")
+            continue
+        
+        # Re-search with constraints
+        h = loc["hunk"]
+        if h.get("new_start"):
+            start_hint = min(len(original_lines), max(0, int(h.get("new_start", 1)) - 1))
+        else:
+            start_hint = (search_min + search_max) // 2
+        
+        # Find new candidates in constrained region
+        new_candidates = _find_all_hunk_candidates(
+            original_lines, h, threshold, start_hint,
+            search_min, search_max,
+            log=log
+        )
+        
+        if new_candidates:
+            # Take the best candidate
+            new_location = new_candidates[0]
+            new_location["hunk_index"] = loc["hunk_index"]
+            new_location["hunk"] = h
+            locations[i] = new_location
+            log.debug(f"  ✅ Refined (new confidence={new_location['confidence']:.2f})")
+        else:
+            # Still can't find it - create merge conflict if we have both bounds
+            if prev_perfect and next_perfect:
+                log.debug(f"  💡 Creating merge conflict between anchors")
+                
+                # Calculate proportional position
+                patch_total = sum(
+                    len(locations[j]["hunk"].get("lines", [])) 
+                    for j in range(len(locations))
+                )
+                patch_before = sum(
+                    len(locations[j]["hunk"].get("lines", [])) 
+                    for j in range(i)
+                )
+                ratio = patch_before / max(patch_total, 1)
+                
+                file_range = search_max - search_min
+                insert_pos = search_min + int(ratio * file_range)
+                
+                # Get what we expected vs what's there
+                old_content, new_content, _ = _split_hunk_components(h["lines"])
+                window_size = min(len(old_content), search_max - insert_pos) if old_content else 5
+                actual_content = original_lines[insert_pos:insert_pos + window_size]
+                
+                conflict_lines = []
+                conflict_lines.append("<<<<<<< CURRENT (file content)")
+                conflict_lines.extend(actual_content)
+                conflict_lines.append("=======")
+                conflict_lines.extend(new_content if new_content else ["(empty)"])
+                conflict_lines.append(f">>>>>>> PATCH (hunk #{loc['hunk_index'] + 1})")
+                
+                locations[i] = {
+                    "hunk_index": loc["hunk_index"],
+                    "hunk": h,
+                    "start_idx": insert_pos,
+                    "end_idx": insert_pos + window_size,
+                    "replacement_lines": conflict_lines,
+                    "match_type": "merge_conflict",
+                    "confidence": 0.5
+                }
+                log.debug(f"  ✅ Merge conflict created at line {insert_pos}")
+            else:
+                log.debug(f"  ✗ Still failed, no both-side anchors for merge conflict")
+    
+    # PHASE 4: Apply all changes bottom-to-top
+    log.debug("\n" + "=" * 60)
+    log.debug("PHASE 4: APPLY CHANGES (BOTTOM TO TOP)")
+    log.debug("=" * 60)
+    
+    # Sort by position descending (bottom to top), then by hunk_index ascending (patch order)
+    locations.sort(key=lambda x: (-x["start_idx"], x["hunk_index"]))
+    
+    # Detect overlaps (should not happen with proper assignment)
+    for i in range(len(locations) - 1):
+        curr = locations[i]
+        next_loc = locations[i + 1]
+        if curr["start_idx"] >= 0 and next_loc["start_idx"] >= 0:
+            if curr["start_idx"] < next_loc["end_idx"] and curr["end_idx"] > next_loc["start_idx"]:
+                log.debug(f"\n⚠️ UNEXPECTED OVERLAP (BUG?):")
+                log.debug(f"  Hunk #{curr['hunk_index'] + 1} [{curr['start_idx']}:{curr['end_idx']}]")
+                log.debug(f"  Hunk #{next_loc['hunk_index'] + 1} [{next_loc['start_idx']}:{next_loc['end_idx']}]")
     
     current_lines = original_lines[:]
     
-    for i, location in enumerate(match_locations):
-        log.debug(f"\n{'=' * 60}\nAPPLYING HUNK #{location['hunk_index'] + 1} (originally) - Apply order #{i + 1}/{len(match_locations)}")
-        log.debug(f"  Position: [{location['start_idx']}:{location['end_idx']}]")
+    for loc in locations:
+        if loc["start_idx"] < 0:
+            log.debug(f"\nSkipping failed hunk #{loc['hunk_index'] + 1}")
+            continue
         
-        # Debug: Show the current state at this position
-        log.debug(f"  Current file state at position (lines {max(0, location['start_idx']-2)} to {min(len(current_lines), location['end_idx']+2)}):")
-        for j in range(max(0, location['start_idx']-2), min(len(current_lines), location['end_idx']+2)):
-            marker = " >>> " if location['start_idx'] <= j < location['end_idx'] else "     "
-            log.debug(f"    {marker}[{j}] {repr(current_lines[j][:80])}")
-        log.debug(f"  Match type: {location['match_type']}")
-        log.debug(f"  Replacing {location['end_idx'] - location['start_idx']} lines with {len(location['replacement_lines'])} lines")
-        
-        # Show what we're replacing
-        old_content = current_lines[location['start_idx']:location['end_idx']]
-        log.debug(f"  OLD content (lines {location['start_idx']}-{location['end_idx'] - 1}):")
-        for j, line in enumerate(old_content[:5]):  # Show first 5 lines
-            log.debug(f"    {location['start_idx'] + j}: {repr(line[:80])}")
-        if len(old_content) > 5:
-            log.debug(f"    ... and {len(old_content) - 5} more lines")
-        
-        log.debug(f"  NEW content ({len(location['replacement_lines'])} lines):")
-        for j, line in enumerate(location['replacement_lines'][:5]):  # Show first 5 lines
-            log.debug(f"    {j}: {repr(line[:80])}")
-        if len(location['replacement_lines']) > 5:
-            log.debug(f"    ... and {len(location['replacement_lines']) - 5} more lines")
+        log.debug(f"\nApplying Hunk #{loc['hunk_index'] + 1} at [{loc['start_idx']}:{loc['end_idx']}]")
+        log.debug(f"  Type: {loc['match_type']}, Confidence: {loc['confidence']:.2f}")
         
         current_lines = (
-            current_lines[:location["start_idx"]] +
-            location["replacement_lines"] +
-            current_lines[location["end_idx"]:]
+            current_lines[:loc["start_idx"]] +
+            loc["replacement_lines"] +
+            current_lines[loc["end_idx"]:]
         )
         
-        # Debug: Show the result after this hunk
-        log.debug(f"  Result after applying (lines {max(0, location['start_idx']-1)} to {min(len(current_lines), location['start_idx']+len(location['replacement_lines'])+1)}):")
-        for j in range(max(0, location['start_idx']-1), min(len(current_lines), location['start_idx']+len(location['replacement_lines'])+1)):
-            marker = " NEW " if location['start_idx'] <= j < location['start_idx'] + len(location['replacement_lines']) else "     "
-            log.debug(f"    {marker}[{j}] {repr(current_lines[j][:80])}")
-        
-        log.debug(f"  ✅ Applied. File now has {len(current_lines)} lines (delta: {len(current_lines) - len(original_lines)})")
+        log.debug(f"  ✅ Applied. File now has {len(current_lines)} lines")
     
     log.debug("\n" + "=" * 60)
     log.debug("PATCH APPLICATION COMPLETE")
@@ -1246,11 +1361,8 @@ def fuzzy_patch_partial(
     content: str, patch_str: str, threshold: float = 0.6, *, logger=None, log: bool = False
 ):
     """
-    Best-effort patching using two-pass approach:
-      - locates all hunks it can in the original file
-      - applies them from bottom to top
-      - returns (new_text, applied_indices, failed) where failed is a list of
-        {index, error, lead_ctx, tail_ctx, old_content, new_content}
+    Best-effort patching - same four-phase algorithm as patch_text.
+    Returns (new_text, applied_indices, failed) where failed is a list of failed hunk details.
     """
     log = resolve_logger(logger=logger, enabled=log, name=__name__, level=logging.DEBUG)
 
@@ -1269,58 +1381,148 @@ def fuzzy_patch_partial(
     hunks = _parse_patch_hunks(patch_str.strip())
     original_lines = content.splitlines()
     
-    # PASS 1: Try to locate all hunks
-    match_locations = []
-    applied = []
-    failed = []
-    min_position = 0
+    # Phase 1: Find all candidates
+    all_candidates = []
     
     for i, h in enumerate(hunks):
-        header_hint = min(len(original_lines), max(0, int(h.get("new_start", 1)) - 1))
-        lines = h.get("lines", [])
-        pure_add = all(ln.startswith("+") or ln == "" for ln in lines) and any(
-            ln.startswith("+") for ln in lines
+        if h.get("new_start"):
+            start_hint = min(len(original_lines), max(0, int(h.get("new_start", 1)) - 1))
+        else:
+            start_hint = 0
+        
+        candidates = _find_all_hunk_candidates(
+            original_lines, h, threshold, start_hint,
+            0, len(original_lines),
+            log=log
         )
-        start_hint = (
-            header_hint
-            if pure_add
-            else max(min_position, min(len(original_lines), int(round(0.7 * min_position + 0.3 * header_hint))))
+        all_candidates.append(candidates)
+    
+    # Phase 2: Assign globally
+    assignments = _assign_hunks_to_candidates(all_candidates, log)
+    
+    locations = []
+    for i, assignment in enumerate(assignments):
+        if assignment is None:
+            locations.append({
+                "hunk_index": i,
+                "hunk": hunks[i],
+                "match_type": "failed",
+                "confidence": 0.0,
+                "start_idx": -1,
+                "end_idx": -1,
+                "replacement_lines": [],
+                "error": "No valid assignment"
+            })
+        else:
+            assignment["hunk_index"] = i
+            assignment["hunk"] = hunks[i]
+            locations.append(assignment)
+    
+    # Phase 3: Refine (same logic as patch_text)
+    PERFECT_THRESHOLD = 0.95
+    perfect_indices = [i for i, loc in enumerate(locations) if loc["confidence"] >= PERFECT_THRESHOLD]
+    
+    for i, loc in enumerate(locations):
+        if loc["confidence"] >= PERFECT_THRESHOLD:
+            continue
+        
+        prev_perfect = None
+        next_perfect = None
+        
+        for pi in perfect_indices:
+            if pi < i:
+                prev_perfect = locations[pi]
+            elif pi > i:
+                next_perfect = locations[pi]
+                break
+        
+        if prev_perfect and next_perfect:
+            search_min = prev_perfect["end_idx"]
+            search_max = next_perfect["start_idx"]
+        elif prev_perfect:
+            search_min = prev_perfect["end_idx"]
+            search_max = len(original_lines)
+        elif next_perfect:
+            search_min = 0
+            search_max = next_perfect["start_idx"]
+        else:
+            continue
+        
+        if search_max <= search_min:
+            continue
+        
+        h = loc["hunk"]
+        start_hint = (search_min + search_max) // 2
+        
+        new_candidates = _find_all_hunk_candidates(
+            original_lines, h, threshold, start_hint,
+            search_min, search_max,
+            log=log
         )
-        try:
-            location = _locate_hunk_position(original_lines, h, threshold, start_hint, min_position, log=log)
-            location["hunk_index"] = i  # Track original hunk order
-            match_locations.append((i, location))
-            applied.append(i)
-            
-            # Allow next hunk to overlap with trailing context
-            hunk_lines = h.get("lines", [])
-            lead_ctx, tail_ctx = _split_lead_tail_context(hunk_lines)
-            changes_end_offset = len(tail_ctx)
-            min_position = location["end_idx"] - changes_end_offset
-            
-        except PatchFailedError as e:
-            old_content, new_content, _ctx = _split_hunk_components(h["lines"])
-            lead_ctx, tail_ctx = _split_lead_tail_context(h["lines"])
+        
+        if new_candidates:
+            new_location = new_candidates[0]
+            new_location["hunk_index"] = loc["hunk_index"]
+            new_location["hunk"] = h
+            locations[i] = new_location
+        else:
+            if prev_perfect and next_perfect:
+                # Create merge conflict
+                patch_total = sum(len(locations[j]["hunk"].get("lines", [])) for j in range(len(locations)))
+                patch_before = sum(len(locations[j]["hunk"].get("lines", [])) for j in range(i))
+                ratio = patch_before / max(patch_total, 1)
+                
+                insert_pos = search_min + int(ratio * (search_max - search_min))
+                
+                old_content, new_content, _ = _split_hunk_components(h["lines"])
+                window_size = min(len(old_content) if old_content else 5, search_max - insert_pos)
+                actual_content = original_lines[insert_pos:insert_pos + window_size]
+                
+                conflict_lines = []
+                conflict_lines.append("<<<<<<< CURRENT")
+                conflict_lines.extend(actual_content)
+                conflict_lines.append("=======")
+                conflict_lines.extend(new_content if new_content else ["(empty)"])
+                conflict_lines.append(f">>>>>>> PATCH (hunk #{loc['hunk_index'] + 1})")
+                
+                locations[i] = {
+                    "hunk_index": loc["hunk_index"],
+                    "hunk": h,
+                    "start_idx": insert_pos,
+                    "end_idx": insert_pos + window_size,
+                    "replacement_lines": conflict_lines,
+                    "match_type": "merge_conflict",
+                    "confidence": 0.5
+                }
+    
+    # Phase 4: Apply
+    locations.sort(key=lambda x: (-x["start_idx"], x["hunk_index"]))
+    
+    current_lines = original_lines[:]
+    applied = []
+    failed = []
+    
+    for loc in locations:
+        if loc["start_idx"] < 0:
+            old_content, new_content, _ = _split_hunk_components(loc["hunk"]["lines"])
+            lead_ctx, tail_ctx = _split_lead_tail_context(loc["hunk"]["lines"])
             failed.append({
-                "index": i,
-                "error": str(e),
+                "index": loc["hunk_index"],
+                "error": loc.get("error", "Unknown error"),
                 "lead_ctx": lead_ctx,
                 "tail_ctx": tail_ctx,
                 "old_content": old_content,
                 "new_content": new_content,
-                "header_hint": header_hint,
+                "header_hint": 0,
             })
-    
-    # PASS 2: Apply successfully located hunks from bottom to top
-    match_locations.sort(key=lambda x: x[1]["start_idx"], reverse=True)
-    current_lines = original_lines[:]
-    
-    for hunk_idx, location in match_locations:
+            continue
+        
         current_lines = (
-            current_lines[:location["start_idx"]] +
-            location["replacement_lines"] +
-            current_lines[location["end_idx"]:]
+            current_lines[:loc["start_idx"]] +
+            loc["replacement_lines"] +
+            current_lines[loc["end_idx"]:]
         )
+        applied.append(loc["hunk_index"])
     
     new_text = eol.join(current_lines) + (eol if had_trailing_nl else "")
     return new_text, applied, failed
