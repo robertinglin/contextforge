@@ -622,6 +622,27 @@ def _find_all_hunk_candidates(
             "confidence": 0.9
         }]
     
+    # Check if deletions are scattered (context lines between deletion lines)
+    # If so, skip anchor approach - use old_content matching instead
+    if changed_lines and len(changed_lines) > 1:
+        last_delete_idx = -10  # Track position of last deletion
+        deletions_scattered = False
+        
+        for i, line in enumerate(hunk["lines"]):
+            if line and line[0] == '-':
+                # Check if there was context since last deletion
+                if last_delete_idx >= 0 and i - last_delete_idx > 1:
+                    deletions_scattered = True
+                    log.debug(f"Deletions are scattered: gap of {i - last_delete_idx - 1} lines between deletions")
+                    break
+                last_delete_idx = i
+        
+        if deletions_scattered:
+            log.debug("Skipping anchor approach for scattered deletions, using old_content matching")
+            # Clear changed_lines to force fallback to old_content matching
+            # which handles scattered deletes correctly
+            changed_lines = []
+    
     # Step 1: Find all locations that contain the changed lines (fuzzy)
     anchor_candidates = []
     
@@ -662,6 +683,52 @@ def _find_all_hunk_candidates(
         
         log.debug(f"Found {len(anchor_candidates)} anchor candidates at: {anchor_candidates}")
     
+    # If no anchor candidates found but we have context, try matching on context alone
+    # This handles cases where the deletion target doesn't exist but context is clear
+    if not anchor_candidates and changed_lines and (lead_ctx or tail_ctx):
+        log.debug(f"No anchors found for changed lines, trying context-only matching")
+        
+        # Build a pattern from the context
+        context_pattern = []
+        if lead_ctx:
+            context_pattern.extend(lead_ctx[-min(3, len(lead_ctx)):])
+        if tail_ctx:
+            context_pattern.extend(tail_ctx[:min(3, len(tail_ctx))])
+        
+        if context_pattern:
+            log.debug(f"Searching for context pattern ({len(context_pattern)} lines)")
+            
+            # Search for the context pattern
+            for i in range(max(0, search_min), min(len(target_lines) - len(context_pattern) + 1, search_max)):
+                window = target_lines[i : i + len(context_pattern)]
+                
+                # Check similarity
+                ratio = _similarity(context_pattern, window)
+                
+                if ratio >= 0.8:  # Strong context match
+                    # Calculate where the changed lines WOULD be
+                    # They come after the leading context
+                    anchor_position = i + len(lead_ctx[-min(3, len(lead_ctx)):]) if lead_ctx else i
+                    anchor_candidates.append(anchor_position)
+                    log.debug(f"  Found context match at {i}, implies anchor at {anchor_position}, ratio={ratio:.3f}")
+    
+    # Additional fallback: if still no candidates and we have both lead and tail context,
+    # search for where they could sandwich an insertion point
+    if not anchor_candidates and not changed_lines and lead_ctx and tail_ctx:
+        log.debug("No anchors, trying to find insertion point between lead and tail context")
+        
+        lead_slice = lead_ctx[-min(3, len(lead_ctx)):]
+        tail_slice = tail_ctx[:min(3, len(tail_ctx))]
+        
+        lead_hits = _find_block_matches(target_lines, lead_slice, loose=True)
+        tail_hits = _find_block_matches(target_lines, tail_slice, loose=True)
+        
+        for L in lead_hits:
+            for T in tail_hits:
+                if L + len(lead_slice) <= T and search_min <= L < search_max:
+                    anchor_candidates.append(L + len(lead_slice))
+                    log.debug(f"  Found lead at {L} and tail at {T}, anchor at {L + len(lead_slice)}")
+    
     # Step 2: Score each anchor candidate by surrounding context
     if anchor_candidates:
         scored_candidates = []
@@ -677,15 +744,19 @@ def _find_all_hunk_candidates(
 
             # Check leading context
             if lead_ctx:
-                # The context check needs to look BEFORE the anchor
-                # But the anchor is at the changed line, and there's leading_context_count lines before it
-                # So we check context BEFORE (anchor - leading_context_count)
-                before = target_lines[max(0, anchor_idx - leading_context_count - ctx_probe) : anchor_idx - leading_context_count]
-                lead_slice = lead_ctx[-min(ctx_probe, len(lead_ctx)):]
-                lead_ratio = _similarity(lead_slice, before[-len(lead_slice):] if before else [])
-                context_score += lead_ratio
-                context_weight += 1
-                log.debug(f"  Anchor {anchor_idx}: lead_context_ratio={lead_ratio:.3f}")
+                hunk_start = anchor_idx - leading_context_count
+                if hunk_start <= 0:
+                    # Hunk at/near start: lead context is implicitly part of matched hunk structure
+                    context_score += 1.0
+                    context_weight += 1
+                    log.debug(f"  Anchor {anchor_idx}: lead_context at file start (implicit)")
+                else:
+                    before = target_lines[max(0, hunk_start - ctx_probe) : hunk_start]
+                    lead_slice = lead_ctx[-min(ctx_probe, len(lead_ctx)):]
+                    lead_ratio = _similarity(lead_slice, before[-len(lead_slice):] if before else [])
+                    context_score += lead_ratio
+                    context_weight += 1
+                    log.debug(f"  Anchor {anchor_idx}: lead_context_ratio={lead_ratio:.3f}")
             
             # Check trailing context  
             if tail_ctx:

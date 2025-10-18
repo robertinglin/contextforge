@@ -114,7 +114,7 @@ def test_run_tests():
     +mainFooter.style.display = 'flex'; // Always visible now
     -scanQrButton.addEventListener('click', startQrScanner);
     """)
-    after = cf_fuzzy_patch(before, patch)
+    after = cf_fuzzy_patch(before, patch, log=True)
     assert (
         "qrScanner:" not in after and "qrVideoStream" not in after and "qrAnimationId" not in after
     )
@@ -133,6 +133,6 @@ def test_run_tests():
      end
     """)
     expected = "one\nalpha\nBETA\ngamma\nend\n"
-    out = cf_fuzzy_patch(initial, patch)
+    out = cf_fuzzy_patch(initial, patch, log=True)
     _assert_eq(out, expected, "block-first")
     tests_passed += 1
