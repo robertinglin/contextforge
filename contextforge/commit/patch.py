@@ -543,10 +543,12 @@ def _locate_hunk_position(
     hunk: dict,
     threshold: float,
     start_hint: int,
+    min_position: int,
     log: logging.Logger,
 ) -> dict:
     """
     Locate where a hunk should be applied without modifying the file.
+    Only searches at positions >= min_position (enforces sequential ordering).
     Returns a dict with: start_idx, end_idx, replacement_lines, match_type
     Raises PatchFailedError if no acceptable match is found.
     """
@@ -567,12 +569,15 @@ def _locate_hunk_position(
             log.debug(f"    ... and {len(old_content) - 3} more lines")
         log.debug(f"  start_hint={start_hint}, lead_ctx={len(lead_ctx)} lines, tail_ctx={len(tail_ctx)} lines")
 
+    log.debug(f"  min_position={min_position} (hunks must be sequential)")
+
     # --- Step 0: composite block replace (from_lines -> to_lines) ---
     from_lines, to_lines = _compose_from_to(hunk["lines"])
     if any(ln for ln in hunk["lines"] if ln and ln[0] in " -") and len(from_lines) > 0:
         # Try exact, nearest to hint
         hits = _find_block_matches(target_lines, from_lines, loose=False)
         log.debug(f"Exact block match for {len(from_lines)} lines: {len(hits)} hits at positions {hits[:5]}")
+        hits = [h for h in hits if h >= min_position]
         if hits:
             i = min(hits, key=lambda p: abs(p - start_hint))
             surg = _surgical_reconstruct_block(
@@ -592,6 +597,7 @@ def _locate_hunk_position(
         # Try loose, nearest to hint
         hits_loose = _find_block_matches(target_lines, from_lines, loose=True)
         log.debug(f"Loose block match for {len(from_lines)} lines: {len(hits_loose)} hits at positions {hits_loose[:5]}")
+        hits_loose = [h for h in hits_loose if h >= min_position]
         if hits_loose:
             i = min(hits_loose, key=lambda p: abs(p - start_hint))
             surg = _surgical_reconstruct_block(
@@ -642,6 +648,7 @@ def _locate_hunk_position(
 
     # 1) Exact block match(es)
     exact = _find_block_matches(target_lines, old_content, loose=False)
+    exact = [e for e in exact if e >= min_position]
     if exact:
         # Debug: Show all exact matches found
         log.debug(f"\n  EXACT MATCHES FOUND: {len(exact)} locations: {exact}")
@@ -713,6 +720,7 @@ def _locate_hunk_position(
 
     # 2) Loose block match(es)
     loose = _find_block_matches(target_lines, old_content, loose=True)
+    loose = [l for l in loose if l >= min_position]
     if loose:
         log.debug(f"Loose content match: {len(loose)} hits at positions {loose[:5]}")
         def _score_loose(p: int) -> tuple[int, int]:
@@ -774,6 +782,10 @@ def _locate_hunk_position(
         else:
             first_line_matches = True  # Empty old_content edge case
         
+        # Skip positions before min_position (enforce sequential ordering)
+        if i < min_position:
+            continue
+        
         # Only update best match if first line aligns
         if first_line_matches:
             if ratio > best_ratio or (
@@ -789,11 +801,25 @@ def _locate_hunk_position(
     # Middle-out bounded search
     if best_ratio < threshold:
         BUF = 40
-        lo = max(0, start_hint - (BUF + 1))
+        lo = max(min_position, start_hint - (BUF + 1))
         hi = min(len(target_lines), start_hint + len(old_content) + BUF)
         mid_idx, mid_ratio = _middle_out_best_window(target_lines, old_content, start_hint, lo, hi)
         if mid_ratio > best_ratio:
-            log.debug(f"  Middle-out improved ratio from {best_ratio:.3f} to {mid_ratio:.3f} at {mid_idx}")
+            # Verify first-line alignment before accepting middle-out result
+            if old_content and mid_idx >= 0 and mid_idx < len(target_lines):
+                old_first = old_content[0].strip()
+                file_first = target_lines[mid_idx].strip()
+                if old_first != file_first:
+                    first_ratio = difflib.SequenceMatcher(None, old_first, file_first, autojunk=False).ratio()
+                    if first_ratio <= 0.8:
+                        log.debug(f"  Middle-out match at {mid_idx} rejected: first line mismatch")
+                        log.debug(f"    Expected: {repr(old_first[:60])}")
+                        log.debug(f"    Found: {repr(file_first[:60])}")
+                        log.debug(f"    Similarity: {first_ratio:.3f}")
+                        # Don't update best_ratio, reject this match
+                        mid_idx, mid_ratio = -1, -1.0
+            if mid_ratio > best_ratio:
+                log.debug(f"  Middle-out improved ratio from {best_ratio:.3f} to {mid_ratio:.3f} at {mid_idx}")
             best_ratio, best_index = mid_ratio, mid_idx
 
     # Line-number stripping fallback
@@ -801,7 +827,7 @@ def _locate_hunk_position(
         log.debug("  💡 Attempting line-number stripping...")
         stripped_old = _strip_line_numbers_block(old_content)
         BUF = 40
-        lo = max(0, start_hint - (BUF + 1))
+        lo = max(min_position, start_hint - (BUF + 1))
         hi = min(len(target_lines), start_hint + len(stripped_old) + BUF)
         s_idx, s_ratio = _middle_out_best_window(target_lines, stripped_old, start_hint, lo, hi)
         if s_ratio < threshold:
@@ -811,6 +837,15 @@ def _locate_hunk_position(
             for i in range(len(target_lines) - m + 1):
                 b_trim = [_normalize_quotes(x.strip()) for x in target_lines[i:i+m]]
                 r = difflib.SequenceMatcher(None, a_trim, b_trim, autojunk=False).ratio()
+                # Enforce first-line alignment
+                if r > s_best_ratio and old_content and i < len(target_lines):
+                    old_first = old_content[0].strip()
+                    file_first = target_lines[i].strip()
+                    if old_first != file_first:
+                        first_ratio = difflib.SequenceMatcher(None, old_first, file_first, autojunk=False).ratio()
+                        if first_ratio <= 0.8:
+                            # Skip this position due to first-line mismatch
+                            continue
                 if r > s_best_ratio:
                     s_best_ratio, s_best_index = r, i
             s_idx, s_ratio = s_best_index, s_best_ratio
@@ -827,6 +862,10 @@ def _locate_hunk_position(
             anchor_hits = [
                 i for i, line in enumerate(target_lines) if line.strip() == anchor_line_stripped
             ]
+            # Filter to only positions >= min_position
+            anchor_hits = [i for i in anchor_hits if i >= min_position]
+            if not anchor_hits:
+                log.debug(f"  ⚠️ Anchored fallback: no valid anchors at or after min_position={min_position}")
             if anchor_hits:
                 sorted_anchors = sorted(anchor_hits, key=lambda i: abs(i - start_hint))
                 flat_old_block = _flatten_ws_outside_quotes("\n".join(old_content))
@@ -854,6 +893,8 @@ def _locate_hunk_position(
             if start_anchor_strip and end_anchor_strip:
                 start_hits = [i for i, k in enumerate(target_lines) if k.strip() == start_anchor_strip]
                 end_hits = [i for i, k in enumerate(target_lines) if k.strip() == end_anchor_strip]
+                start_hits = [i for i in start_hits if i >= min_position]
+                end_hits = [i for i in end_hits if i >= min_position]
                 if len(end_hits) == 1:
                     end_line_idx = end_hits[0]
                     plausible_starts = [i for i in start_hits if i <= end_line_idx]
@@ -870,7 +911,7 @@ def _locate_hunk_position(
         # FINAL FALLBACK: Fuzzy window merge conflict
         log.debug("\n  💡 Creating merge conflict...")
         conflict_threshold = 0.25
-        start_line = max(0, best_index)
+        start_line = max(min_position, best_index) if best_index >= 0 else min_position
         window_len = min(len(old_content), len(target_lines) - start_line) if target_lines else 0
         end_line = start_line + window_len
 
@@ -1095,7 +1136,7 @@ def patch_text(
     log.debug("=" * 60)
     
     match_locations = []
-    cursor = 0
+    min_position = 0  # Each hunk must be at or after the previous hunk's end
 
     for i, h in enumerate(hunks):
         log.debug(f"\n{'=' * 60}\nLocating Hunk #{i + 1}/{len(hunks)}")
@@ -1107,20 +1148,34 @@ def patch_text(
         if h.get("new_start"):
             header_hint = min(len(original_lines), max(0, int(h.get("new_start", 1)) - 1))
         else:
-            header_hint = cursor
+            header_hint = min_position
 
         start_hint = (
             header_hint
             if pure_add or not h.get("new_start")
-            else max(0, min(len(original_lines), int(round(0.7 * cursor + 0.3 * header_hint))))
+            else max(min_position, min(len(original_lines), int(round(0.7 * min_position + 0.3 * header_hint))))
         )
 
         try:
-            location = _locate_hunk_position(original_lines, h, threshold, start_hint, log=log)
+            location = _locate_hunk_position(original_lines, h, threshold, start_hint, min_position, log=log)
             location["hunk_index"] = i  # Track original hunk order
             match_locations.append(location)
-            # Update cursor for next hunk hint (simulate where we would be after applying)
-            cursor = location["end_idx"] + len(location["replacement_lines"]) - (location["end_idx"] - location["start_idx"])
+            
+            # Next hunk can start where trailing context begins (to allow context overlap)
+            # Find where trailing context starts by looking at the hunk lines
+            hunk_lines = h.get("lines", [])
+            lead_ctx, tail_ctx = _split_lead_tail_context(hunk_lines)
+            
+            # The changes span from after leading context to before trailing context
+            # So min_position should be: start + leading_context + changes
+            # Which equals: end - trailing_context
+            changes_end_offset = len(tail_ctx)
+            
+            # Next hunk must start at or after where changes ended (but can overlap trailing context)
+            min_position = location["end_idx"] - changes_end_offset
+            
+            log.debug(f"  Hunk changes end at {min_position} (end_idx={location['end_idx']}, tail_ctx={len(tail_ctx)} lines)")
+            
             log.debug(f"✓ Hunk #{i + 1} located. Match type: {location['match_type']}")
         except PatchFailedError as e:
             log.debug(f"✗ Hunk #{i + 1} FAILED: {e}")
@@ -1218,7 +1273,7 @@ def fuzzy_patch_partial(
     match_locations = []
     applied = []
     failed = []
-    cursor = 0
+    min_position = 0
     
     for i, h in enumerate(hunks):
         header_hint = min(len(original_lines), max(0, int(h.get("new_start", 1)) - 1))
@@ -1229,14 +1284,20 @@ def fuzzy_patch_partial(
         start_hint = (
             header_hint
             if pure_add
-            else max(0, min(len(original_lines), int(round(0.7 * cursor + 0.3 * header_hint))))
+            else max(min_position, min(len(original_lines), int(round(0.7 * min_position + 0.3 * header_hint))))
         )
         try:
-            location = _locate_hunk_position(original_lines, h, threshold, start_hint, log=log)
+            location = _locate_hunk_position(original_lines, h, threshold, start_hint, min_position, log=log)
             location["hunk_index"] = i  # Track original hunk order
             match_locations.append((i, location))
             applied.append(i)
-            cursor = location["end_idx"] + len(location["replacement_lines"]) - (location["end_idx"] - location["start_idx"])
+            
+            # Allow next hunk to overlap with trailing context
+            hunk_lines = h.get("lines", [])
+            lead_ctx, tail_ctx = _split_lead_tail_context(hunk_lines)
+            changes_end_offset = len(tail_ctx)
+            min_position = location["end_idx"] - changes_end_offset
+            
         except PatchFailedError as e:
             old_content, new_content, _ctx = _split_hunk_components(h["lines"])
             lead_ctx, tail_ctx = _split_lead_tail_context(h["lines"])

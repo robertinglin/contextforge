@@ -52,7 +52,7 @@ def test_patch_from_file_scenario(filename):
     expected_result = expected_raw.strip()
 
     # Apply the patch to the initial content and trim its result
-    actual_result = patch_text(initial_content, diff_text).strip()
+    actual_result = patch_text(initial_content, diff_text, log=True).strip()
 
     # If the results don't match, write the actual result to a file and generate a diff
     if actual_result != expected_result:
