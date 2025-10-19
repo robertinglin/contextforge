@@ -1,0 +1,452 @@
+import { create } from 'zustand';
+import { http } from '@/lib/http';
+import { toast } from 'sonner';
+
+export interface GitFileStatus {
+    path: string;
+    status: string;
+}
+
+export interface GitStatus {
+    staged: GitFileStatus[];
+    unstaged: GitFileStatus[];
+    untracked: GitFileStatus[];
+}
+
+type GitState = {
+    status: GitStatus | null;
+    commitMessage: string;
+    isLoading: boolean;
+    isGeneratingCommitMessage: boolean;
+};
+
+type GitActions = {
+    fetchStatus: () => Promise<void>;
+    stageFiles: (files: string[]) => Promise<void>;
+    unstageFiles: (files: string[]) => Promise<void>;
+    discardUnstagedChanges: (files: string[]) => Promise<void>;
+    discardUntrackedFiles: (files: string[]) => Promise<void>;
+    commit: () => Promise<void>;
+    createProposalFromStaged: (providerId?: string) => Promise<void>;
+    setCommitMessage: (message: string) => void;
+};
+
+const initialState: GitState = {
+    status: null,
+    commitMessage: '',
+    isLoading: false,
+    isGeneratingCommitMessage: false,
+};
+
+export const useGitStore = create<GitState & GitActions>((set, get) => ({
+    ...initialState,
+    setCommitMessage: (message) => set({ commitMessage: message }),
+    fetchStatus: async () => {
+        set({ isLoading: true });
+        try {
+            const status = await http<GitStatus>('/api/git/status');
+            set({ status, isLoading: false });
+        } catch (error: any) {
+            toast.error("Failed to get Git status", { description: error.message });
+            set({ isLoading: false });
+        }
+    },
+    stageFiles: async (files) => {
+        try {
+            await http('/api/git/stage', {
+                method: 'POST',
+                body: JSON.stringify({ files }),
+            });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Failed to stage files", { description: error.message });
+        }
+    },
+    unstageFiles: async (files) => {
+        try {
+            await http('/api/git/unstage', {
+                method: 'POST',
+                body: JSON.stringify({ files }),
+            });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Failed to unstage files", { description: error.message });
+        }
+    },
+    discardUnstagedChanges: async (files) => {
+        if (files.length === 0) return;
+        try {
+            await http('/api/git/checkout', {
+                method: 'POST',
+                body: JSON.stringify({ files }),
+            });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Failed to discard changes", { description: error.message });
+        }
+    },
+    discardUntrackedFiles: async (files) => {
+        if (files.length === 0) return;
+        try {
+            await http('/api/git/clean', {
+                method: 'POST',
+                body: JSON.stringify({ files }),
+            });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Failed to discard untracked files", { description: error.message });
+        }
+    },
+    commit: async () => {
+        const { commitMessage } = get();
+        if (!commitMessage.trim()) {
+            toast.error("Commit message cannot be empty.");
+            return;
+        }
+        try {
+            await http('/api/git/commit', {
+                method: 'POST',
+                body: JSON.stringify({ message: commitMessage }),
+            });
+            toast.success("Commit successful!");
+            set({ commitMessage: '' });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Commit failed", { description: error.message });
+        }
+    },
+    createProposalFromStaged: async (providerId?: string) => {
+        const { commitMessage: instructions } = get();
+        set({ isGeneratingCommitMessage: true });
+        const toastId = toast.loading("Generating commit message...");
+        try {
+            const response = await http<{ commitMessage: string }>('/api/git/commit-message', {
+                method: 'POST',
+                body: JSON.stringify({
+                    instructions: instructions,
+                    providerId: providerId,
+                }),
+            });
+            if (response.commitMessage) {
+                set({ commitMessage: response.commitMessage });
+                toast.success("Commit message generated.", { id: toastId });
+            } else {
+                throw new Error("Empty commit message from provider.");
+            }
+        } catch (error: any) {
+            toast.error("Failed to generate commit message", { id: toastId, description: error.message });
+        } finally {
+            set({ isGeneratingCommitMessage: false });
+        }
+    }
+}));
+# === TEST ===
+Here's the diff for you
+
+```diff
+--- a/src/stores/git.ts
++++ b/src/stores/git.ts
+@@ -14,11 +14,23 @@
+     untracked: GitFileStatus[];
+ }
+ 
++export interface GitBranch {
++    name: string;
++    is_current: boolean;
++    upstream: string | null;
++}
++
+ type GitState = {
+     status: GitStatus | null;
+     commitMessage: string;
+     isLoading: boolean;
+     isGeneratingCommitMessage: boolean;
++    // Branch info
++    branches: GitBranch[] | null;
++    remoteBranches: string[] | null;
++    currentBranch: GitBranch | null;
++    isSyncing: boolean;
+ };
+ 
+ type GitActions = {
+@@ -29,6 +41,9 @@
+     discardUntrackedFiles: (files: string[]) => Promise<void>;
+     commit: () => Promise<void>;
+     createProposalFromStaged: (providerId?: string) => Promise<void>;
+     setCommitMessage: (message: string) => void;
++    fetchBranches: () => Promise<void>;
++    checkoutBranch: (branchName: string, createNew?: boolean, fromBranch?: string) => Promise<void>;
++    sync: () => Promise<void>;
+ };
+ 
+ const initialState: GitState = {
+@@ -36,6 +51,10 @@
+     commitMessage: '',
+     isLoading: false,
+     isGeneratingCommitMessage: false,
++    branches: null,
++    remoteBranches: null,
++    currentBranch: null,
++    isSyncing: false,
+ };
+ 
+ export const useGitStore = create<GitState & GitActions>((set, get) => ({
+@@ -118,5 +137,47 @@
+         } finally {
+             set({ isGeneratingCommitMessage: false });
+         }
++    },
++    fetchBranches: async () => {
++        try {
++            const response = await http<{
++                current_branch: GitBranch | null;
++                local_branches: GitBranch[];
++                remote_branches: string[];
++            }>('/api/git/branches');
++            set({
++                currentBranch: response.current_branch,
++                branches: response.local_branches,
++                remoteBranches: response.remote_branches,
++            });
++        } catch (error: any) {
++            toast.error("Failed to get Git branches", { description: error.message });
++        }
++    },
++    checkoutBranch: async (branchName, createNew = false, fromBranch) => {
++        const toastId = toast.loading(`Checking out branch ${branchName}...`);
++        try {
++            await http('/api/git/checkout-branch', {
++                method: 'POST',
++                body: JSON.stringify({ branch_name: branchName, create_new: createNew, from_branch: fromBranch }),
++            });
++            toast.success(`Switched to branch ${branchName}`, { id: toastId });
++            await get().fetchStatus();
++            await get().fetchBranches();
++        } catch (error: any) {
++            toast.error(`Failed to checkout ${branchName}`, { id: toastId, description: error.message });
++        }
++    },
++    sync: async () => {
++        set({ isSyncing: true });
++        const toastId = toast.loading("Syncing with remote...");
++        try {
++            const response = await http<{ success: boolean; message: string }>('/api/git/sync', { method: 'POST' });
++            toast.success("Sync successful", { id: toastId, description: response.message });
++            await get().fetchStatus();
++            await get().fetchBranches(); // To update tracking info
++        } catch (error: any) {
++            toast.error("Sync failed", { id: toastId, description: error.message });
++        } finally {
++            set({ isSyncing: false });
++        }
+     }
+ }));
+```
+
+hope you like it
+
+# === RESULT ===
+import { create } from 'zustand';
+import { http } from '@/lib/http';
+import { toast } from 'sonner';
+
+export interface GitFileStatus {
+    path: string;
+    status: string;
+}
+
+export interface GitStatus {
+    staged: GitFileStatus[];
+    unstaged: GitFileStatus[];
+    untracked: GitFileStatus[];
+}
+
+export interface GitBranch {
+    name: string;
+    is_current: boolean;
+    upstream: string | null;
+}
+
+type GitState = {
+    status: GitStatus | null;
+    commitMessage: string;
+    isLoading: boolean;
+    isGeneratingCommitMessage: boolean;
+    // Branch info
+    branches: GitBranch[] | null;
+    remoteBranches: string[] | null;
+    currentBranch: GitBranch | null;
+    isSyncing: boolean;
+};
+
+type GitActions = {
+    fetchStatus: () => Promise<void>;
+    stageFiles: (files: string[]) => Promise<void>;
+    unstageFiles: (files: string[]) => Promise<void>;
+    discardUnstagedChanges: (files: string[]) => Promise<void>;
+    discardUntrackedFiles: (files: string[]) => Promise<void>;
+    commit: () => Promise<void>;
+    createProposalFromStaged: (providerId?: string) => Promise<void>;
+    setCommitMessage: (message: string) => void;
+    fetchBranches: () => Promise<void>;
+    checkoutBranch: (branchName: string, createNew?: boolean, fromBranch?: string) => Promise<void>;
+    sync: () => Promise<void>;
+};
+
+const initialState: GitState = {
+    status: null,
+    commitMessage: '',
+    isLoading: false,
+    isGeneratingCommitMessage: false,
+    branches: null,
+    remoteBranches: null,
+    currentBranch: null,
+    isSyncing: false,
+};
+
+export const useGitStore = create<GitState & GitActions>((set, get) => ({
+    ...initialState,
+    setCommitMessage: (message) => set({ commitMessage: message }),
+    fetchStatus: async () => {
+        set({ isLoading: true });
+        try {
+            const status = await http<GitStatus>('/api/git/status');
+            set({ status, isLoading: false });
+        } catch (error: any) {
+            toast.error("Failed to get Git status", { description: error.message });
+            set({ isLoading: false });
+        }
+    },
+    stageFiles: async (files) => {
+        try {
+            await http('/api/git/stage', {
+                method: 'POST',
+                body: JSON.stringify({ files }),
+            });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Failed to stage files", { description: error.message });
+        }
+    },
+    unstageFiles: async (files) => {
+        try {
+            await http('/api/git/unstage', {
+                method: 'POST',
+                body: JSON.stringify({ files }),
+            });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Failed to unstage files", { description: error.message });
+        }
+    },
+    discardUnstagedChanges: async (files) => {
+        if (files.length === 0) return;
+        try {
+            await http('/api/git/checkout', {
+                method: 'POST',
+                body: JSON.stringify({ files }),
+            });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Failed to discard changes", { description: error.message });
+        }
+    },
+    discardUntrackedFiles: async (files) => {
+        if (files.length === 0) return;
+        try {
+            await http('/api/git/clean', {
+                method: 'POST',
+                body: JSON.stringify({ files }),
+            });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Failed to discard untracked files", { description: error.message });
+        }
+    },
+    commit: async () => {
+        const { commitMessage } = get();
+        if (!commitMessage.trim()) {
+            toast.error("Commit message cannot be empty.");
+            return;
+        }
+        try {
+            await http('/api/git/commit', {
+                method: 'POST',
+                body: JSON.stringify({ message: commitMessage }),
+            });
+            toast.success("Commit successful!");
+            set({ commitMessage: '' });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Commit failed", { description: error.message });
+        }
+    },
+    createProposalFromStaged: async (providerId?: string) => {
+        const { commitMessage: instructions } = get();
+        set({ isGeneratingCommitMessage: true });
+        const toastId = toast.loading("Generating commit message...");
+        try {
+            const response = await http<{ commitMessage: string }>('/api/git/commit-message', {
+                method: 'POST',
+                body: JSON.stringify({
+                    instructions: instructions,
+                    providerId: providerId,
+                }),
+            });
+            if (response.commitMessage) {
+                set({ commitMessage: response.commitMessage });
+                toast.success("Commit message generated.", { id: toastId });
+            } else {
+                throw new Error("Empty commit message from provider.");
+            }
+        } catch (error: any) {
+            toast.error("Failed to generate commit message", { id: toastId, description: error.message });
+        } finally {
+            set({ isGeneratingCommitMessage: false });
+        }
+    },
+    fetchBranches: async () => {
+        try {
+            const response = await http<{
+                current_branch: GitBranch | null;
+                local_branches: GitBranch[];
+                remote_branches: string[];
+            }>('/api/git/branches');
+            set({
+                currentBranch: response.current_branch,
+                branches: response.local_branches,
+                remoteBranches: response.remote_branches,
+            });
+        } catch (error: any) {
+            toast.error("Failed to get Git branches", { description: error.message });
+        }
+    },
+    checkoutBranch: async (branchName, createNew = false, fromBranch) => {
+        const toastId = toast.loading(`Checking out branch ${branchName}...`);
+        try {
+            await http('/api/git/checkout-branch', {
+                method: 'POST',
+                body: JSON.stringify({ branch_name: branchName, create_new: createNew, from_branch: fromBranch }),
+            });
+            toast.success(`Switched to branch ${branchName}`, { id: toastId });
+            await get().fetchStatus();
+            await get().fetchBranches();
+        } catch (error: any) {
+            toast.error(`Failed to checkout ${branchName}`, { id: toastId, description: error.message });
+        }
+    },
+    sync: async () => {
+        set({ isSyncing: true });
+        const toastId = toast.loading("Syncing with remote...");
+        try {
+            const response = await http<{ success: boolean; message: string }>('/api/git/sync', { method: 'POST' });
+            toast.success("Sync successful", { id: toastId, description: response.message });
+            await get().fetchStatus();
+            await get().fetchBranches(); // To update tracking info
+        } catch (error: any) {
+            toast.error("Sync failed", { id: toastId, description: error.message });
+        } finally {
+            set({ isSyncing: false });
+        }
+    }
+}));

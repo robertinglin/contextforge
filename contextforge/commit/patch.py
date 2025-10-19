@@ -403,6 +403,91 @@ def _parse_simplified_patch_hunks(patch_str: str) -> list[dict]:
     return hunks
 
 
+def _split_noncontiguous_hunks(hunks: list[dict]) -> list[dict]:
+    """
+    Split hunks that have non-contiguous additions into separate hunks.
+    Non-contiguous additions are when we have: + lines, then context, then more + lines
+    without any - lines in between.
+    """
+    split_hunks = []
+    
+    for hunk in hunks:
+        lines = hunk["lines"]
+        
+        # Check if this hunk has non-contiguous additions
+        # Pattern: + lines, then context, then more + lines (no - lines)
+        has_additions = False
+        had_additions_then_context = False
+        has_noncontiguous = False
+        
+        for i, line in enumerate(lines):
+            if line and line[0] == "+":
+                if had_additions_then_context:
+                    # We found additions, then context, now more additions
+                    has_noncontiguous = True
+                    break
+                has_additions = True
+            elif line == "" or (line and line[0] == " "):
+                if has_additions:
+                    had_additions_then_context = True
+            elif line and line[0] == "-":
+                # If we see a deletion, reset the pattern
+                has_additions = False
+                had_additions_then_context = False
+        
+        if not has_noncontiguous:
+            # No non-contiguous additions, keep hunk as-is
+            split_hunks.append(hunk)
+            continue
+        
+        # Split the hunk at the boundaries where additions become non-contiguous
+        current_hunk_lines = []
+        in_addition_block = False
+        had_context_after_additions = False
+        
+        for line in lines:
+            if line and line[0] == "+":
+                if had_context_after_additions and current_hunk_lines:
+                    # Start a new hunk
+                    if current_hunk_lines:
+                        new_hunk = {
+                            "old_start": hunk["old_start"],
+                            "old_len": 0,  # Will be calculated
+                            "new_start": hunk["new_start"],
+                            "new_len": 0,  # Will be calculated
+                            "lines": current_hunk_lines[:]
+                        }
+                        split_hunks.append(new_hunk)
+                        current_hunk_lines = []
+                        had_context_after_additions = False
+                
+                current_hunk_lines.append(line)
+                in_addition_block = True
+            elif line == "" or (line and line[0] == " "):
+                current_hunk_lines.append(line)
+                if in_addition_block:
+                    had_context_after_additions = True
+                    in_addition_block = False
+            else:
+                # Deletion or other line
+                current_hunk_lines.append(line)
+                in_addition_block = False
+                had_context_after_additions = False
+        
+        # Add the final hunk
+        if current_hunk_lines:
+            new_hunk = {
+                "old_start": hunk["old_start"],
+                "old_len": 0,
+                "new_start": hunk["new_start"],
+                "new_len": 0,
+                "lines": current_hunk_lines
+            }
+            split_hunks.append(new_hunk)
+    
+    return split_hunks
+
+
 def _find_block_matches(target: list[str], block: list[str], loose: bool = False) -> list[int]:
     """Find all start indices where block appears in target."""
     matches: list[int] = []
@@ -589,39 +674,61 @@ def _find_all_hunk_candidates(
         for i, line in enumerate(addition_lines):
             log.debug(f"  [{i}] {repr(line)}")
     
-    # If we have no changed lines, this is a pure addition
-    if not changed_lines:
-        log.debug("Pure addition detected (no - lines)")
-        if not old_content:
-            # Completely new content with no context
-            log.debug("No old content, treating as pure addition")
-            ins_pos = _locate_insertion_index(target_lines, lead_ctx, tail_ctx, start_hint, ctx_probe)
-            return [{
-                "start_idx": ins_pos,
-                "end_idx": ins_pos,
-                "replacement_lines": addition_lines,
-                "match_type": "pure_addition",
-                "confidence": 0.9
-            }]
-    
-    # --- Strategy: Find all locations with the changed content, then score by context ---
+    # --- Prepare full block for matching ---
     from_lines, to_lines = _compose_from_to(hunk["lines"])
     log.debug(f"Composed from_lines ({len(from_lines)} lines):")
     for i, line in enumerate(from_lines):
         log.debug(f"  [{i}] {repr(line)}")
     
-    # For pure additions with context, find where to insert based on context
-    if not changed_lines and old_content:
-        log.debug("Pure addition with context - locating insertion point")
-        ins_pos = _locate_insertion_index(target_lines, lead_ctx, tail_ctx, start_hint, ctx_probe)
-        return [{
-            "start_idx": ins_pos,
-            "end_idx": ins_pos,
-            "replacement_lines": addition_lines,
-            "match_type": "pure_addition",
-            "confidence": 0.9
-        }]
+    # Check if this is a pure contiguous addition (no deletions AND additions are contiguous)
+    if not changed_lines:
+        # Check if additions are contiguous by tracking state transitions
+        state = "context"  # context, addition
+        additions_contiguous = True
+        
+        for ln in hunk["lines"]:
+            if ln and ln[0] == "+":
+                if state == "post_addition":
+                    # We had additions, then context, now more additions = not contiguous
+                    additions_contiguous = False
+                    log.debug("Additions are not contiguous - found context between addition blocks")
+                    break
+                state = "addition"
+            elif (ln == "" or (ln and ln[0] == " ")) and state == "addition":
+                # Moved from addition to context
+                state = "post_addition"
+        
+        log.debug(f"Pure addition detected (no - lines), contiguous={additions_contiguous}")
+        
+        # Only use pure addition insertion logic for contiguous additions
+        if additions_contiguous:
+            if not old_content:
+                # Completely new content with no context
+                log.debug("No old content, inserting at calculated position")
+                ins_pos = _locate_insertion_index(target_lines, lead_ctx, tail_ctx, start_hint, ctx_probe)
+                return [{
+                    "start_idx": ins_pos,
+                    "end_idx": ins_pos,
+                    "replacement_lines": addition_lines,
+                    "match_type": "pure_addition",
+                    "confidence": 0.9
+                }]
+            elif old_content:
+                # Contiguous pure addition with context
+                log.debug("Pure addition with context - locating insertion point")
+                ins_pos = _locate_insertion_index(target_lines, lead_ctx, tail_ctx, start_hint, ctx_probe)
+                return [{
+                    "start_idx": ins_pos,
+                    "end_idx": ins_pos,
+                    "replacement_lines": addition_lines,
+                    "match_type": "pure_addition",
+                    "confidence": 0.9
+                }]
+        
+        # If additions are non-contiguous, fall through to block matching below
+        log.debug("Non-contiguous additions - using block matching with from_lines")
     
+    # Standard matching for replacements and non-contiguous additions
     # Check if deletions are scattered (context lines between deletion lines)
     # If so, skip anchor approach - use old_content matching instead
     if changed_lines and len(changed_lines) > 1:
@@ -991,60 +1098,60 @@ def _find_all_hunk_candidates(
             ratio = difflib.SequenceMatcher(None, a_trim, b_trim, autojunk=False).ratio()
             log.debug(f"    line {i}: ratio={ratio:.3f}")
         
-        for i, ratio in fuzzy_candidates[:max_candidates]:
-            # Validate alignment for surgical reconstruction
-            use_surgical = False
-            if i + len(old_content) <= len(target_lines) and len(old_content) > 0:
-                alignment_checks = min(3, len(old_content))
-                matches = 0
-                for check_idx in range(alignment_checks):
-                    if i + check_idx >= len(target_lines):
-                        break
-                    old_line = old_content[check_idx].strip()
-                    file_line = target_lines[i + check_idx].strip()
-                    if old_line == file_line:
-                        matches += 1
-                
-                use_surgical = matches >= min(2, alignment_checks)
+    for i, ratio in fuzzy_candidates[:max_candidates]:
+        # Validate alignment for surgical reconstruction
+        use_surgical = False
+        if i + len(old_content) <= len(target_lines) and len(old_content) > 0:
+            alignment_checks = min(3, len(old_content))
+            matches = 0
+            for check_idx in range(alignment_checks):
+                if i + check_idx >= len(target_lines):
+                    break
+                old_line = old_content[check_idx].strip()
+                file_line = target_lines[i + check_idx].strip()
+                if old_line == file_line:
+                    matches += 1
             
-            if use_surgical:
-                actual_old_file_lines = 0
-                for ln in hunk["lines"]:
-                    if ln == "" or (ln and ln[0] in " -"):
-                        actual_old_file_lines += 1
-                
-                if i + actual_old_file_lines > len(target_lines):
-                    actual_old_file_lines = len(target_lines) - i
-                
-                surg = _surgical_reconstruct_block(
-                    hunk["lines"],
-                    target_lines[i : i + actual_old_file_lines],
-                    old_content[0],
-                    target_lines[i]
-                )
-                candidates.append({
-                    "start_idx": i,
-                    "end_idx": i + actual_old_file_lines,
-                    "replacement_lines": surg,
-                    "match_type": "fuzzy_surgical",
-                    "confidence": ratio
-                })
-            else:
-                # Simple replacement
-                m_local = min(len(old_content), len(target_lines) - i)
-                if new_content:
-                    new_adj = _reindent_relative(new_content, old_content[0], target_lines[i])
-                else:
-                    new_adj = new_content
-                candidates.append({
-                    "start_idx": i,
-                    "end_idx": i + m_local,
-                    "replacement_lines": new_adj,
-                    "match_type": "fuzzy_window",
-                    "confidence": ratio
-                })
+            use_surgical = matches >= min(2, alignment_checks)
         
-        return candidates
+        if use_surgical:
+            actual_old_file_lines = 0
+            for ln in hunk["lines"]:
+                if ln == "" or (ln and ln[0] in " -"):
+                    actual_old_file_lines += 1
+            
+            if i + actual_old_file_lines > len(target_lines):
+                actual_old_file_lines = len(target_lines) - i
+            
+            surg = _surgical_reconstruct_block(
+                hunk["lines"],
+                target_lines[i : i + actual_old_file_lines],
+                old_content[0],
+                target_lines[i]
+            )
+            candidates.append({
+                "start_idx": i,
+                "end_idx": i + actual_old_file_lines,
+                "replacement_lines": surg,
+                "match_type": "fuzzy_surgical",
+                "confidence": ratio
+            })
+        else:
+            # Simple replacement
+            m_local = min(len(old_content), len(target_lines) - i)
+            if new_content:
+                new_adj = _reindent_relative(new_content, old_content[0], target_lines[i])
+            else:
+                new_adj = new_content
+            candidates.append({
+                "start_idx": i,
+                "end_idx": i + m_local,
+                "replacement_lines": new_adj,
+                "match_type": "fuzzy_window",
+                "confidence": ratio
+            })
+    
+    return candidates
 
     # No candidates found
     return []
@@ -1219,6 +1326,12 @@ def patch_text(
         hunks = _parse_patch_hunks(dedented_patch)
     else:
         hunks = _parse_simplified_patch_hunks(dedented_patch)
+    
+    # Split non-contiguous additions into separate hunks
+    original_hunk_count = len(hunks)
+    hunks = _split_noncontiguous_hunks(hunks)
+    if len(hunks) != original_hunk_count:
+        log.debug(f"Split {original_hunk_count} hunks into {len(hunks)} due to non-contiguous additions")
     
     if not hunks:
         raise PatchFailedError("no valid hunks")
@@ -1466,6 +1579,10 @@ def fuzzy_patch_partial(
     eol = _detect_eol(content)
     had_trailing_nl = content.endswith(("\r\n", "\n", "\r"))
     hunks = _parse_patch_hunks(patch_str.strip())
+    
+    # Split non-contiguous additions into separate hunks
+    hunks = _split_noncontiguous_hunks(hunks)
+    
     original_lines = content.splitlines()
     
     # Phase 1: Find all candidates
