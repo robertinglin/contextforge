@@ -1,0 +1,1596 @@
+import React, { useEffect, useMemo, useCallback, useState } from "react";
+import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Sparkles,
+  Clipboard,
+  X,
+  Github,
+  Code2,
+  Asterisk,
+  Send,
+  Bot,
+  Loader2,
+} from "lucide-react";
+import { Textarea } from "@/components/ui/textarea";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { useIsMobile } from "@/hooks/use-is-mobile";
+import { InlineSearch } from "./InlineSearch";
+import { useInlineSearch } from "@/hooks/use-inline-search";
+import { SearchResult } from "@/stores/search";
+import {
+  Popover,
+  PopoverContent,
+  PopoverAnchor,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { cn } from "@/lib/utils";
+import { useNavigate } from "react-router-dom";
+import { useWorkspaceStore } from "@/stores/workspace";
+import { useInstructionsStore } from "@/stores/instructions";
+import { useContextBuilder } from "@/hooks/workspace/useContextBuilder";
+import { toast } from "sonner";
+import { formatTokenCount } from "./utils";
+// Import settings store to get provider info
+import { useSettingsStore } from "@/stores/settings";
+import { fetchSnapshot } from "@/stores/app";
+import { useAppStatusStore } from "@/stores/appStatus";
+
+const ProviderIcon = ({ provider }: { provider: string }) => {
+  const props = { className: "h-4 w-4" };
+  switch (provider) {
+    case "yolo":
+      return <Sparkles {...props} />;
+    case "gemini":
+      return <Sparkles {...props} />;
+    case "copilot":
+      return <Github {...props} />;
+    case "codex":
+      return <Code2 {...props} />;
+    case "claude":
+      return <Asterisk {...props} />;
+    case "goose":
+      return <Send {...props} />; // paper plane for origami
+    case "qwen":
+      return <Bot {...props} />; // Rabbit placeholder
+    case "custom":
+      return <Send {...props} />; // Default icon for custom providers
+    default:
+      return <Sparkles {...props} />;
+  }
+};
+
+const ProviderMenuItem = ({
+  provider,
+  isSelected,
+  onSelect,
+}: {
+  provider: { id: string; name: string; isCustom?: boolean };
+  isSelected: boolean;
+  onSelect: () => void;
+}) => {
+  return (
+    <button
+      onClick={onSelect}
+      className={cn(
+        "w-full flex items-center gap-2 px-2 py-2 text-sm hover:bg-accent",
+        isSelected && "bg-accent"
+      )}
+    >
+      <ProviderIcon provider={provider.isCustom ? "custom" : provider.id} />
+      <span>{provider.name}</span>
+    </button>
+  );
+};
+
+// Helper to extract provider info from interaction mode
+const getProviderInfo = (interactionMode: string, settings: any) => {
+  if (interactionMode.startsWith("llm_provider:")) {
+    const providerId = interactionMode.split(":")[1];
+    const provider = settings.llmProviders?.[providerId];
+    return provider ? { ...provider, isCustom: true } : null;
+  }
+  // Also check if it's stored as separate fields
+  if (
+    settings.workspace.interactionMode === "llm_provider" &&
+    settings.workspace.llmProviderId
+  ) {
+    const provider = settings.llmProviders?.[settings.workspace.llmProviderId];
+    return provider ? { ...provider, isCustom: true } : null;
+  }
+  return {
+    name: interactionMode.charAt(0).toUpperCase() + interactionMode.slice(1),
+    isCustom: false,
+  };
+};
+
+export const ContextBuilder = ({}) => {
+  const {
+    includeFileTree,
+    tokenBudget,
+    isAutoContextEnabled,
+    setIncludeFileTree,
+    setTokenBudget,
+    setUserSelectedFiles,
+    setContextSelectedFiles,
+    setCachedInstructionContext,
+  } = useWorkspaceStore((state) => ({
+    includeFileTree: state.includeFileTree,
+    tokenBudget: state.tokenBudget,
+    isAutoContextEnabled: state.isAutoContextEnabled,
+    setIncludeFileTree: state.setIncludeFileTree,
+    setTokenBudget: state.setTokenBudget,
+    setUserSelectedFiles: state.setUserSelectedFiles,
+    setContextSelectedFiles: state.setContextSelectedFiles,
+    setCachedInstructionContext: state.setCachedInstructionContext,
+  }));
+  const { instructions, setInstructions } =
+    useInstructionsStore((state) => ({
+      instructions: state.instructions,
+      setInstructions: state.setInstructions,
+    }));
+  const navigate = useNavigate();
+
+  const contextBuilder = useContextBuilder();
+
+  const { interactionMode, canGenerate, formattedTokens } = useMemo(() => {
+    const { totalTokens, isAutomaticMode, interactionMode, canGenerate } =
+      contextBuilder;
+    const formatted = isAutomaticMode
+      ? `${tokenBudget}`
+      : formatTokenCount(totalTokens);
+    return { interactionMode, canGenerate, formattedTokens: formatted };
+  }, [contextBuilder, tokenBudget]);
+
+  const [isCopying, setIsCopying] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isProviderMenuOpen, setIsProviderMenuOpen] = useState(false);
+  const [longPressTimer, setLongPressTimer] = useState<ReturnType<
+    typeof setTimeout
+  > | null>(null);
+  const [touchStartPos, setTouchStartPos] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
+
+  const onCopyContext = useCallback(async () => {
+    if (isCopying || isGenerating) return;
+    setIsCopying(true);
+    try {
+      await contextBuilder.handleCopyContext();
+    } catch (e: any) {
+      toast.error("Failed to copy context.", { description: e.message });
+    } finally {
+      setIsCopying(false);
+    }
+  }, [isCopying, isGenerating, contextBuilder]);
+
+  const onGenerateProposal = useCallback(async () => {
+    if (isCopying || isGenerating || isProviderMenuOpen) return;
+    setIsGenerating(true);
+    const result = await contextBuilder.handleGenerateProposal();
+    console.log('GENERATE PROPOSAL', result);
+    setIsGenerating(false);
+    if (result?.isYolo) {
+      fetchSnapshot();
+      if (result.taskId) navigate(`/pages/task-detail/${result.taskId}`);
+    } else if (result?.proposalId) {
+      navigate(
+        `/pages/generation-progress/?taskId=${result.taskId}&proposalId=${result.proposalId}&model=${result.model}`
+      );
+    }
+  }, [isCopying, isGenerating, contextBuilder, navigate]);
+
+  const onClearContext = useCallback(() => {
+    setInstructions("");
+    setContextSelectedFiles(new Map());
+  }, [setInstructions, setContextSelectedFiles]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.ctrlKey && (e.key === "Enter" || e.key === "c")) {
+        if (!isCopying && !isGenerating) {
+          e.preventDefault();
+          onCopyContext();
+        }
+      }
+    },
+    [onCopyContext, isCopying, isGenerating]
+  );
+
+  const isMobile = useIsMobile();
+  const [isSearchPopoverOpen, setIsSearchPopoverOpen] = React.useState(false);
+  const [inlineSearchQuery, setInlineSearchQuery] = React.useState("");
+  const [highlightedIndex, setHighlightedIndex] = React.useState(0);
+  const textareaRef = React.useRef<HTMLTextAreaElement>(null);
+  const searchContainerRef = React.useRef<HTMLDivElement>(null);
+  const [textareaWrapperStyle, setTextareaWrapperStyle] =
+    React.useState<React.CSSProperties>({});
+  const [searchResultsStyle, setSearchResultsStyle] =
+    React.useState<React.CSSProperties>({});
+  const [isTextareaFocused, setIsTextareaFocused] = React.useState(false);
+  const [textareaHeight, setTextareaHeight] = React.useState(0);
+  const [visualViewportHeight, setVisualViewportHeight] = React.useState(
+    typeof window !== "undefined" ? window.innerHeight : 0
+  );
+
+  const settings = useSettingsStore();
+
+  const { results: inlineSearchResults, loading: isInlineSearchLoading } =
+    useInlineSearch(inlineSearchQuery, 3, 300);
+
+  // Reset highlighted index when search results change
+  useEffect(() => {
+    setHighlightedIndex(0);
+  }, [inlineSearchResults]);
+
+  // Effect to track the visual viewport height (for mobile keyboard)
+  useEffect(() => {
+    if (!isMobile) return;
+    const handleResize = () => {
+      // Use visualViewport height if available, fallback to innerHeight
+      const newHeight = window.visualViewport?.height ?? window.innerHeight;
+      setVisualViewportHeight(newHeight);
+    };
+
+    window.visualViewport?.addEventListener("resize", handleResize);
+    handleResize(); // Set initial value
+
+    return () =>
+      window.visualViewport?.removeEventListener("resize", handleResize);
+  }, [isMobile]);
+
+  // Effect to handle fixed positioning on mobile when search is active
+  useEffect(() => {
+    const isMobileFocused = isMobile && isTextareaFocused;
+    if (isMobileFocused) {
+      document.body.style.overflow = "hidden";
+      document.body.style.height = `${visualViewportHeight}px`; // Lock body height
+
+      // Give textarea a reasonable fixed height on mobile (30% of viewport)
+      const mobileTextareaHeight = Math.max(
+        textareaHeight,
+        visualViewportHeight * 0.3
+      );
+      setTextareaWrapperStyle({
+        position: "fixed",
+        top: 0,
+        left: 0,
+        right: 0,
+        height: mobileTextareaHeight,
+        zIndex: 101,
+        backgroundColor: "var(--background)",
+        borderBottom: "1px solid var(--border)",
+        padding: "0.5rem",
+      });
+
+      if (isSearchPopoverOpen) {
+        const searchResultsHeight = visualViewportHeight - mobileTextareaHeight;
+        setSearchResultsStyle({
+          position: "fixed",
+          top: `${mobileTextareaHeight}px`,
+          left: "0",
+          right: "0",
+          height: `${searchResultsHeight}px`,
+          zIndex: 100,
+          backgroundColor: "var(--background)",
+        });
+      } else {
+        setSearchResultsStyle({});
+      }
+    } else {
+      document.body.style.overflow = "";
+      document.body.style.height = ""; // Reset body height
+      setTextareaWrapperStyle({});
+      setSearchResultsStyle({});
+    }
+    return () => {
+      document.body.style.overflow = "";
+      document.body.style.height = "";
+    };
+  }, [
+    isMobile,
+    isTextareaFocused,
+    isSearchPopoverOpen,
+    textareaHeight,
+    visualViewportHeight,
+  ]);
+
+  const handleInstructionsChange = (
+    e: React.ChangeEvent<HTMLTextAreaElement>
+  ) => {
+    const value = e.target.value;
+    setInstructions(value);
+    setCachedInstructionContext(new Set()); // Invalidate cache on manual change
+    const caretPos = e.target.selectionStart;
+    const textBeforeCaret = value.substring(0, caretPos);
+    const match = textBeforeCaret.match(/\!([\w\d/\._-]*)$/);
+
+    // Only trigger if there's a match and the textarea is currently focused
+    if (
+      match &&
+      textareaRef.current === document.activeElement &&
+      match[1].length >= 3
+    ) {
+      setInlineSearchQuery(match[1]);
+      setIsSearchPopoverOpen(true);
+    } else {
+      setIsSearchPopoverOpen(false);
+      setInlineSearchQuery("");
+    }
+  };
+
+  const handleInlineSearchSelect = (result: SearchResult) => {
+    if (result.path) {
+      setUserSelectedFiles((prev) => new Set(prev).add(result.path!));
+    }
+    const newValue = instructions.replace(
+      /\!([\w\d/\._-]*)$/,
+      result.name || result.path || ""
+    );
+    setInstructions(newValue);
+    setIsSearchPopoverOpen(false);
+    setInlineSearchQuery("");
+    setTimeout(() => textareaRef.current?.focus(), 0);
+  };
+
+  const handleKeyDownInTextarea = (
+    e: React.KeyboardEvent<HTMLTextAreaElement>
+  ) => {
+    if (isSearchPopoverOpen && inlineSearchResults.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setHighlightedIndex((prev) => (prev + 1) % inlineSearchResults.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setHighlightedIndex(
+          (prev) =>
+            (prev - 1 + inlineSearchResults.length) % inlineSearchResults.length
+        );
+        return;
+      }
+      if (e.key === "Enter") {
+        e.preventDefault();
+        handleInlineSearchSelect(inlineSearchResults[highlightedIndex]);
+        return;
+      }
+    }
+    handleKeyDown(e); // Prop from parent for ctrl+enter
+  };
+
+  const handleGenerateButtonTouchStart = useCallback((e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    setTouchStartPos({ x: touch.clientX, y: touch.clientY });
+
+    const timer = setTimeout(() => {
+      setIsProviderMenuOpen(true);
+      setLongPressTimer(null);
+    }, 500);
+    setLongPressTimer(timer);
+  }, []);
+
+  const handleGenerateButtonTouchEnd = useCallback(
+    (e: React.TouchEvent) => {
+      if (longPressTimer) {
+        e.preventDefault();
+        clearTimeout(longPressTimer);
+        setLongPressTimer(null);
+
+        const touch = e.changedTouches[0];
+        if (touchStartPos) {
+          const dx = Math.abs(touch.clientX - touchStartPos.x);
+          const dy = Math.abs(touch.clientY - touchStartPos.y);
+
+          if (dx < 10 && dy < 10) {
+            onGenerateProposal();
+          }
+        }
+      }
+      setTouchStartPos(null);
+    },
+    [longPressTimer, touchStartPos, onGenerateProposal]
+  );
+
+  const handleGenerateButtonTouchMove = useCallback(
+    (e: React.TouchEvent) => {
+      if (longPressTimer) {
+        const touch = e.touches[0];
+        if (touchStartPos) {
+          const dx = Math.abs(touch.clientX - touchStartPos.x);
+          const dy = Math.abs(touch.clientY - touchStartPos.y);
+
+          if (dx > 10 || dy > 10) {
+            clearTimeout(longPressTimer);
+            setLongPressTimer(null);
+            setTouchStartPos(null);
+          }
+        }
+      }
+    },
+    [longPressTimer, touchStartPos]
+  );
+
+  const handleProviderSelect = useCallback(
+    (provider: { id: string; name: string; isCustom?: boolean }) => {
+      const { workspace } = useSettingsStore.getState();
+      const settingsStore = useSettingsStore.getState();
+      if (provider.isCustom) {
+        settingsStore.patch({
+          workspace: {
+            ...workspace,
+            interactionMode: "llm_provider",
+            llmProviderId: provider.id,
+          },
+        });
+      } else {
+        settingsStore.patch({
+          workspace: {
+            ...workspace,
+            interactionMode: provider.id as any,
+            llmProviderId: undefined,
+          },
+        });
+      }
+      setIsProviderMenuOpen(false);
+      onGenerateProposal();
+    },
+    [onGenerateProposal]
+  );
+
+  const { toolAvailability } = useAppStatusStore();
+  const llmProviders = useSettingsStore((state) => state.llmProviders);
+
+  // Get proper provider name and icon
+  const llmProviderId = settings.workspace.llmProviderId;
+  const providerInfo = getProviderInfo(interactionMode, settings);
+  const modeLabel =
+    providerInfo?.name ||
+    (interactionMode === "copy"
+      ? "YOLO"
+      : interactionMode.charAt(0).toUpperCase() + interactionMode.slice(1));
+  const providerIconKey = providerInfo?.isCustom ? "custom" : interactionMode;
+  const availableProviders = useMemo(() => {
+    const providers = [];
+       // Add YOLO mode as an option when copy mode is not active
+   if (interactionMode !== "copy") {
+    providers.push({ id: "copy", name: "YOLO", isCustom: false });
+   }
+    if (toolAvailability?.qwen) providers.push({ id: "qwen", name: "Qwen" });
+
+    if (toolAvailability?.gemini)
+      providers.push({ id: "gemini", name: "Gemini" });
+    if (toolAvailability?.claude)
+      providers.push({ id: "claude", name: "Claude" });
+    if (toolAvailability?.codex) providers.push({ id: "codex", name: "Codex" });
+    if (toolAvailability?.copilot)
+      providers.push({ id: "copilot", name: "Copilot" });
+    Object.values(llmProviders || {}).forEach((p) => {
+      if (p.enabled) providers.push({ id: p.id, name: p.name, isCustom: true });
+    });
+    return providers;
+  }, [toolAvailability, llmProviders]) as {
+    id: string;
+    name: string;
+    isCustom?: boolean;
+  }[];
+
+  const textareaElement = (
+    <Textarea
+      ref={textareaRef}
+      value={instructions}
+      onKeyDown={handleKeyDownInTextarea}
+      onFocus={() => {
+        if (isMobile) {
+          if (textareaRef.current && !isTextareaFocused) {
+            setTextareaHeight(
+              textareaRef.current.getBoundingClientRect().height
+            );
+          }
+          setIsTextareaFocused(true);
+        }
+      }}
+      onBlur={() => {
+        // Delay blur to allow search result selection
+        if (isMobile) {
+          // A small delay allows tap events on search results to register before the UI disappears.
+          setTimeout(() => setIsTextareaFocused(false), 150);
+        }
+      }}
+      onChange={handleInstructionsChange}
+      placeholder="Add instructions for the model… Use ! to search for files."
+      data-workspace-instructions="true"
+      className="h-full resize-none text-xs p-2"
+    />
+  );
+
+  return (
+    <div className="h-full flex flex-col p-1 border rounded gap-1">
+      {/* Backdrop blur for mobile when textarea is focused */}
+      {isMobile && isTextareaFocused && (
+        <div
+          className="fixed inset-0 bg-background/80 backdrop-blur-sm"
+          style={{ zIndex: 99 }}
+          onClick={() => textareaRef.current?.blur()}
+        />
+      )}
+
+      {/* Header - only show when not focused on mobile */}
+      {!(isMobile && isTextareaFocused) && (
+        <div className="flex items-center justify-between">
+          <h3 className="text-[11px] font-medium tracking-wide uppercase text-muted-foreground">
+            Context Builder
+          </h3>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6"
+            onClick={onClearContext}
+          >
+            <X className="h-3 w-3" />
+            <span className="sr-only">Clear context</span>
+          </Button>
+        </div>
+      )}
+
+      {isMobile ? (
+        <div
+          style={textareaWrapperStyle}
+          className={cn(
+            "relative w-full flex-1 flex flex-col",
+            isTextareaFocused && "shadow-lg"
+          )}
+        >
+          {/* Add clear button header when focused on mobile */}
+          {isTextareaFocused && (
+            <div className="flex items-center justify-between p-2 border-b">
+              <h3 className="text-[11px] font-medium tracking-wide uppercase text-muted-foreground">
+                Context Builder
+              </h3>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-6 w-6"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={onClearContext}
+              >
+                <X className="h-3 w-3" />
+                <span className="sr-only">Clear context</span>
+              </Button>
+            </div>
+          )}
+          {textareaElement}
+        </div>
+      ) : (
+        <Popover
+          open={isSearchPopoverOpen}
+          onOpenChange={setIsSearchPopoverOpen}
+        >
+          <div className="relative w-full flex-1">
+            <PopoverAnchor asChild>{textareaElement}</PopoverAnchor>
+          </div>
+          <PopoverContent
+            className="w-[400px] p-0"
+            align="start"
+            side="top"
+            onOpenAutoFocus={(e) => e.preventDefault()}
+          >
+            <InlineSearch
+              query={inlineSearchQuery}
+              results={inlineSearchResults}
+              onSelect={handleInlineSearchSelect}
+              loading={isInlineSearchLoading}
+              highlightedIndex={highlightedIndex}
+            />
+          </PopoverContent>
+        </Popover>
+      )}
+      {isMobile && isTextareaFocused && isSearchPopoverOpen && (
+        <div
+          ref={searchContainerRef}
+          style={searchResultsStyle}
+          className="border-b p-1 flex flex-col shadow-lg"
+        >
+          <InlineSearch
+            className="flex-1 max-h-full"
+            query={inlineSearchQuery}
+            results={inlineSearchResults}
+            onSelect={handleInlineSearchSelect}
+            loading={isInlineSearchLoading}
+            highlightedIndex={highlightedIndex}
+          />
+        </div>
+      )}
+      {isAutoContextEnabled && (
+        <div className="grid gap-1.5 p-1">
+          <Label htmlFor="token-budget" className="text-[11px]">
+            Token Budget
+          </Label>
+          <Select
+            value={String(tokenBudget)}
+            onValueChange={(value) =>
+              setTokenBudget(
+                value === "unlimited" ? "unlimited" : parseInt(value, 10)
+              )
+            }
+          >
+            <SelectTrigger id="token-budget" className="h-7 text-xs">
+              <SelectValue placeholder="Select budget" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="16000">16k</SelectItem>
+              <SelectItem value="32000">32k</SelectItem>
+              <SelectItem value="64000">64k</SelectItem>
+              <SelectItem value="128000">128k</SelectItem>
+              <SelectItem value="256000">256k</SelectItem>
+              <SelectItem value="unlimited">Unlimited</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+      <div className="flex items-center justify-between p-1">
+        <Label htmlFor="include-tree" className="text-[11px]">
+          Include file tree in context
+        </Label>
+        <Switch
+          id="include-tree"
+          checked={includeFileTree}
+          onCheckedChange={setIncludeFileTree}
+          className="scale-90"
+        />
+      </div>
+      <div className="flex items-center mt-auto">
+        <Button
+          onClick={onCopyContext}
+          disabled={isCopying || isGenerating}
+          className="flex-1 h-7 px-2 py-0 text-xs rounded-r-none gap-1"
+        >
+          <Clipboard className="h-3 w-3" /> {isCopying ? "Copying..." : "Copy"}
+        </Button>
+        {interactionMode !== "copy" && (
+          <Button
+            variant="outline"
+            className="flex-1 h-7 px-2 py-0 text-xs rounded-l-none gap-1"
+            onClick={onGenerateProposal}
+            disabled={isCopying || isGenerating || !canGenerate}
+            onTouchStart={handleGenerateButtonTouchStart}
+            onTouchEnd={handleGenerateButtonTouchEnd}
+            onTouchMove={handleGenerateButtonTouchMove}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setIsProviderMenuOpen(true);
+            }}
+          >
+            {isGenerating ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <ProviderIcon provider={providerIconKey} />
+            )}
+            <span>{isGenerating ? "Generating..." : modeLabel}</span>
+          </Button>
+        )}
+        <span className="text-[10px] text-muted-foreground ml-2 self-center whitespace-nowrap">
+          {formattedTokens} tokens
+        </span>
+         
+          <Popover
+            open={isProviderMenuOpen}
+            onOpenChange={setIsProviderMenuOpen}
+          >
+            <PopoverTrigger asChild>
+              <div className="w-0 h-0 overflow-hidden" />
+            </PopoverTrigger>
+            <PopoverContent className="w-48 p-1" align="end" side="top">
+              <div className="text-xs font-medium text-muted-foreground mb-2 px-2">
+                Select Provider
+              </div>
+              {availableProviders.map((provider) => (
+                <ProviderMenuItem
+                  key={provider.id}
+                  provider={provider}
+                  isSelected={
+                    provider.id === interactionMode ||
+                    (!!provider.isCustom && provider.id === llmProviderId)
+                  }
+                  onSelect={() => handleProviderSelect(provider)}
+                />
+              ))}
+            </PopoverContent>
+          </Popover>
+        
+      </div>
+    </div>
+  );
+};
+# === TEST ===
+I'll analyze the issue and provide a fix. The problem is that on mobile, when typing in the context builder (instructions textarea), the instructions are being updated immediately with each keystroke, which can cause performance issues and unwanted side effects. Instead, we should only update the instructions when the user blurs (leaves) the textarea.
+
+Looking at the code, I can see that the issue is in the `ContextBuilder.tsx` component. The `handleInstructionsChange` function is called on every change event, which immediately updates the instructions state via `setInstructions`. On mobile, we want to defer this update until the blur event.
+
+Here's my fix:
+
+```diff
+--- a/src/pages/workspace/ContextBuilder.tsx
++++ b/src/pages/workspace/ContextBuilder.tsx
+@@ -1,4 +1,4 @@
+-import React, { useEffect, useMemo, useCallback, useState } from \"react\";
++import React, { useEffect, useMemo, useCallback, useState, useRef } from \"react\";
+ import { Button } from \"@/components/ui/button\";
+ import {
+   Select,
+@@ -58,6 +58,7 @@ export const ContextBuilder = ({}) => {
+   const [isProviderMenuOpen, setIsProviderMenuOpen] = useState(false);
+   const [longPressTimer, setLongPressTimer] = useState<ReturnType<
+     typeof setTimeout
++  const [mobileInstructions, setMobileInstructions] = useState(\"\");
++  const isMobile = useIsMobile();
++  const textareaRef = useRef<HTMLTextAreaElement>(null);
+   > | null>(null);
+   const [touchStartPos, setTouchStartPos] = useState<{
+     x: number;
+@@ -65,7 +66,6 @@ export const ContextBuilder = ({}) => {
+   } | null>(null);
+ 
+   const isMobile = useIsMobile();
+-  const textareaRef = React.useRef<HTMLTextAreaElement>(null);
+   const searchContainerRef = React.useRef<HTMLDivElement>(null);
+   const [textareaWrapperStyle, setTextareaWrapperStyle] =
+     React.useState<React.CSSProperties>({});
+@@ -194,6 +194,7 @@ export const ContextBuilder = ({}) => {
+   const handleInstructionsChange = (
+     e: React.ChangeEvent<HTMLTextAreaElement>
+   ) => {
++    // On mobile, store in local state and only update on blur
++    if (isMobile) {
++      setMobileInstructions(e.target.value);
++      const caretPos = e.target.selectionStart;
++      const textBeforeCaret = e.target.value.substring(0, caretPos);
++      const match = textBeforeCaret.match(/\\!([\\w\\d/\\._-]*)$/);
++
++      // Only trigger if there's a match and the textarea is currently focused
++      if (
++        match &&
++        textareaRef.current === document.activeElement &&
++        match[1].length >= 3
++      ) {
++        setInlineSearchQuery(match[1]);
++        setIsSearchPopoverOpen(true);
++      } else {
++        setIsSearchPopoverOpen(false);
++        setInlineSearchQuery(\"\");
++      }
++      return;
++    }
++    
+     const value = e.target.value;
+     setInstructions(value);
+     setCachedInstructionContext(new Set()); // Invalidate cache on manual change
+@@ -201,6 +202,7 @@ export const ContextBuilder = ({}) => {
+     const textBeforeCaret = value.substring(0, caretPos);
+     const match = textBeforeCaret.match(/\\!([\\w\\d/\\._-]*)$/);
+ 
++    // Desktop behavior - update immediately
+     // Only trigger if there's a match and the textarea is currently focused
+     if (
+       match &&
+@@ -219,6 +221,24 @@ export const ContextBuilder = ({}) => {
+     }
+   };
+ 
++  const handleInstructionsBlur = () => {
++    // Only update instructions on blur for mobile
++    if (isMobile) {
++      setInstructions(mobileInstructions);
++      setCachedInstructionContext(new Set()); // Invalidate cache on blur
++    }
++  };
++
++  // Sync mobile instructions when instructions change from other sources
++  useEffect(() => {
++    if (isMobile && instructions !== mobileInstructions) {
++      setMobileInstructions(instructions);
++    }
++  }, [instructions, isMobile]);
++
+   const handleKeyDownInTextarea = (
+     e: React.KeyboardEvent<HTMLTextAreaElement>
+   ) => {
+@@ -378,7 +398,11 @@ export const ContextBuilder = ({}) => {
+       <div className=\"relative w-full flex-1\">
+         <PopoverAnchor asChild>{textareaElement}</PopoverAnchor>
+       </div>
+-      <PopoverContent
++      <PopoverContent
+         className=\"w-[400px] p-0\"
+         align=\"start\"
+         side=\"top\"
+@@ -506,7 +530,7 @@ export const ContextBuilder = ({}) => {
+       <Textarea
+         ref={textareaRef}
+-        value={instructions}
++        value={isMobile ? mobileInstructions : instructions}
+         onKeyDown={handleKeyDownInTextarea}
+         onFocus={() => {
+           if (isMobile) {
+@@ -525,6 +549,7 @@ export const ContextBuilder = ({}) => {
+         }
+       }}
+       onChange={handleInstructionsChange}
++      onBlur={handleInstructionsBlur}
+       placeholder=\"Add instructions for the model… Use ! to search for files.\"
+       data-workspace-instructions=\"true\"
+       className=\"h-full resize-none text-xs p-2\"
+```
+
+This fix:
+
+1. Adds a new state `mobileInstructions` to store the temporary instructions value on mobile
+2. Adds a `handleInstructionsBlur` function that updates the actual instructions when the textarea is blurred
+3. Modifies `handleInstructionsChange` to only update the local state on mobile, while keeping the desktop behavior unchanged
+4. Adds an effect to sync the mobile instructions when instructions change from other sources
+5. Updates the textarea value to use `mobileInstructions` on mobile and `instructions` on desktop
+6. Adds the `onBlur` handler to the textarea
+
+The key insight is that we need to maintain a separate state for mobile that only gets committed to the actual instructions state when the user is done typing (blurs the textarea). This prevents unnecessary updates and improves performance on mobile devices.",
+# === RESULT ===
+import React, { useEffect, useMemo, useCallback, useState } from "react";
+import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Sparkles,
+  Clipboard,
+  X,
+  Github,
+  Code2,
+  Asterisk,
+  Send,
+  Bot,
+  Loader2,
+} from "lucide-react";
+import { Textarea } from "@/components/ui/textarea";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { useIsMobile } from "@/hooks/use-is-mobile";
+import { InlineSearch } from "./InlineSearch";
+import { useInlineSearch } from "@/hooks/use-inline-search";
+import { SearchResult } from "@/stores/search";
+import {
+  Popover,
+  PopoverContent,
+  PopoverAnchor,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { cn } from "@/lib/utils";
+import { useNavigate } from "react-router-dom";
+import { useWorkspaceStore } from "@/stores/workspace";
+import { useInstructionsStore } from "@/stores/instructions";
+import { useContextBuilder } from "@/hooks/workspace/useContextBuilder";
+import { toast } from "sonner";
+import { formatTokenCount } from "./utils";
+// Import settings store to get provider info
+import { useSettingsStore } from "@/stores/settings";
+import { fetchSnapshot } from "@/stores/app";
+import { useAppStatusStore } from "@/stores/appStatus";
+
+const ProviderIcon = ({ provider }: { provider: string }) => {
+  const props = { className: "h-4 w-4" };
+  switch (provider) {
+    case "yolo":
+      return <Sparkles {...props} />;
+    case "gemini":
+      return <Sparkles {...props} />;
+    case "copilot":
+      return <Github {...props} />;
+    case "codex":
+      return <Code2 {...props} />;
+    case "claude":
+      return <Asterisk {...props} />;
+    case "goose":
+      return <Send {...props} />; // paper plane for origami
+    case "qwen":
+      return <Bot {...props} />; // Rabbit placeholder
+    case "custom":
+      return <Send {...props} />; // Default icon for custom providers
+    default:
+      return <Sparkles {...props} />;
+  }
+};
+
+const ProviderMenuItem = ({
+  provider,
+  isSelected,
+  onSelect,
+}: {
+  provider: { id: string; name: string; isCustom?: boolean };
+  isSelected: boolean;
+  onSelect: () => void;
+}) => {
+  return (
+    <button
+      onClick={onSelect}
+      className={cn(
+        "w-full flex items-center gap-2 px-2 py-2 text-sm hover:bg-accent",
+        isSelected && "bg-accent"
+      )}
+    >
+      <ProviderIcon provider={provider.isCustom ? "custom" : provider.id} />
+      <span>{provider.name}</span>
+    </button>
+  );
+};
+
+// Helper to extract provider info from interaction mode
+const getProviderInfo = (interactionMode: string, settings: any) => {
+  if (interactionMode.startsWith("llm_provider:")) {
+    const providerId = interactionMode.split(":")[1];
+    const provider = settings.llmProviders?.[providerId];
+    return provider ? { ...provider, isCustom: true } : null;
+  }
+  // Also check if it's stored as separate fields
+  if (
+    settings.workspace.interactionMode === "llm_provider" &&
+    settings.workspace.llmProviderId
+  ) {
+    const provider = settings.llmProviders?.[settings.workspace.llmProviderId];
+    return provider ? { ...provider, isCustom: true } : null;
+  }
+  return {
+    name: interactionMode.charAt(0).toUpperCase() + interactionMode.slice(1),
+    isCustom: false,
+  };
+};
+
+export const ContextBuilder = ({}) => {
+  const {
+    includeFileTree,
+    tokenBudget,
+    isAutoContextEnabled,
+    setIncludeFileTree,
+    setTokenBudget,
+    setUserSelectedFiles,
+    setContextSelectedFiles,
+    setCachedInstructionContext,
+  } = useWorkspaceStore((state) => ({
+    includeFileTree: state.includeFileTree,
+    tokenBudget: state.tokenBudget,
+    isAutoContextEnabled: state.isAutoContextEnabled,
+    setIncludeFileTree: state.setIncludeFileTree,
+    setTokenBudget: state.setTokenBudget,
+    setUserSelectedFiles: state.setUserSelectedFiles,
+    setContextSelectedFiles: state.setContextSelectedFiles,
+    setCachedInstructionContext: state.setCachedInstructionContext,
+  }));
+  const { instructions, setInstructions } =
+    useInstructionsStore((state) => ({
+      instructions: state.instructions,
+      setInstructions: state.setInstructions,
+    }));
+  const navigate = useNavigate();
+
+  const contextBuilder = useContextBuilder();
+
+  const { interactionMode, canGenerate, formattedTokens } = useMemo(() => {
+    const { totalTokens, isAutomaticMode, interactionMode, canGenerate } =
+      contextBuilder;
+    const formatted = isAutomaticMode
+      ? `${tokenBudget}`
+      : formatTokenCount(totalTokens);
+    return { interactionMode, canGenerate, formattedTokens: formatted };
+  }, [contextBuilder, tokenBudget]);
+
+  const [isCopying, setIsCopying] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isProviderMenuOpen, setIsProviderMenuOpen] = useState(false);
+  const [longPressTimer, setLongPressTimer] = useState<ReturnType<
+    typeof setTimeout
+  const [mobileInstructions, setMobileInstructions] = useState(\"\");
+  const isMobile = useIsMobile();
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  > | null>(null);
+  const [touchStartPos, setTouchStartPos] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
+
+  const onCopyContext = useCallback(async () => {
+    if (isCopying || isGenerating) return;
+    setIsCopying(true);
+    try {
+      await contextBuilder.handleCopyContext();
+    } catch (e: any) {
+      toast.error("Failed to copy context.", { description: e.message });
+    } finally {
+      setIsCopying(false);
+    }
+  }, [isCopying, isGenerating, contextBuilder]);
+
+  const onGenerateProposal = useCallback(async () => {
+    if (isCopying || isGenerating || isProviderMenuOpen) return;
+    setIsGenerating(true);
+    const result = await contextBuilder.handleGenerateProposal();
+    console.log('GENERATE PROPOSAL', result);
+    setIsGenerating(false);
+    if (result?.isYolo) {
+      fetchSnapshot();
+      if (result.taskId) navigate(`/pages/task-detail/${result.taskId}`);
+    } else if (result?.proposalId) {
+      navigate(
+        `/pages/generation-progress/?taskId=${result.taskId}&proposalId=${result.proposalId}&model=${result.model}`
+      );
+    }
+  }, [isCopying, isGenerating, contextBuilder, navigate]);
+
+  const onClearContext = useCallback(() => {
+    setInstructions("");
+    setContextSelectedFiles(new Map());
+  }, [setInstructions, setContextSelectedFiles]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.ctrlKey && (e.key === "Enter" || e.key === "c")) {
+        if (!isCopying && !isGenerating) {
+          e.preventDefault();
+          onCopyContext();
+        }
+      }
+    },
+    [onCopyContext, isCopying, isGenerating]
+  );
+
+  const isMobile = useIsMobile();
+  const [isSearchPopoverOpen, setIsSearchPopoverOpen] = React.useState(false);
+  const [inlineSearchQuery, setInlineSearchQuery] = React.useState("");
+  const [highlightedIndex, setHighlightedIndex] = React.useState(0);
+  const searchContainerRef = React.useRef<HTMLDivElement>(null);
+  const [textareaWrapperStyle, setTextareaWrapperStyle] =
+    React.useState<React.CSSProperties>({});
+  const [searchResultsStyle, setSearchResultsStyle] =
+    React.useState<React.CSSProperties>({});
+  const [isTextareaFocused, setIsTextareaFocused] = React.useState(false);
+  const [textareaHeight, setTextareaHeight] = React.useState(0);
+  const [visualViewportHeight, setVisualViewportHeight] = React.useState(
+  const handleInstructionsBlur = () => {
+    // Only update instructions on blur for mobile
+    if (isMobile) {
+      setInstructions(mobileInstructions);
+      setCachedInstructionContext(new Set()); // Invalidate cache on blur
+    }
+  };
+
+  // Sync mobile instructions when instructions change from other sources
+  useEffect(() => {
+    if (isMobile && instructions !== mobileInstructions) {
+      setMobileInstructions(instructions);
+    }
+  }, [instructions, isMobile]);
+
+    typeof window !== "undefined" ? window.innerHeight : 0
+  );
+
+  const settings = useSettingsStore();
+
+  const { results: inlineSearchResults, loading: isInlineSearchLoading } =
+    useInlineSearch(inlineSearchQuery, 3, 300);
+
+  // Reset highlighted index when search results change
+  useEffect(() => {
+    setHighlightedIndex(0);
+  }, [inlineSearchResults]);
+
+  // Effect to track the visual viewport height (for mobile keyboard)
+  useEffect(() => {
+    if (!isMobile) return;
+    const handleResize = () => {
+      // Use visualViewport height if available, fallback to innerHeight
+      const newHeight = window.visualViewport?.height ?? window.innerHeight;
+      setVisualViewportHeight(newHeight);
+    };
+
+    window.visualViewport?.addEventListener("resize", handleResize);
+    handleResize(); // Set initial value
+
+    return () =>
+      window.visualViewport?.removeEventListener("resize", handleResize);
+  }, [isMobile]);
+
+  // Effect to handle fixed positioning on mobile when search is active
+  useEffect(() => {
+    const isMobileFocused = isMobile && isTextareaFocused;
+    if (isMobileFocused) {
+      document.body.style.overflow = "hidden";
+      document.body.style.height = `${visualViewportHeight}px`; // Lock body height
+
+      // Give textarea a reasonable fixed height on mobile (30% of viewport)
+      const mobileTextareaHeight = Math.max(
+        textareaHeight,
+        visualViewportHeight * 0.3
+      );
+      setTextareaWrapperStyle({
+        position: "fixed",
+        top: 0,
+        left: 0,
+        right: 0,
+        height: mobileTextareaHeight,
+        zIndex: 101,
+        backgroundColor: "var(--background)",
+        borderBottom: "1px solid var(--border)",
+        padding: "0.5rem",
+      });
+
+      if (isSearchPopoverOpen) {
+        const searchResultsHeight = visualViewportHeight - mobileTextareaHeight;
+        setSearchResultsStyle({
+          position: "fixed",
+          top: `${mobileTextareaHeight}px`,
+          left: "0",
+          right: "0",
+          height: `${searchResultsHeight}px`,
+          zIndex: 100,
+          backgroundColor: "var(--background)",
+        });
+      } else {
+        setSearchResultsStyle({});
+      }
+    } else {
+      document.body.style.overflow = "";
+      document.body.style.height = ""; // Reset body height
+      setTextareaWrapperStyle({});
+      setSearchResultsStyle({});
+    }
+    return () => {
+      document.body.style.overflow = "";
+      document.body.style.height = "";
+    };
+  }, [
+    isMobile,
+    isTextareaFocused,
+    isSearchPopoverOpen,
+    textareaHeight,
+    visualViewportHeight,
+  ]);
+
+  const handleInstructionsChange = (
+    e: React.ChangeEvent<HTMLTextAreaElement>
+  ) => {
+    // On mobile, store in local state and only update on blur
+    if (isMobile) {
+      setMobileInstructions(e.target.value);
+      const caretPos = e.target.selectionStart;
+      const textBeforeCaret = e.target.value.substring(0, caretPos);
+      const match = textBeforeCaret.match(/\\!([\\w\\d/\\._-]*)$/);
+
+      // Only trigger if there's a match and the textarea is currently focused
+      if (
+        match &&
+        textareaRef.current === document.activeElement &&
+        match[1].length >= 3
+      ) {
+        setInlineSearchQuery(match[1]);
+        setIsSearchPopoverOpen(true);
+      } else {
+        setIsSearchPopoverOpen(false);
+        setInlineSearchQuery(\"\");
+      }
+      return;
+    }
+    
+    const value = e.target.value;
+    setInstructions(value);
+    setCachedInstructionContext(new Set()); // Invalidate cache on manual change
+    const caretPos = e.target.selectionStart;
+    const textBeforeCaret = value.substring(0, caretPos);
+    const match = textBeforeCaret.match(/\!([\w\d/\._-]*)$/);
+
+    // Desktop behavior - update immediately
+    // Only trigger if there's a match and the textarea is currently focused
+    if (
+      match &&
+      textareaRef.current === document.activeElement &&
+      match[1].length >= 3
+    ) {
+      setInlineSearchQuery(match[1]);
+      setIsSearchPopoverOpen(true);
+    } else {
+      setIsSearchPopoverOpen(false);
+      setInlineSearchQuery("");
+    }
+  };
+
+  const handleInlineSearchSelect = (result: SearchResult) => {
+    if (result.path) {
+      setUserSelectedFiles((prev) => new Set(prev).add(result.path!));
+    }
+    const newValue = instructions.replace(
+      /\!([\w\d/\._-]*)$/,
+      result.name || result.path || ""
+    );
+    setInstructions(newValue);
+    setIsSearchPopoverOpen(false);
+    setInlineSearchQuery("");
+    setTimeout(() => textareaRef.current?.focus(), 0);
+  };
+
+  const handleKeyDownInTextarea = (
+    e: React.KeyboardEvent<HTMLTextAreaElement>
+  ) => {
+    if (isSearchPopoverOpen && inlineSearchResults.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setHighlightedIndex((prev) => (prev + 1) % inlineSearchResults.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setHighlightedIndex(
+          (prev) =>
+            (prev - 1 + inlineSearchResults.length) % inlineSearchResults.length
+        );
+        return;
+      }
+      if (e.key === "Enter") {
+        e.preventDefault();
+        handleInlineSearchSelect(inlineSearchResults[highlightedIndex]);
+        return;
+      }
+    }
+    handleKeyDown(e); // Prop from parent for ctrl+enter
+  };
+
+  const handleGenerateButtonTouchStart = useCallback((e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    setTouchStartPos({ x: touch.clientX, y: touch.clientY });
+
+    const timer = setTimeout(() => {
+      setIsProviderMenuOpen(true);
+      setLongPressTimer(null);
+    }, 500);
+    setLongPressTimer(timer);
+  }, []);
+
+  const handleGenerateButtonTouchEnd = useCallback(
+    (e: React.TouchEvent) => {
+      if (longPressTimer) {
+        e.preventDefault();
+        clearTimeout(longPressTimer);
+        setLongPressTimer(null);
+
+        const touch = e.changedTouches[0];
+        if (touchStartPos) {
+          const dx = Math.abs(touch.clientX - touchStartPos.x);
+          const dy = Math.abs(touch.clientY - touchStartPos.y);
+
+          if (dx < 10 && dy < 10) {
+            onGenerateProposal();
+          }
+        }
+      }
+      setTouchStartPos(null);
+    },
+    [longPressTimer, touchStartPos, onGenerateProposal]
+  );
+
+  const handleGenerateButtonTouchMove = useCallback(
+    (e: React.TouchEvent) => {
+      if (longPressTimer) {
+        const touch = e.touches[0];
+        if (touchStartPos) {
+          const dx = Math.abs(touch.clientX - touchStartPos.x);
+          const dy = Math.abs(touch.clientY - touchStartPos.y);
+
+          if (dx > 10 || dy > 10) {
+            clearTimeout(longPressTimer);
+            setLongPressTimer(null);
+            setTouchStartPos(null);
+          }
+        }
+      }
+    },
+    [longPressTimer, touchStartPos]
+  );
+
+  const handleProviderSelect = useCallback(
+    (provider: { id: string; name: string; isCustom?: boolean }) => {
+      const { workspace } = useSettingsStore.getState();
+      const settingsStore = useSettingsStore.getState();
+      if (provider.isCustom) {
+        settingsStore.patch({
+          workspace: {
+            ...workspace,
+            interactionMode: "llm_provider",
+            llmProviderId: provider.id,
+          },
+        });
+      } else {
+        settingsStore.patch({
+          workspace: {
+            ...workspace,
+            interactionMode: provider.id as any,
+            llmProviderId: undefined,
+          },
+        });
+      }
+      setIsProviderMenuOpen(false);
+      onGenerateProposal();
+    },
+    [onGenerateProposal]
+  );
+
+  const { toolAvailability } = useAppStatusStore();
+  const llmProviders = useSettingsStore((state) => state.llmProviders);
+
+  // Get proper provider name and icon
+  const llmProviderId = settings.workspace.llmProviderId;
+  const providerInfo = getProviderInfo(interactionMode, settings);
+  const modeLabel =
+    providerInfo?.name ||
+    (interactionMode === "copy"
+      ? "YOLO"
+      : interactionMode.charAt(0).toUpperCase() + interactionMode.slice(1));
+  const providerIconKey = providerInfo?.isCustom ? "custom" : interactionMode;
+  const availableProviders = useMemo(() => {
+    const providers = [];
+       // Add YOLO mode as an option when copy mode is not active
+   if (interactionMode !== "copy") {
+    providers.push({ id: "copy", name: "YOLO", isCustom: false });
+   }
+    if (toolAvailability?.qwen) providers.push({ id: "qwen", name: "Qwen" });
+
+    if (toolAvailability?.gemini)
+      providers.push({ id: "gemini", name: "Gemini" });
+    if (toolAvailability?.claude)
+      providers.push({ id: "claude", name: "Claude" });
+    if (toolAvailability?.codex) providers.push({ id: "codex", name: "Codex" });
+    if (toolAvailability?.copilot)
+      providers.push({ id: "copilot", name: "Copilot" });
+    Object.values(llmProviders || {}).forEach((p) => {
+      if (p.enabled) providers.push({ id: p.id, name: p.name, isCustom: true });
+    });
+    return providers;
+  }, [toolAvailability, llmProviders]) as {
+    id: string;
+    name: string;
+    isCustom?: boolean;
+  }[];
+
+  const textareaElement = (
+    <Textarea
+      ref={textareaRef}
+      value={isMobile ? mobileInstructions : instructions}
+      onKeyDown={handleKeyDownInTextarea}
+      onFocus={() => {
+        if (isMobile) {
+          if (textareaRef.current && !isTextareaFocused) {
+            setTextareaHeight(
+              textareaRef.current.getBoundingClientRect().height
+            );
+          }
+          setIsTextareaFocused(true);
+        }
+      }}
+      onBlur={() => {
+        // Delay blur to allow search result selection
+        if (isMobile) {
+          // A small delay allows tap events on search results to register before the UI disappears.
+          setTimeout(() => setIsTextareaFocused(false), 150);
+        }
+      }}
+      onChange={handleInstructionsChange}
+      onBlur={handleInstructionsBlur}
+      placeholder="Add instructions for the model… Use ! to search for files."
+      data-workspace-instructions="true"
+      className="h-full resize-none text-xs p-2"
+    />
+  );
+
+  return (
+    <div className="h-full flex flex-col p-1 border rounded gap-1">
+      {/* Backdrop blur for mobile when textarea is focused */}
+      {isMobile && isTextareaFocused && (
+        <div
+          className="fixed inset-0 bg-background/80 backdrop-blur-sm"
+          style={{ zIndex: 99 }}
+          onClick={() => textareaRef.current?.blur()}
+        />
+      )}
+
+      {/* Header - only show when not focused on mobile */}
+      {!(isMobile && isTextareaFocused) && (
+        <div className="flex items-center justify-between">
+          <h3 className="text-[11px] font-medium tracking-wide uppercase text-muted-foreground">
+            Context Builder
+          </h3>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6"
+            onClick={onClearContext}
+          >
+            <X className="h-3 w-3" />
+            <span className="sr-only">Clear context</span>
+          </Button>
+        </div>
+      )}
+
+      {isMobile ? (
+        <div
+          style={textareaWrapperStyle}
+          className={cn(
+            "relative w-full flex-1 flex flex-col",
+            isTextareaFocused && "shadow-lg"
+          )}
+        >
+          {/* Add clear button header when focused on mobile */}
+          {isTextareaFocused && (
+            <div className="flex items-center justify-between p-2 border-b">
+              <h3 className="text-[11px] font-medium tracking-wide uppercase text-muted-foreground">
+                Context Builder
+              </h3>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-6 w-6"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={onClearContext}
+              >
+                <X className="h-3 w-3" />
+                <span className="sr-only">Clear context</span>
+              </Button>
+            </div>
+          )}
+          {textareaElement}
+        </div>
+      ) : (
+        <Popover
+          open={isSearchPopoverOpen}
+          onOpenChange={setIsSearchPopoverOpen}
+        >
+          <div className="relative w-full flex-1">
+            <PopoverAnchor asChild>{textareaElement}</PopoverAnchor>
+          </div>
+          <PopoverContent
+            className="w-[400px] p-0"
+            align="start"
+            side="top"
+            onOpenAutoFocus={(e) => e.preventDefault()}
+          >
+            <InlineSearch
+              query={inlineSearchQuery}
+              results={inlineSearchResults}
+              onSelect={handleInlineSearchSelect}
+              loading={isInlineSearchLoading}
+              highlightedIndex={highlightedIndex}
+            />
+          </PopoverContent>
+        </Popover>
+      )}
+      {isMobile && isTextareaFocused && isSearchPopoverOpen && (
+        <div
+          ref={searchContainerRef}
+          style={searchResultsStyle}
+          className="border-b p-1 flex flex-col shadow-lg"
+        >
+          <InlineSearch
+            className="flex-1 max-h-full"
+            query={inlineSearchQuery}
+            results={inlineSearchResults}
+            onSelect={handleInlineSearchSelect}
+            loading={isInlineSearchLoading}
+            highlightedIndex={highlightedIndex}
+          />
+        </div>
+      )}
+      {isAutoContextEnabled && (
+        <div className="grid gap-1.5 p-1">
+          <Label htmlFor="token-budget" className="text-[11px]">
+            Token Budget
+          </Label>
+          <Select
+            value={String(tokenBudget)}
+            onValueChange={(value) =>
+              setTokenBudget(
+                value === "unlimited" ? "unlimited" : parseInt(value, 10)
+              )
+            }
+          >
+            <SelectTrigger id="token-budget" className="h-7 text-xs">
+              <SelectValue placeholder="Select budget" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="16000">16k</SelectItem>
+              <SelectItem value="32000">32k</SelectItem>
+              <SelectItem value="64000">64k</SelectItem>
+              <SelectItem value="128000">128k</SelectItem>
+              <SelectItem value="256000">256k</SelectItem>
+              <SelectItem value="unlimited">Unlimited</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+      <div className="flex items-center justify-between p-1">
+        <Label htmlFor="include-tree" className="text-[11px]">
+          Include file tree in context
+        </Label>
+        <Switch
+          id="include-tree"
+          checked={includeFileTree}
+          onCheckedChange={setIncludeFileTree}
+          className="scale-90"
+        />
+      </div>
+      <div className="flex items-center mt-auto">
+        <Button
+          onClick={onCopyContext}
+          disabled={isCopying || isGenerating}
+          className="flex-1 h-7 px-2 py-0 text-xs rounded-r-none gap-1"
+        >
+          <Clipboard className="h-3 w-3" /> {isCopying ? "Copying..." : "Copy"}
+        </Button>
+        {interactionMode !== "copy" && (
+          <Button
+            variant="outline"
+            className="flex-1 h-7 px-2 py-0 text-xs rounded-l-none gap-1"
+            onClick={onGenerateProposal}
+            disabled={isCopying || isGenerating || !canGenerate}
+            onTouchStart={handleGenerateButtonTouchStart}
+            onTouchEnd={handleGenerateButtonTouchEnd}
+            onTouchMove={handleGenerateButtonTouchMove}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setIsProviderMenuOpen(true);
+            }}
+          >
+            {isGenerating ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <ProviderIcon provider={providerIconKey} />
+            )}
+            <span>{isGenerating ? "Generating..." : modeLabel}</span>
+          </Button>
+        )}
+        <span className="text-[10px] text-muted-foreground ml-2 self-center whitespace-nowrap">
+          {formattedTokens} tokens
+        </span>
+         
+          <Popover
+            open={isProviderMenuOpen}
+            onOpenChange={setIsProviderMenuOpen}
+          >
+            <PopoverTrigger asChild>
+              <div className="w-0 h-0 overflow-hidden" />
+            </PopoverTrigger>
+            <PopoverContent className="w-48 p-1" align="end" side="top">
+              <div className="text-xs font-medium text-muted-foreground mb-2 px-2">
+                Select Provider
+              </div>
+              {availableProviders.map((provider) => (
+                <ProviderMenuItem
+                  key={provider.id}
+                  provider={provider}
+                  isSelected={
+                    provider.id === interactionMode ||
+                    (!!provider.isCustom && provider.id === llmProviderId)
+                  }
+                  onSelect={() => handleProviderSelect(provider)}
+                />
+              ))}
+            </PopoverContent>
+          </Popover>
+        
+      </div>
+    </div>
+  );
+};

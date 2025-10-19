@@ -1,0 +1,259 @@
+import { create } from 'zustand';
+import { http } from '@/lib/http';
+import { toast } from 'sonner';
+
+export interface GitStatus {
+    staged: string[];
+    unstaged: string[];
+    untracked: string[];
+}
+
+type GitState = {
+    status: GitStatus | null;
+    commitMessage: string;
+    isLoading: boolean;
+};
+
+type GitActions = {
+    fetchStatus: () => Promise<void>;
+    stageFiles: (files: string[]) => Promise<void>;
+    unstageFiles: (files: string[]) => Promise<void>;
+    commit: () => Promise<void>;
+    setCommitMessage: (message: string) => void;
+};
+
+const initialState: GitState = {
+    status: null,
+    commitMessage: '',
+    isLoading: false,
+};
+
+export const useGitStore = create<GitState & GitActions>((set, get) => ({
+    ...initialState,
+    setCommitMessage: (message) => set({ commitMessage: message }),
+    fetchStatus: async () => {
+        set({ isLoading: true });
+        try {
+            const status = await http<GitStatus>('/api/git/status');
+            set({ status, isLoading: false });
+        } catch (error: any) {
+            toast.error("Failed to get Git status", { description: error.message });
+            set({ isLoading: false });
+        }
+    },
+    stageFiles: async (files) => {
+        try {
+            await http('/api/git/stage', {
+                method: 'POST',
+                body: JSON.stringify({ files }),
+            });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Failed to stage files", { description: error.message });
+        }
+    },
+    unstageFiles: async (files) => {
+        try {
+            await http('/api/git/unstage', {
+                method: 'POST',
+                body: JSON.stringify({ files }),
+            });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Failed to unstage files", { description: error.message });
+        }
+    },
+    commit: async () => {
+        const { commitMessage } = get();
+        if (!commitMessage.trim()) {
+            toast.error("Commit message cannot be empty.");
+            return;
+        }
+        try {
+            await http('/api/git/commit', {
+                method: 'POST',
+                body: JSON.stringify({ message: commitMessage }),
+            });
+            toast.success("Commit successful!");
+            set({ commitMessage: '' });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Commit failed", { description: error.message });
+        }
+    },
+}));
+# === TEST ===
+Of course. It's a common issue for single-page applications where `index.html` gets cached by the browser, preventing new frontend builds from being loaded.
+
+To solve this, we can instruct browsers to never cache the `index.html` file by adding a `Cache-Control` header to the HTTP response when it's served. I'll modify your FastAPI backend to include this header for `index.html`.
+
+Here are the changes for `backend/app/main.py`:
+
+```diff
+--- a/src/stores/git.ts
++++ b/src/stores/git.ts
+@@ -1,9 +1,15 @@
+ import { create } from 'zustand';
+ import { http } from '@/lib/http';
+ import { toast } from 'sonner';
+ 
++export interface GitFileStatus {
++    path: string;
++    status: string;
++}
++
+ export interface GitStatus {
+-    staged: string[];
+-    unstaged: string[];
+-    untracked: string[];
++    staged: GitFileStatus[];
++    unstaged: GitFileStatus[];
++    untracked: GitFileStatus[];
+ }
+ 
+ type GitState = {
+@@ -16,6 +22,7 @@
+     stageFiles: (files: string[]) => Promise<void>;
+     unstageFiles: (files: string[]) => Promise<void>;
+     commit: () => Promise<void>;
++    createProposalFromStaged: () => Promise<{ taskId: string, proposalId: string } | null>;
+     setCommitMessage: (message: string) => void;
+ };
+ 
+@@ -75,4 +82,23 @@
+             toast.error("Commit failed", { description: error.message });
+         }
+     },
++    createProposalFromStaged: async () => {
++        const { commitMessage } = get();
++        if (!commitMessage.trim()) {
++            toast.error("Please provide instructions in the commit message box to create a proposal.");
++            return null;
++        }
++        try {
++            const response = await http<{ taskId: string, proposalId: string }>('/api/proposals/run-from-staged', {
++                method: 'POST',
++                body: JSON.stringify({ instructions: commitMessage }),
++            });
++            set({ commitMessage: '' });
++            return response;
++
++        } catch (error: any) {
++            toast.error("Failed to create proposal from staged changes", { description: error.message });
++            return null;
++        }
++    }
+ }));
+```
+
+I've updated the two routes that serve your `index.html` to include headers that prevent caching. This ensures that your users will always get the latest version of the frontend after you deploy a new build. Other static assets (like hashed JS and CSS files) will still be cached by the browser, as they should be.
+# === RESULT ===
+import { create } from 'zustand';
+import { http } from '@/lib/http';
+import { toast } from 'sonner';
+
+export interface GitFileStatus {
+    path: string;
+    status: string;
+}
+
+export interface GitStatus {
+    staged: GitFileStatus[];
+    unstaged: GitFileStatus[];
+    untracked: GitFileStatus[];
+}
+
+type GitState = {
+    status: GitStatus | null;
+    commitMessage: string;
+    isLoading: boolean;
+};
+
+type GitActions = {
+    fetchStatus: () => Promise<void>;
+    stageFiles: (files: string[]) => Promise<void>;
+    unstageFiles: (files: string[]) => Promise<void>;
+    commit: () => Promise<void>;
+    createProposalFromStaged: () => Promise<{ taskId: string, proposalId: string } | null>;
+    setCommitMessage: (message: string) => void;
+};
+
+const initialState: GitState = {
+    status: null,
+    commitMessage: '',
+    isLoading: false,
+};
+
+export const useGitStore = create<GitState & GitActions>((set, get) => ({
+    ...initialState,
+    setCommitMessage: (message) => set({ commitMessage: message }),
+    fetchStatus: async () => {
+        set({ isLoading: true });
+        try {
+            const status = await http<GitStatus>('/api/git/status');
+            set({ status, isLoading: false });
+        } catch (error: any) {
+            toast.error("Failed to get Git status", { description: error.message });
+            set({ isLoading: false });
+        }
+    },
+    stageFiles: async (files) => {
+        try {
+            await http('/api/git/stage', {
+                method: 'POST',
+                body: JSON.stringify({ files }),
+            });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Failed to stage files", { description: error.message });
+        }
+    },
+    unstageFiles: async (files) => {
+        try {
+            await http('/api/git/unstage', {
+                method: 'POST',
+                body: JSON.stringify({ files }),
+            });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Failed to unstage files", { description: error.message });
+        }
+    },
+    commit: async () => {
+        const { commitMessage } = get();
+        if (!commitMessage.trim()) {
+            toast.error("Commit message cannot be empty.");
+            return;
+        }
+        try {
+            await http('/api/git/commit', {
+                method: 'POST',
+                body: JSON.stringify({ message: commitMessage }),
+            });
+            toast.success("Commit successful!");
+            set({ commitMessage: '' });
+            await get().fetchStatus();
+        } catch (error: any) {
+            toast.error("Commit failed", { description: error.message });
+        }
+    },
+    createProposalFromStaged: async () => {
+        const { commitMessage } = get();
+        if (!commitMessage.trim()) {
+            toast.error("Please provide instructions in the commit message box to create a proposal.");
+            return null;
+        }
+        try {
+            const response = await http<{ taskId: string, proposalId: string }>('/api/proposals/run-from-staged', {
+                method: 'POST',
+                body: JSON.stringify({ instructions: commitMessage }),
+            });
+            set({ commitMessage: '' });
+            return response;
+
+        } catch (error: any) {
+            toast.error("Failed to create proposal from staged changes", { description: error.message });
+            return null;
+        }
+    }
+}));

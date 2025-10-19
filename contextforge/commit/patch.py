@@ -775,7 +775,21 @@ def _find_all_hunk_candidates(
             confidence = 0.9 + (avg_context * 0.1)  # 0.9-1.0 range
             
             # Calculate the actual hunk start position
-            hunk_start = anchor_idx - leading_context_count
+            # Count non-addition lines between leading context and the first deletion
+            # to correctly calculate where the hunk starts in the file
+            context_lines_before_anchor = leading_context_count
+            for i in range(leading_context_count, len(hunk["lines"])):
+                line = hunk["lines"][i]
+                if line and line[0] == "-":
+                    # Found first deletion, stop counting
+                    break
+                elif line == "" or (line and line[0] == " "):
+                    # Context line between leading context and deletions
+                    context_lines_before_anchor += 1
+                # Skip additions (don't increment counter)
+            
+            hunk_start = anchor_idx - context_lines_before_anchor
+            log.debug(f"Calculated hunk_start={hunk_start} (anchor={anchor_idx}, context_before={context_lines_before_anchor})")
             
             # Build replacement using surgical reconstruction
             # Use old_content length for the match window
