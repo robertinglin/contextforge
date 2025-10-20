@@ -1,0 +1,747 @@
+import { useCallback, useMemo, useEffect, useRef } from 'react';
+import { toast } from 'sonner';
+import { useWorkspaceStore } from '@/stores/workspace';
+import { FileNode } from '@/pages/workspace/types';
+import { useWorkspaceState } from './useWorkspaceState';
+import { useDebounce } from '../use-debounce';
+
+export const useFileSelection = () => {
+  const { isStateLoaded } = useWorkspaceState();
+  const {
+    instructions,
+    fileTree,
+    userSelectedFiles,
+    setUserSelectedFiles,
+    contextSelectedFiles,
+    setContextSelectedFiles,
+    isAutoContextEnabled,
+    tokenBudget,
+    findRelevantFiles,
+    findRelevantFilesFromInstructions,
+    cachedInstructionContext,
+    setCachedInstructionContext,
+  } = useWorkspaceStore(state => ({
+    instructions: state.instructions,
+    fileTree: state.fileTree,
+    userSelectedFiles: state.userSelectedFiles,
+    setUserSelectedFiles: state.setUserSelectedFiles,
+    contextSelectedFiles: state.contextSelectedFiles,
+    setContextSelectedFiles: state.setContextSelectedFiles,
+    isAutoContextEnabled: state.isAutoContextEnabled,
+    tokenBudget: state.tokenBudget,
+    findRelevantFiles: state.findRelevantFiles,
+    findRelevantFilesFromInstructions: state.findRelevantFilesFromInstructions,
+    cachedInstructionContext: state.cachedInstructionContext,
+    setCachedInstructionContext: state.setCachedInstructionContext,
+  }));
+  const debouncedInstructions = useDebounce(instructions, 500);
+  const requestAbortControllerRef = useRef<AbortController | null>(null);
+
+  const getAllDescendantFiles = useCallback((node: FileNode, files: Set<string>, includeIgnored = false) => {
+    if (node.type === 'file' && node.tokenizable) {
+      if (includeIgnored || !node.ignored) {
+        files.add(node.path);
+      }
+    }
+    node.children?.forEach((child) => getAllDescendantFiles(child, files, includeIgnored));
+  }, []);
+
+  // Reconcile selected files with current file tree
+  useEffect(() => {
+    // Don't run reconciliation until both the state is loaded and a non-empty file tree is present.
+    if (!isStateLoaded || fileTree.length === 0) return;
+
+    const allFilePaths = new Set<string>();
+    const traverse = (nodes: FileNode[]) => {
+      for (const node of nodes) {
+        if (node.type === 'file') {
+          allFilePaths.add(node.path);
+      }
+        if (node.children) { 
+          traverse(node.children);
+        }
+      }
+    };
+    traverse(fileTree);
+
+    const filesToKeep = new Set<string>();
+    for (const file of userSelectedFiles) {
+      if (allFilePaths.has(file)) {
+        filesToKeep.add(file);
+      }
+    }
+
+    // Only update state if there is a difference to prevent infinite loops.
+    if (filesToKeep.size !== userSelectedFiles.size) {
+      setUserSelectedFiles(() => filesToKeep);
+    }
+  }, [fileTree, userSelectedFiles, isStateLoaded, setUserSelectedFiles]);
+
+  const toggleNodeSelection = useCallback((node: FileNode, checked: boolean) => {
+    const filesToToggle = new Set<string>();
+    if (node.type === 'file') {
+      if (node.tokenizable) {
+        filesToToggle.add(node.path);
+      }
+    } else {
+      // When unchecking a directory, we unselect everything, even individually selected ignored files.
+      // When checking, we only select non-ignored files.
+      getAllDescendantFiles(node, filesToToggle, !checked);
+    }
+
+    setUserSelectedFiles(prev => {
+      const next = new Set(prev);
+      if (checked) {
+        filesToToggle.forEach((file) => next.add(file));
+      } else {
+        filesToToggle.forEach((file) => next.delete(file));
+      }
+      return next;
+    });
+  }, [getAllDescendantFiles, setUserSelectedFiles]);
+
+  const prevTokenBudgetRef = useRef(tokenBudget);
+
+  useEffect(() => {
+    if (!isStateLoaded) return;
+
+    const budgetChanged = prevTokenBudgetRef.current !== tokenBudget;
+    prevTokenBudgetRef.current = tokenBudget;
+
+    // Abort any ongoing request when dependencies change.
+    if (requestAbortControllerRef.current) {
+      requestAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    requestAbortControllerRef.current = controller;
+
+    const recomputeContext = async () => {
+      if (!isAutoContextEnabled) {
+        setContextSelectedFiles(new Map());
+        return;
+      }
+
+      if (userSelectedFiles.size > 0) {
+        const fileNodeMap = new Map<string, FileNode>();
+        const traverse = (nodes: FileNode[]) => {
+          for (const node of nodes) {
+            fileNodeMap.set(node.path, node);
+            if (node.children) traverse(node.children);
+          }
+        };
+        traverse(fileTree);
+        
+        const seedFiles = Array.from(userSelectedFiles).filter(path => !fileTree.find(n => n.path === path)?.ignored);
+
+        let toastId: string | number | undefined;
+        if (budgetChanged) {
+          toastId = toast.loading('Re-calculating relevant files with new budget...');
+        }
+        const relevantFiles = await findRelevantFiles({ seedFiles, tokenBudget });
+
+        if (controller.signal.aborted) return;
+
+        if (toastId) toast.dismiss(toastId);
+
+        if (relevantFiles) {
+          const alreadySelected = new Set(seedFiles);
+          const newContextFiles = new Set(relevantFiles.filter((p) => !alreadySelected.has(p)));
+          if (newContextFiles.size > 0) {
+            setContextSelectedFiles(new Map([['auto-context', newContextFiles]]));
+            if (budgetChanged) toast.success(`Found ${newContextFiles.size} relevant files with new budget.`);
+          } else {
+            setContextSelectedFiles(new Map());
+            if (budgetChanged) toast.info('No additional relevant files found with new budget.');
+          }
+        } else {
+          setContextSelectedFiles(new Map());
+        }
+      } else if (debouncedInstructions.trim().length >= 20) { // Only search from instructions if some are provided
+        if (cachedInstructionContext && cachedInstructionContext.size > 0 && !budgetChanged) {
+          setContextSelectedFiles(new Map([['auto-context', cachedInstructionContext]]));
+          return;
+        }
+      
+        const relevantFiles = await findRelevantFilesFromInstructions({ instructions: debouncedInstructions, tokenBudget }, controller.signal);
+        if (controller.signal.aborted) return;
+
+        if (relevantFiles) {
+          const filesSet = new Set(relevantFiles);
+          setContextSelectedFiles(new Map([['auto-context', filesSet]]));
+          setCachedInstructionContext(filesSet);
+        } else {
+          setContextSelectedFiles(new Map());
+        }
+      
+      } else { // No files selected and no instructions
+        setContextSelectedFiles(new Map());
+      }
+    }
+    
+    recomputeContext();
+
+    return () => {
+      controller.abort();
+    }
+  }, [isStateLoaded, userSelectedFiles, tokenBudget, isAutoContextEnabled, findRelevantFiles, setContextSelectedFiles, debouncedInstructions, findRelevantFilesFromInstructions, cachedInstructionContext, setCachedInstructionContext, fileTree]);
+
+  const combinedSelectedFiles = useMemo(() => {
+    const all = new Set(userSelectedFiles);
+    contextSelectedFiles.forEach((files) => {
+      files.forEach((file) => all.add(file));
+    });
+    return all;
+  }, [userSelectedFiles, contextSelectedFiles]);
+
+  const nodeSelectionStates = useMemo(() => {
+    const states = new Map<string, 'checked' | 'unchecked' | 'indeterminate'>();
+    const tokenizableDescendants = new Map<string, boolean>();
+    const folderSelectionTypes = new Map<string, 'user' | 'context' | 'mixed' | 'none'>();
+
+    const contextOnlyFiles = new Set<string>();
+    contextSelectedFiles.forEach(files => {
+      files.forEach(file => contextOnlyFiles.add(file));
+    });
+
+    interface NodeCounts {
+      totalSelectable: number;
+      selectedSelectable: number;
+      selectedIgnored: number;
+      userSelected: number;
+      contextOnlySelected: number;
+    }
+
+    function getCounts(node: FileNode): NodeCounts {
+      if (node.type === 'file') {
+        const isTokenizable = !!node.tokenizable;
+        tokenizableDescendants.set(node.path, isTokenizable);
+        if (!isTokenizable) return { totalSelectable: 0, selectedSelectable: 0, selectedIgnored: 0, userSelected: 0, contextOnlySelected: 0 };
+
+        const isUser = userSelectedFiles.has(node.path);
+        const isContext = contextSelectedFiles.has(node.path) || Array.from(contextSelectedFiles.values()).some(s => s.has(node.path));
+        const isContextOnly = isContext && !isUser;
+
+        if (node.ignored) {
+          return {
+            totalSelectable: 0,
+            selectedSelectable: 0,
+            selectedIgnored: (isUser || isContext) ? 1 : 0,
+            userSelected: isUser ? 1 : 0,
+            contextOnlySelected: isContextOnly ? 1 : 0,
+          };
+        } else {
+          return {
+            totalSelectable: 1,
+            selectedSelectable: (isUser || isContext) ? 1 : 0,
+            selectedIgnored: 0,
+            userSelected: isUser ? 1 : 0,
+            contextOnlySelected: isContextOnly ? 1 : 0,
+          };
+        }
+      }
+
+      if (node.type === 'directory') {
+        const totals: NodeCounts = { totalSelectable: 0, selectedSelectable: 0, selectedIgnored: 0, userSelected: 0, contextOnlySelected: 0 };
+
+        if (node.children?.length) {
+          for (const child of node.children) {
+            const childCounts = getCounts(child);
+            totals.totalSelectable += childCounts.totalSelectable;
+            totals.selectedSelectable += childCounts.selectedSelectable;
+            totals.selectedIgnored += childCounts.selectedIgnored;
+            totals.userSelected += childCounts.userSelected;
+            totals.contextOnlySelected += childCounts.contextOnlySelected;
+          }
+        }
+
+        const hasTokenizable = totals.totalSelectable > 0 || totals.selectedIgnored > 0;
+        tokenizableDescendants.set(node.path, hasTokenizable);
+
+        let state: 'checked' | 'unchecked' | 'indeterminate' = 'unchecked';
+        if (hasTokenizable) {
+          if ((totals.selectedSelectable + totals.selectedIgnored) === 0) {
+            state = 'unchecked';
+          } else if (totals.selectedSelectable === totals.totalSelectable && totals.selectedIgnored === 0 && totals.totalSelectable > 0) {
+            state = 'checked';
+          }
+          else state = 'indeterminate';
+        }
+        states.set(node.path, state);
+
+        let folderType: 'user' | 'context' | 'mixed' | 'none' = 'none';
+        if (totals.userSelected > 0 && totals.contextOnlySelected > 0) {
+          folderType = 'mixed';
+        } else if (totals.userSelected > 0) {
+          folderType = 'user';
+        } else if (totals.contextOnlySelected > 0) {
+          folderType = 'context';
+        }
+        folderSelectionTypes.set(node.path, folderType);
+
+        return totals;
+      }
+      return { totalSelectable: 0, selectedSelectable: 0, selectedIgnored: 0, userSelected: 0, contextOnlySelected: 0 };
+    }
+    
+    fileTree.forEach(getCounts);
+    return { nodeSelectionStates: states, hasTokenizableDescendants: tokenizableDescendants, folderSelectionTypes };
+  }, [userSelectedFiles, contextSelectedFiles, fileTree]);
+
+  const handleSelectAll = () => {
+    const allFiles = new Set<string>();
+    fileTree.forEach((node) => getAllDescendantFiles(node, allFiles));
+    if (userSelectedFiles.size === allFiles.size) {
+      setUserSelectedFiles(() => new Set());
+    } else {
+      setUserSelectedFiles(() => allFiles);
+    }
+  };
+
+  const areAllFilesSelected = useMemo(() => {
+    const allFiles = new Set<string>();
+    fileTree.forEach((node) => getAllDescendantFiles(node, allFiles));
+    return allFiles.size > 0 && allFiles.size === combinedSelectedFiles.size;
+  }, [combinedSelectedFiles, fileTree, getAllDescendantFiles]);
+
+  return {
+    toggleNodeSelection,
+    combinedSelectedFiles,
+    nodeSelectionStates: nodeSelectionStates.nodeSelectionStates,
+    hasTokenizableDescendants: nodeSelectionStates.hasTokenizableDescendants,
+    folderSelectionTypes: nodeSelectionStates.folderSelectionTypes,
+    handleSelectAll,
+    areAllFilesSelected,
+    getAllDescendantFiles,
+  };
+};
+# === TEST ===
+Of course. I'd be happy to help you deep-dive into the performance of `setUserSelectedFiles`. A lag during this operation is a classic sign of a computationally expensive process running on the main thread during a re-render.
+
+After analyzing the data flow, I've pinpointed the primary cause of the lag and prepared some optimizations.
+
+### Performance Analysis: The Data Flow of a File Selection
+
+When a file is selected or deselected in the `FileExplorer`, a chain of events is triggered. The lag you're experiencing is primarily due to a synchronous and computationally intensive process that runs immediately after the selection state changes.
+
+Here's a step-by-step breakdown of the data flow:
+
+1.  **`setUserSelectedFiles()` Called**: A user clicks a checkbox, which calls `toggleNodeSelection`, and in turn, the `setUserSelectedFiles` action from the `workspace` store.
+
+2.  **State Update & Re-render**: The `userSelectedFiles` set in the Zustand store is updated. Any component subscribed to this state, like `FileExplorer`, begins to re-render.
+
+3.  **The Bottleneck - Synchronous Tree Traversal**: The `useFileSelection` hook contains a `useMemo` block to calculate `nodeSelectionStates`. This memoized value is crucial for determining if a folder's checkbox should be checked, unchecked, or indeterminate.
+    *   **This is the main source of the lag.** To calculate the state of each folder, this function must recursively traverse the *entire file tree from the bottom up*, counting selected and selectable files within each directory.
+    *   For a large project with thousands of files and folders, this traversal can take a noticeable amount of time, blocking the main thread and causing the UI to freeze momentarily.
+
+4.  **Asynchronous Context Calculation**: In parallel, a `useEffect` in `useFileSelection` is triggered by the change in `userSelectedFiles`. It calls `findRelevantFiles` to fetch related files for auto-context. This is an asynchronous API call.
+
+5.  **A Second State Update**: When the API call from the previous step completes, it calls `setContextSelectedFiles`.
+
+6.  **The Bottleneck, Again**: This second state update triggers another re-render. The expensive `nodeSelectionStates` calculation from step 3 runs **again**, because it also depends on `contextSelectedFiles`. This can cause a second, smaller lag or flicker as the UI updates with the new context files.
+
+In summary, every single selection change synchronously re-calculates selection states for every folder in your project by traversing the entire tree, which is the root cause of the performance issue.
+
+### Code Optimizations and Improvements
+
+To address this and improve clarity, I've made several changes. The primary goal is to make the code more efficient and to add logging that makes the performance cost visible during development.
+
+Here are the changes:
+
+1.  **`src/hooks/workspace/useFileSelection.ts`**:
+    *   Added a `console.log` to the expensive `nodeSelectionStates` calculation to make it obvious when this heavy computation is running.
+    *   Optimized selection checking by pre-calculating a flattened `Set` of all context files (`allContextFiles`). This avoids repeated and inefficient iterations inside loops.
+    *   Separated the calculation of `hasTokenizableDescendants` into its own `useMemo`, as it only depends on the `fileTree` and doesn't need to re-run when selections change. This improves code structure and memoization.
+
+2.  **`src/pages/workspace/explorer/FileExplorer.tsx`**:
+    *   Updated the component to use the new, efficient `allContextFiles` set for checking file states, replacing slow `Array.from(...).some()` calls.
+    *   Improved the existing debugging code to correctly log which piece of state from `useWorkspaceStore` is triggering a re-render, which will help diagnose future performance issues.
+
+Here are the diffs for the changes:
+
+```diff
+--- a/src/hooks/workspace/useFileSelection.ts
++++ b/src/hooks/workspace/useFileSelection.ts
+@@ -141,6 +141,14 @@
+     });
+     return all;
+   }, [userSelectedFiles, contextSelectedFiles]);
++
++  const allContextFiles = useMemo(() => {
++    const contextFiles = new Set<string>();
++    contextSelectedFiles.forEach((files) => {
++      files.forEach((file) => contextFiles.add(file));
++    });
++    return contextFiles;
++  }, [contextSelectedFiles]);
+ 
+   const nodeSelectionStates = useMemo(() => {
+     const states = new Map<string, 'checked' | 'unchecked' | 'indeterminate'>();
+-    const tokenizableDescendants = new Map<string, boolean>();
+     const folderSelectionTypes = new Map<string, 'user' | 'context' | 'mixed' | 'none'>();
+ 
+-    const contextOnlyFiles = new Set<string>();
+-    contextSelectedFiles.forEach(files => {
+-      files.forEach(file => contextOnlyFiles.add(file));
+-    });
++    const hasTokenizableDescendants = new Map<string, boolean>();
++    console.log('Recalculating node selection states. This can be slow for large file trees.');
+ 
+     interface NodeCounts {
+       totalSelectable: number;
+@@ -153,11 +161,10 @@
+ 
+     function getCounts(node: FileNode): NodeCounts {
+       if (node.type === 'file') {
+-        const isTokenizable = !!node.tokenizable;
+-        tokenizableDescendants.set(node.path, isTokenizable);
+-        if (!isTokenizable) return { totalSelectable: 0, selectedSelectable: 0, selectedIgnored: 0, userSelected: 0, contextOnlySelected: 0 };
++        if (!node.tokenizable) return { totalSelectable: 0, selectedSelectable: 0, selectedIgnored: 0, userSelected: 0, contextOnlySelected: 0 };
+ 
+         const isUser = userSelectedFiles.has(node.path);
+-        const isContext = contextSelectedFiles.has(node.path) || Array.from(contextSelectedFiles.values()).some(s => s.has(node.path));
++        const isContext = allContextFiles.has(node.path);
+         const isContextOnly = isContext && !isUser;
+ 
+         if (node.ignored) {
+@@ -218,8 +225,8 @@
+     }
+     
+     fileTree.forEach(getCounts);
+-    return { nodeSelectionStates: states, hasTokenizableDescendants: tokenizableDescendants, folderSelectionTypes };
+-  }, [userSelectedFiles, contextSelectedFiles, fileTree]);
++    return { nodeSelectionStates: states, hasTokenizableDescendants, folderSelectionTypes };
++  }, [userSelectedFiles, allContextFiles, fileTree]);
+ 
+   const handleSelectAll = () => {
+     const allFiles = new Set<string>();
+@@ -241,6 +248,7 @@
+     folderSelectionTypes: nodeSelectionStates.folderSelectionTypes,
+     handleSelectAll,
+     areAllFilesSelected,
+     getAllDescendantFiles,
++    allContextFiles,
+   };
+ };
+
+```
+# === RESULT ===
+import { useCallback, useMemo, useEffect, useRef } from 'react';
+import { toast } from 'sonner';
+import { useWorkspaceStore } from '@/stores/workspace';
+import { FileNode } from '@/pages/workspace/types';
+import { useWorkspaceState } from './useWorkspaceState';
+import { useDebounce } from '../use-debounce';
+
+export const useFileSelection = () => {
+  const { isStateLoaded } = useWorkspaceState();
+  const {
+    instructions,
+    fileTree,
+    userSelectedFiles,
+    setUserSelectedFiles,
+    contextSelectedFiles,
+    setContextSelectedFiles,
+    isAutoContextEnabled,
+    tokenBudget,
+    findRelevantFiles,
+    findRelevantFilesFromInstructions,
+    cachedInstructionContext,
+    setCachedInstructionContext,
+  } = useWorkspaceStore(state => ({
+    instructions: state.instructions,
+    fileTree: state.fileTree,
+    userSelectedFiles: state.userSelectedFiles,
+    setUserSelectedFiles: state.setUserSelectedFiles,
+    contextSelectedFiles: state.contextSelectedFiles,
+    setContextSelectedFiles: state.setContextSelectedFiles,
+    isAutoContextEnabled: state.isAutoContextEnabled,
+    tokenBudget: state.tokenBudget,
+    findRelevantFiles: state.findRelevantFiles,
+    findRelevantFilesFromInstructions: state.findRelevantFilesFromInstructions,
+    cachedInstructionContext: state.cachedInstructionContext,
+    setCachedInstructionContext: state.setCachedInstructionContext,
+  }));
+  const debouncedInstructions = useDebounce(instructions, 500);
+  const requestAbortControllerRef = useRef<AbortController | null>(null);
+
+  const getAllDescendantFiles = useCallback((node: FileNode, files: Set<string>, includeIgnored = false) => {
+    if (node.type === 'file' && node.tokenizable) {
+      if (includeIgnored || !node.ignored) {
+        files.add(node.path);
+      }
+    }
+    node.children?.forEach((child) => getAllDescendantFiles(child, files, includeIgnored));
+  }, []);
+
+  // Reconcile selected files with current file tree
+  useEffect(() => {
+    // Don't run reconciliation until both the state is loaded and a non-empty file tree is present.
+    if (!isStateLoaded || fileTree.length === 0) return;
+
+    const allFilePaths = new Set<string>();
+    const traverse = (nodes: FileNode[]) => {
+      for (const node of nodes) {
+        if (node.type === 'file') {
+          allFilePaths.add(node.path);
+      }
+        if (node.children) { 
+          traverse(node.children);
+        }
+      }
+    };
+    traverse(fileTree);
+
+    const filesToKeep = new Set<string>();
+    for (const file of userSelectedFiles) {
+      if (allFilePaths.has(file)) {
+        filesToKeep.add(file);
+      }
+    }
+
+    // Only update state if there is a difference to prevent infinite loops.
+    if (filesToKeep.size !== userSelectedFiles.size) {
+      setUserSelectedFiles(() => filesToKeep);
+    }
+  }, [fileTree, userSelectedFiles, isStateLoaded, setUserSelectedFiles]);
+
+  const toggleNodeSelection = useCallback((node: FileNode, checked: boolean) => {
+    const filesToToggle = new Set<string>();
+    if (node.type === 'file') {
+      if (node.tokenizable) {
+        filesToToggle.add(node.path);
+      }
+    } else {
+      // When unchecking a directory, we unselect everything, even individually selected ignored files.
+      // When checking, we only select non-ignored files.
+      getAllDescendantFiles(node, filesToToggle, !checked);
+    }
+
+    setUserSelectedFiles(prev => {
+      const next = new Set(prev);
+      if (checked) {
+        filesToToggle.forEach((file) => next.add(file));
+      } else {
+        filesToToggle.forEach((file) => next.delete(file));
+      }
+      return next;
+    });
+  }, [getAllDescendantFiles, setUserSelectedFiles]);
+
+  const prevTokenBudgetRef = useRef(tokenBudget);
+
+  useEffect(() => {
+    if (!isStateLoaded) return;
+
+    const budgetChanged = prevTokenBudgetRef.current !== tokenBudget;
+    prevTokenBudgetRef.current = tokenBudget;
+
+    // Abort any ongoing request when dependencies change.
+    if (requestAbortControllerRef.current) {
+      requestAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    requestAbortControllerRef.current = controller;
+
+    const recomputeContext = async () => {
+      if (!isAutoContextEnabled) {
+        setContextSelectedFiles(new Map());
+        return;
+      }
+
+      if (userSelectedFiles.size > 0) {
+        const fileNodeMap = new Map<string, FileNode>();
+        const traverse = (nodes: FileNode[]) => {
+          for (const node of nodes) {
+            fileNodeMap.set(node.path, node);
+            if (node.children) traverse(node.children);
+          }
+        };
+        traverse(fileTree);
+        
+        const seedFiles = Array.from(userSelectedFiles).filter(path => !fileTree.find(n => n.path === path)?.ignored);
+
+        let toastId: string | number | undefined;
+        if (budgetChanged) {
+          toastId = toast.loading('Re-calculating relevant files with new budget...');
+        }
+        const relevantFiles = await findRelevantFiles({ seedFiles, tokenBudget });
+
+        if (controller.signal.aborted) return;
+
+        if (toastId) toast.dismiss(toastId);
+
+        if (relevantFiles) {
+          const alreadySelected = new Set(seedFiles);
+          const newContextFiles = new Set(relevantFiles.filter((p) => !alreadySelected.has(p)));
+          if (newContextFiles.size > 0) {
+            setContextSelectedFiles(new Map([['auto-context', newContextFiles]]));
+            if (budgetChanged) toast.success(`Found ${newContextFiles.size} relevant files with new budget.`);
+          } else {
+            setContextSelectedFiles(new Map());
+            if (budgetChanged) toast.info('No additional relevant files found with new budget.');
+          }
+        } else {
+          setContextSelectedFiles(new Map());
+        }
+      } else if (debouncedInstructions.trim().length >= 20) { // Only search from instructions if some are provided
+        if (cachedInstructionContext && cachedInstructionContext.size > 0 && !budgetChanged) {
+          setContextSelectedFiles(new Map([['auto-context', cachedInstructionContext]]));
+          return;
+        }
+      
+        const relevantFiles = await findRelevantFilesFromInstructions({ instructions: debouncedInstructions, tokenBudget }, controller.signal);
+        if (controller.signal.aborted) return;
+
+        if (relevantFiles) {
+          const filesSet = new Set(relevantFiles);
+          setContextSelectedFiles(new Map([['auto-context', filesSet]]));
+          setCachedInstructionContext(filesSet);
+        } else {
+          setContextSelectedFiles(new Map());
+        }
+      
+      } else { // No files selected and no instructions
+        setContextSelectedFiles(new Map());
+      }
+    }
+    
+    recomputeContext();
+
+    return () => {
+      controller.abort();
+    }
+  }, [isStateLoaded, userSelectedFiles, tokenBudget, isAutoContextEnabled, findRelevantFiles, setContextSelectedFiles, debouncedInstructions, findRelevantFilesFromInstructions, cachedInstructionContext, setCachedInstructionContext, fileTree]);
+
+  const combinedSelectedFiles = useMemo(() => {
+    const all = new Set(userSelectedFiles);
+    contextSelectedFiles.forEach((files) => {
+      files.forEach((file) => all.add(file));
+    });
+    return all;
+  }, [userSelectedFiles, contextSelectedFiles]);
+
+  const allContextFiles = useMemo(() => {
+    const contextFiles = new Set<string>();
+    contextSelectedFiles.forEach((files) => {
+      files.forEach((file) => contextFiles.add(file));
+    });
+    return contextFiles;
+  }, [contextSelectedFiles]);
+
+  const nodeSelectionStates = useMemo(() => {
+    const states = new Map<string, 'checked' | 'unchecked' | 'indeterminate'>();
+    const folderSelectionTypes = new Map<string, 'user' | 'context' | 'mixed' | 'none'>();
+
+    const hasTokenizableDescendants = new Map<string, boolean>();
+    console.log('Recalculating node selection states. This can be slow for large file trees.');
+
+    interface NodeCounts {
+      totalSelectable: number;
+      selectedSelectable: number;
+      selectedIgnored: number;
+      userSelected: number;
+      contextOnlySelected: number;
+    }
+
+    function getCounts(node: FileNode): NodeCounts {
+      if (node.type === 'file') {
+        if (!node.tokenizable) return { totalSelectable: 0, selectedSelectable: 0, selectedIgnored: 0, userSelected: 0, contextOnlySelected: 0 };
+
+        const isUser = userSelectedFiles.has(node.path);
+        const isContext = allContextFiles.has(node.path);
+        const isContextOnly = isContext && !isUser;
+
+        if (node.ignored) {
+          return {
+            totalSelectable: 0,
+            selectedSelectable: 0,
+            selectedIgnored: (isUser || isContext) ? 1 : 0,
+            userSelected: isUser ? 1 : 0,
+            contextOnlySelected: isContextOnly ? 1 : 0,
+          };
+        } else {
+          return {
+            totalSelectable: 1,
+            selectedSelectable: (isUser || isContext) ? 1 : 0,
+            selectedIgnored: 0,
+            userSelected: isUser ? 1 : 0,
+            contextOnlySelected: isContextOnly ? 1 : 0,
+          };
+        }
+      }
+
+      if (node.type === 'directory') {
+        const totals: NodeCounts = { totalSelectable: 0, selectedSelectable: 0, selectedIgnored: 0, userSelected: 0, contextOnlySelected: 0 };
+
+        if (node.children?.length) {
+          for (const child of node.children) {
+            const childCounts = getCounts(child);
+            totals.totalSelectable += childCounts.totalSelectable;
+            totals.selectedSelectable += childCounts.selectedSelectable;
+            totals.selectedIgnored += childCounts.selectedIgnored;
+            totals.userSelected += childCounts.userSelected;
+            totals.contextOnlySelected += childCounts.contextOnlySelected;
+          }
+        }
+
+        const hasTokenizable = totals.totalSelectable > 0 || totals.selectedIgnored > 0;
+        tokenizableDescendants.set(node.path, hasTokenizable);
+
+        let state: 'checked' | 'unchecked' | 'indeterminate' = 'unchecked';
+        if (hasTokenizable) {
+          if ((totals.selectedSelectable + totals.selectedIgnored) === 0) {
+            state = 'unchecked';
+          } else if (totals.selectedSelectable === totals.totalSelectable && totals.selectedIgnored === 0 && totals.totalSelectable > 0) {
+            state = 'checked';
+          }
+          else state = 'indeterminate';
+        }
+        states.set(node.path, state);
+
+        let folderType: 'user' | 'context' | 'mixed' | 'none' = 'none';
+        if (totals.userSelected > 0 && totals.contextOnlySelected > 0) {
+          folderType = 'mixed';
+        } else if (totals.userSelected > 0) {
+          folderType = 'user';
+        } else if (totals.contextOnlySelected > 0) {
+          folderType = 'context';
+        }
+        folderSelectionTypes.set(node.path, folderType);
+
+        return totals;
+      }
+      return { totalSelectable: 0, selectedSelectable: 0, selectedIgnored: 0, userSelected: 0, contextOnlySelected: 0 };
+    }
+    
+    fileTree.forEach(getCounts);
+    return { nodeSelectionStates: states, hasTokenizableDescendants, folderSelectionTypes };
+  }, [userSelectedFiles, allContextFiles, fileTree]);
+
+  const handleSelectAll = () => {
+    const allFiles = new Set<string>();
+    fileTree.forEach((node) => getAllDescendantFiles(node, allFiles));
+    if (userSelectedFiles.size === allFiles.size) {
+      setUserSelectedFiles(() => new Set());
+    } else {
+      setUserSelectedFiles(() => allFiles);
+    }
+  };
+
+  const areAllFilesSelected = useMemo(() => {
+    const allFiles = new Set<string>();
+    fileTree.forEach((node) => getAllDescendantFiles(node, allFiles));
+    return allFiles.size > 0 && allFiles.size === combinedSelectedFiles.size;
+  }, [combinedSelectedFiles, fileTree, getAllDescendantFiles]);
+
+  return {
+    toggleNodeSelection,
+    combinedSelectedFiles,
+    nodeSelectionStates: nodeSelectionStates.nodeSelectionStates,
+    hasTokenizableDescendants: nodeSelectionStates.hasTokenizableDescendants,
+    folderSelectionTypes: nodeSelectionStates.folderSelectionTypes,
+    handleSelectAll,
+    areAllFilesSelected,
+    getAllDescendantFiles,
+    allContextFiles,
+  };
+};

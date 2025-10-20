@@ -731,6 +731,7 @@ def _find_all_hunk_candidates(
     # Standard matching for replacements and non-contiguous additions
     # Check if deletions are scattered (context lines between deletion lines)
     # If so, skip anchor approach - use old_content matching instead
+    skip_anchor_approach = False
     if changed_lines and len(changed_lines) > 1:
         last_delete_idx = -10  # Track position of last deletion
         deletions_scattered = False
@@ -746,14 +747,14 @@ def _find_all_hunk_candidates(
         
         if deletions_scattered:
             log.debug("Skipping anchor approach for scattered deletions, using old_content matching")
-            # Clear changed_lines to force fallback to old_content matching
-            # which handles scattered deletes correctly
-            changed_lines = []
+            # Skip anchor building but don't treat as pure addition
+            # Fall through to old_content matching which handles scattered deletes
+            skip_anchor_approach = True
     
     # Step 1: Find all locations that contain the changed lines (fuzzy)
     anchor_candidates = []
     
-    if changed_lines:
+    if changed_lines and not skip_anchor_approach:
         log.debug(f"Searching for anchor (changed content): {len(changed_lines)} lines")
         
         # Search for changed content with fuzzy matching
