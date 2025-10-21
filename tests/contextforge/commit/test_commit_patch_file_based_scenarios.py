@@ -6,7 +6,7 @@ import difflib
 # Define the directory containing the test files.
 # The path is constructed relative to the current test file's location.
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-TEST_FILES_DIR = os.path.join(TESTS_DIR, '..', 'files')
+TEST_FILES_DIR = os.path.join(TESTS_DIR, '..', '..', 'files', 'diff')
 
 # Discover test files in the directory
 test_files = []

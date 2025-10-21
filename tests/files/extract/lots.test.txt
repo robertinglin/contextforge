@@ -1,0 +1,1317 @@
+I've created a performance analysis library to track the speed of interactive functions throughout the frontend codebase. Here are the changes:
+
+1.  **Performance Library (`src/lib/performance.ts`):**
+    *   A new utility has been added to measure function execution time.
+    *   It exposes a `measure` higher-order function to wrap any function (especially `async` ones) and record its performance metrics like call count, total time, average time, min/max time.
+    *   A global `analyze()` function is now available in the developer console. When called, it displays a sorted table of all tracked functions and their performance data, helping to identify bottlenecks.
+
+2.  **Global Initialization:**
+    *   The performance analysis module is imported into `App.tsx` to ensure `window.analyze()` is available for debugging in the console as soon as the app loads.
+
+3.  **Codebase Instrumentation:**
+    *   The `measure` function has been applied to key interactive and asynchronous functions across the application's stores and hooks. This includes data fetching, state mutations, and user-initiated actions like saving files or generating AI proposals. This provides comprehensive performance data for most user interactions.
+
+Here are the detailed code changes:
+
+### 1. New performance analysis library
+
+I've added a new file to house the performance tracking logic.
+
+```typescript
+# src/lib/performance.ts
+interface PerformanceRecord {
+  callCount: number;
+  totalTime: number;
+  averageTime: number;
+  maxTime: number;
+  minTime: number;
+}
+
+const performanceData = new Map<string, PerformanceRecord>();
+
+export function measure<T extends (...args: any[]) => any>(fn: T, name?: string): T {
+  const perfName = name || fn.name;
+  if (!perfName) {
+    // console.warn('Cannot measure anonymous function without a name. Please provide a name.');
+    return fn;
+  }
+
+  return async function(this: any, ...args: any[]) {
+    const start = performance.now();
+    try {
+      const result = await fn.apply(this, args);
+      return result;
+    } finally {
+      const end = performance.now();
+      const duration = end - start;
+
+      const record = performanceData.get(perfName) || {
+        callCount: 0,
+        totalTime: 0,
+        averageTime: 0,
+        maxTime: -Infinity,
+        minTime: Infinity,
+      };
+
+      record.callCount++;
+      record.totalTime += duration;
+      record.averageTime = record.totalTime / record.callCount;
+      record.maxTime = Math.max(record.maxTime, duration);
+      record.minTime = Math.min(record.minTime, duration);
+
+      performanceData.set(perfName, record);
+    }
+  } as T;
+}
+
+function analyze() {
+  const data = Array.from(performanceData.entries()).map(([name, record]) => ({
+    'Function Name': name,
+    'Call Count': record.callCount,
+    'Total Time (ms)': record.totalTime.toFixed(2),
+    'Average Time (ms)': record.averageTime.toFixed(2),
+    'Max Time (ms)': record.maxTime.toFixed(2),
+    'Min Time (ms)': record.minTime.toFixed(2),
+  }));
+
+  if (data.length === 0) {
+    console.log('No performance data collected yet.');
+    return;
+  }
+
+  data.sort((a, b) => parseFloat(b['Total Time (ms)']) - parseFloat(a['Total Time (ms)']));
+
+  console.table(data);
+}
+
+if (typeof window !== 'undefined') {
+  (window as any).analyze = analyze;
+}
+```
+
+### 2. Integrating the performance library
+
+```diff
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -2,6 +2,7 @@
+ import { router } from "./router";
+ import { useState, useEffect } from "react";
+ import { useSettingsStore } from "./stores/settings";
++import "./lib/performance";
+ import { initializePushNotifications } from "./lib/push";
+ 
+ function App() {
+
+``````diff
+--- a/src/hooks/usePasteToTask.ts
++++ b/src/hooks/usePasteToTask.ts
+@@ -3,12 +3,13 @@
+ import { toast } from 'sonner';
+ import { useWorkspaceActions } from '@/hooks/workspace/useWorkspaceActions';
+ import { useUiStore } from '@/stores/ui';
++import { measure } from '@/lib/performance';
+ 
+ export const usePasteToTask = () => {
+     const navigate = useNavigate();
+     const workspaceActions = useWorkspaceActions();
+ 
+-    const handlePasteToTask = useCallback(async () => {
++    const handlePasteToTask = useCallback(measure(async () => {
+         try {
+             const pastedText = useUiStore.getState().pasteData;
+             if (!pastedText?.trim()) {
+@@ -36,7 +37,7 @@
+             toast.error("Failed to process pasted content", {
+                 description: error.message,
+             });
+         }
+-    }, [navigate, workspaceActions]);
++    }, 'handlePasteToTask'), [navigate, workspaceActions]);
+ 
+     return { handlePasteToTask };
+ };
+
+``````diff
+--- a/src/hooks/workspace/useContextBuilder.ts
++++ b/src/hooks/workspace/useContextBuilder.ts
+@@ -8,6 +8,7 @@
+ import { useWorkspaceStore } from '@/stores/workspace';
+ import { useProjectsStore } from '@/stores/projects';
+ import { useInstructionsStore } from '@/stores/instructions';
++import { measure } from '@/lib/performance';
+ type ClipboardCopyStrategy = 'api' | 'textarea' | 'prompt';
+ 
+ const copyWithTextarea = (text: string): ClipboardCopyStrategy | null => {
+@@ -148,7 +149,7 @@
+     return count;
+   }, [finalFiles, fileTree, includeFileTree, treeStringTokenCount]);
+ 
+-  const handleCopyContext = useCallback(async (): Promise<CopyContextResult | undefined> => {
++  const handleCopyContext = useCallback(measure(async (): Promise<CopyContextResult | undefined> => {
+     const instructions = useInstructionsStore.getState().instructions;
+     if (finalFiles.size === 0) {
+       if (!instructions.trim()) {
+@@ -197,7 +198,7 @@
+         return { servedToClipboard: true, mode: 'manual' };
+       }
+     }
+-  }, [activeProject?.serverPath, finalFiles, includeFileTree, isMobile, tokenBudget]);
++  }, 'handleCopyContext'), [activeProject?.serverPath, finalFiles, includeFileTree, isMobile, tokenBudget]);
+ 
+   const canGenerate = useMemo(() => {
+     const currentMode = interactionMode;
+@@ -216,7 +217,7 @@
+ 
+   }, [interactionMode, llmProviderId, toolAvailability, llmProviders]);
+ 
+-  const handleGenerateProposal = useCallback(async () => {
++  const handleGenerateProposal = useCallback(measure(async () => {
+     const instructions = useInstructionsStore.getState().instructions;
+     if (!canGenerate) {
+       toast.warning('The selected AI provider is not available.', { description: 'Please check your settings or install the required tools.' });
+@@ -296,7 +297,7 @@
+         description: error.message || 'An unknown error occurred.',
+       });
+     }
+-  }, [finalFiles, includeFileTree, tokenBudget, interactionMode, llmProviderId, canGenerate]);
++  }, 'handleGenerateProposal'), [finalFiles, includeFileTree, tokenBudget, interactionMode, llmProviderId, canGenerate]);
+ 
+   const isAutomaticMode = finalFiles.size === 0;
+ 
+
+``````diff
+--- a/src/hooks/workspace/useFileOperations.ts
++++ b/src/hooks/workspace/useFileOperations.ts
+@@ -3,6 +3,7 @@
+ import { toast } from 'sonner';
+ import { useFilesStore } from '@/stores/files';
+ import { useWorkspaceStore } from '@/stores/workspace';
++import { measure } from '@/lib/performance';
+ 
+ import { simpleHash } from '@/lib/utils';
+ export const useFileOperations = () => {
+@@ -14,7 +15,7 @@
+   // Do not get openFilePath from here, it's now passed in.
+   const { cachedContents, ...fileActions } = useFilesStore();
+ 
+-  const handleSaveFile = useCallback(async () => {
++  const handleSaveFile = useCallback(measure(async () => {
+     if (!openFilePath || editedContent[openFilePath] === undefined || isSaving) return;
+     
+     setIsSaving(true);
+@@ -49,7 +50,7 @@
+     } finally {
+       setIsSaving(false);
+     }
+-  }, [openFilePath, editedContent, isSaving, fileActions, cachedContents, setEditedContent]);
++  }, 'handleSaveFile'), [openFilePath, editedContent, isSaving, fileActions, cachedContents, setEditedContent]);
+ 
+   // Auto-load file on mount if needed
+   useEffect(() => {
+
+``````diff
+--- a/src/hooks/workspace/useWorkspaceActions.ts
++++ b/src/hooks/workspace/useWorkspaceActions.ts
+@@ -5,6 +5,7 @@
+ import { useValidatorsStore } from '@/stores/validators';
+ import { toast } from 'sonner';
+ import { FileNode } from '@/pages/workspace/types';
++import { measure } from '@/lib/performance';
+ 
+ export const useWorkspaceActions = () => {
+   const navigate = useNavigate();
+@@ -15,7 +16,7 @@
+   }));
+   const { run: runValidators } = useValidatorsStore();
+ 
+-  const handleImproveTests = useCallback(async (node: FileNode, getAllDescendantFiles: (node: FileNode, files: Set<string>) => void) => {
++  const handleImproveTests = useCallback(measure(async (node: FileNode, getAllDescendantFiles: (node: FileNode, files: Set<string>) => void) => {
+     const filesToTest: string[] = [];
+     if (node.type === 'file') {
+       filesToTest.push(node.path);
+@@ -32,9 +33,9 @@
+     } else {
+       toast.info('No tokenizable files found to improve tests for.');
+     }
+-  }, [buildTestPromptAndAct, navigate]);
++  }, 'handleImproveTests'), [buildTestPromptAndAct, navigate]);
+ 
+-  const handleRunTests = useCallback(async (node: FileNode) => {
++  const handleRunTests = useCallback(measure(async (node: FileNode) => {
+     const filesToTest: string[] = [];
+     if (node.type === 'file') {
+       filesToTest.push(node.path);
+@@ -62,9 +63,9 @@
+     if (runId) {
+       navigate(`/pages/validators/?runId=${runId}`);
+     }
+-  }, [runValidators, navigate]);
++  }, 'handleRunTests'), [runValidators, navigate]);
+ 
+-  const handleFixTests = useCallback(async (node: FileNode) => {
++  const handleFixTests = useCallback(measure(async (node: FileNode) => {
+     if (!node.testSummary?.runId || !node.testSummary.failing) {
+       toast.info('No failing tests with a valid run ID found for this file.');
+       return;
+@@ -78,7 +79,7 @@
+     if (result?.taskId && result.model) {
+       navigate(`/pages/generation-progress/?taskId=${result.taskId}&model=${result.model}`);
+     }
+-  }, [fixFailingTests, navigate]);
++  }, 'handleFixTests'), [fixFailingTests, navigate]);
+ 
+   return {
+     handleImproveTests,
+
+``````diff
+--- a/src/stores/app.ts
++++ b/src/stores/app.ts
+@@ -3,6 +3,7 @@
+ import { RootState } from '../core/state-shape';
+ import { toast } from 'sonner';
+ import useSyncStore from './sync';
++import { measure } from '../lib/performance';
+ 
+ // Import all stores that need to be hydrated from the snapshot
+ import { useAppStatusStore } from './appStatus';
+@@ -43,7 +44,7 @@
+   return pendingPromise;
+ };
+ 
+-const executeFetchSnapshot = async () => {
++const _executeFetchSnapshot = async () => {
+   try {
+     const url = '/api/shell';
+     const state = await http<Partial<RootState>>(url);
+@@ -95,3 +96,5 @@
+     debounceTimer = null;
+   }
+ };
++
++const executeFetchSnapshot = measure(_executeFetchSnapshot, 'fetchSnapshot');
+
+``````diff
+--- a/src/stores/conflicts.ts
++++ b/src/stores/conflicts.ts
+@@ -2,6 +2,8 @@
+ import { http } from "../lib/http";
+ import { createProjectScopedStore } from './projectScoped';
+ 
++import { measure } from '@/lib/performance';
++
+ export type ConflictsState = RootState["review"];
+ 
+ type ConflictsActions = {
+@@ -19,17 +21,17 @@
+   patch: (p) => set(p),
+   reset: () => set({ ...INITIAL_STATE.review }),
+ 
+-  async load(sessionId) {
++  load: measure(async (sessionId) => {
+     const res = await http<any>(`/api/conflicts/${encodeURIComponent(sessionId)}`);
+     set({ conflicts: res });
+-  },
++  }, 'conflicts.load'),
+ 
+-  async resolve(sessionId, decisions) {
++  resolve: measure(async (sessionId, decisions) => {
+     await http<{ success: true; resolved: number }>(
+       `/api/conflicts/${encodeURIComponent(sessionId)}/resolve`,
+       {
+         method: "POST",
+         body: JSON.stringify({ decisions }),
+       }
+     );
+-  },
++  }, 'conflicts.resolve'),
+   resolveHunk: (hunkId, choice, manualText) => {
+     const { conflicts } = get();
+     if (!conflicts) return;
+
+``````diff
+--- a/src/stores/console.ts
++++ b/src/stores/console.ts
+@@ -1,5 +1,6 @@
+ import { immer } from 'zustand/middleware/immer';
+ import { http } from '@/lib/http';
++import { measure } from '@/lib/performance';
+ import { createProjectScopedStore } from './projectScoped';
+ 
+ export type consolePane = {
+@@ -118,41 +119,41 @@
+     isConnected: false,
+     error: null,
+     eventSource: null,
+-
+-    fetchStatus: async () => {
++    
++    fetchStatus: measure(async () => {
+       set({ isLoading: true });
+       try {
+         const response = await http<consoleStatus>('/api/console/status');
+         set({ status: response, isLoading: false, error: null });
+       } catch (error) {
+         console.error('Failed to fetch console status:', error);
+         set({ isLoading: false, error: 'Failed to fetch status.' });
+       }
+-    },
+-
+-    startSession: async () => {
++    }, 'console.fetchStatus'),
++
++    startSession: measure(async () => {
+       set({ isLoading: true });
+       try {
+         await http('/api/console/start', { method: 'POST' });
+         await get().fetchStatus();
+       } catch (error) {
+         console.error('Failed to start console session:', error);
+         set({ isLoading: false, error: 'Failed to start session.' });
+       }
+-    },
+-
+-    stopSession: async () => {
++    }, 'console.startSession'),
++
++    stopSession: measure(async () => {
+       set({ isLoading: true });
+       try {
+         await http('/api/console/stop', { method: 'POST' });
+         await get().fetchStatus();
+       } catch (error) {
+         console.error('Failed to stop console session:', error);
+         set({ isLoading: false, error: 'Failed to stop session.' });
+       }
+-    },
++    }, 'console.stopSession'),
+ 
+     connect: () => {
+       if (get().eventSource) {
+@@ -212,25 +213,25 @@
+       }
+     },
+ 
+-    resizePane: async (paneId: string, rows: number, cols: number) => {
++    resizePane: measure(async (paneId: string, rows: number, cols: number) => {
+       try {
+         await http(`/api/console/panes/${paneId}/resize`, {
+           method: 'POST',
+           headers: { 'Content-Type': 'application/json' },
+           body: JSON.stringify({ rows, cols }),
+         });
+       } catch (error) {
+         console.error(`Failed to resize pane ${paneId}:`, error);
+       }
+-    },
+-
+-    sendPaneInput: async (paneId: string, data: string) => {
++    }, 'console.resizePane'),
++
++    sendPaneInput: measure(async (paneId: string, data: string) => {
+       try {
+         await http(`/api/console/panes/${paneId}/stdin`, {
+           method: 'POST',
+           headers: { 'Content-Type': 'application/json' },
+           body: JSON.stringify({ data }),
+         });
+       } catch (error) {
+         console.error(`Failed to send input to pane ${paneId}:`, error);
+       }
+-    },
++    }, 'console.sendPaneInput'),
+   }))
+ );
+
+``````diff
+--- a/src/stores/contextBundles.ts
++++ b/src/stores/contextBundles.ts
+@@ -1,5 +1,6 @@
+ import { RootState, INITIAL_STATE } from "../core/state-shape";
+ import { http } from "../lib/http";
++import { measure } from '@/lib/performance';
+ import { createProjectScopedStore } from './projectScoped';
+ 
+ export type ContextBundlesState = RootState["contextBundles"];
+@@ -17,7 +18,7 @@
+   patch: (p) => set(p),
+   reset: () => set({ ...INITIAL_STATE.contextBundles }),
+ 
+-  async build(taskId) {
++  build: measure(async (taskId) => {
+     const res = await http<{ bundleId: string; items: any[]; tokensUsed: number; budget: { soft: number; hard: number } }>(
+       `/api/context/build`,
+       { method: "POST", body: JSON.stringify({ taskId }) }
+@@ -37,7 +38,7 @@
+     });
+ 
+     return res.bundleId;
+-  },
++  }, 'contextBundles.build'),
+   
+   async hydrate(bundleId) {
+       console.warn("hydrate not implemented in mock for context bundles");
+
+``````diff
+--- a/src/stores/files.ts
++++ b/src/stores/files.ts
+@@ -1,5 +1,6 @@
+ import { RootState, INITIAL_STATE, CoverageInfo } from "../core/state-shape";
+ import { http } from "../lib/http";
++import { measure } from "@/lib/performance";
+ 
+ import { simpleHash } from "@/lib/utils";
+ import { createProjectScopedStore } from './projectScoped';
+@@ -19,7 +20,7 @@
+   patch: (p) => set(p),
+   reset: () => set({ ...INITIAL_STATE.files }),
+ 
+-  async loadFile(path) {
++  loadFile: measure(async (path) => {
+     const res = await http<{ path: string; content: string; encoding: string; size: number; coverage?: CoverageInfo, coverageDesynced?: boolean }>(
+       `/api/files/content?path=${encodeURIComponent(path)}`
+     );
+@@ -32,5 +33,5 @@
+       coverageDesynced: res.coverageDesynced ?? false,
+     };
+     set({ cachedContents } as Partial<FilesState>);
+-  },
++  }, 'files.loadFile'),
+ }));
+
+``````diff
+--- a/src/stores/git.ts
++++ b/src/stores/git.ts
+@@ -1,5 +1,6 @@
+ import { createProjectScopedStore } from './projectScoped';
+ import { http } from '@/lib/http';
++import { measure } from '@/lib/performance';
+ import { toast } from 'sonner';
+ 
+ export interface GitFileStatus {
+@@ -39,7 +40,7 @@
+ export const useGitStore = createProjectScopedStore<GitState & GitActions>('git', (set, get) => ({
+     ...initialState,
+     setCommitMessage: (message) => set({ commitMessage: message }),
+-    fetchStatus: async () => {
++    fetchStatus: measure(async () => {
+         set({ isLoading: true });
+         try {
+             const status = await http<GitStatus>('/api/git/status');
+@@ -51,8 +52,8 @@
+         } finally {
+             set({ isLoading: false });
+         }
+-    },
+-    fetchAheadBehind: async () => {
++    }, 'git.fetchStatus'),
++    fetchAheadBehind: measure(async () => {
+         try {
+             const data = await http<{ ahead: number; behind: number } | null>('/api/git/ahead-behind');
+             set({ aheadBehind: data });
+@@ -60,8 +61,8 @@
+             // This can fail gracefully if there's no remote, so don't show a toast.
+             console.error("Failed to get ahead/behind status:", error.message);
+             set({ aheadBehind: null });
+         }
+-    },
+-    syncWithOrigin: async () => {
++    }, 'git.fetchAheadBehind'),
++    syncWithOrigin: measure(async () => {
+         set({ isLoading: true });
+         const toastId = toast.loading("Syncing with origin...");
+         try {
+@@ -73,69 +74,69 @@
+         } finally {
+             set({ isLoading: false });
+         }
+-    },
+-    stageFiles: async (files) => {
++    }, 'git.syncWithOrigin'),
++    stageFiles: measure(async (files) => {
+         try {
+             await http('/api/git/stage', {
+                 method: 'POST',
+                 body: JSON.stringify({ files }),
+             });
+             await get().fetchStatus();
+         } catch (error: any) {
+             toast.error("Failed to stage files", { description: error.message });
+         }
+-    },
+-    unstageFiles: async (files) => {
++    }, 'git.stageFiles'),
++    unstageFiles: measure(async (files) => {
+         try {
+             await http('/api/git/unstage', {
+                 method: 'POST',
+                 body: JSON.stringify({ files }),
+             });
+             await get().fetchStatus();
+         } catch (error: any) {
+             toast.error("Failed to unstage files", { description: error.message });
+         }
+-    },
+-    discardUnstagedChanges: async (files) => {
++    }, 'git.unstageFiles'),
++    discardUnstagedChanges: measure(async (files) => {
+         if (files.length === 0) return;
+         try {
+             await http('/api/git/checkout', {
+                 method: 'POST',
+                 body: JSON.stringify({ files }),
+             });
+             await get().fetchStatus();
+         } catch (error: any) {
+             toast.error("Failed to discard changes", { description: error.message });
+         }
+-    },
+-    discardUntrackedFiles: async (files) => {
++    }, 'git.discardUnstagedChanges'),
++    discardUntrackedFiles: measure(async (files) => {
+         if (files.length === 0) return;
+         try {
+             await http('/api/git/clean', {
+                 method: 'POST',
+                 body: JSON.stringify({ files }),
+             });
+             await get().fetchStatus();
+         } catch (error: any) {
+             toast.error("Failed to discard untracked files", { description: error.message });
+         }
+-    },
+-    commit: async () => {
++    }, 'git.discardUntrackedFiles'),
++    commit: measure(async () => {
+         const { commitMessage } = get();
+         if (!commitMessage.trim()) {
+             toast.error("Commit message cannot be empty.");
+             return;
+         }
+         try {
+             await http('/api/git/commit', {
+                 method: 'POST',
+                 body: JSON.stringify({ message: commitMessage }),
+             });
+             toast.success("Commit successful!");
+             set({ commitMessage: '' });
+             await get().fetchStatus();
+         } catch (error: any) {
+             toast.error("Commit failed", { description: error.message });
+         }
+-    },
+-    createProposalFromStaged: async (providerId?: string) => {
++    }, 'git.commit'),
++    createProposalFromStaged: measure(async (providerId?: string) => {
+         const { commitMessage: instructions } = get();
+         set({ isGeneratingCommitMessage: true });
+         const toastId = toast.loading("Generating commit message...");
+@@ -155,5 +156,5 @@
+         } finally {
+             set({ isGeneratingCommitMessage: false });
+         }
+-    }
++    }, 'git.createProposalFromStaged')
+ }));
+
+``````diff
+--- a/src/stores/indexing.ts
++++ b/src/stores/indexing.ts
+@@ -1,5 +1,6 @@
+ import { RootState, INITIAL_STATE } from "../core/state-shape";
+ import { http } from "../lib/http";
++import { measure } from "@/lib/performance";
+ import { createProjectScopedStore } from './projectScoped';
+ 
+ export type IndexState = RootState["index"];
+@@ -17,21 +18,21 @@
+   patch: (p) => set(p),
+   reset: () => set({ ...INITIAL_STATE.index }),
+ 
+-  async start(paths, force) {
++  start: measure(async (paths, force) => {
+     const res = await http<{ indexId: string; status: string; estimatedTime: number }>(`/api/index/start`, {
+       method: "POST",
+       body: JSON.stringify({ paths, force }),
+     });
+     set({ status: "indexing" } as Partial<IndexState>);
+     return res.indexId;
+-  },
++  }, 'indexing.start'),
+ 
+-  async poll(indexId) {
++  poll: measure(async (indexId) => {
+     const res = await http<{
+       indexId: string; status: "indexing" | "complete"; progress: number;
+       filesProcessed: number; symbolsExtracted: number; testsDiscovered: number;
+     }>(`/api/index/${encodeURIComponent(indexId)}/status`);
+     set({
+       status: res.status === "complete" ? "ready" : "indexing",
+       stats: {
+@@ -43,5 +44,5 @@
+       progress: res.progress,
+       lastUpdatedAt: new Date().toISOString(),
+     } as Partial<IndexState>);
+-  },
++  }, 'indexing.poll'),
+ }));
+
+``````diff
+--- a/src/stores/mobile.ts
++++ b/src/stores/mobile.ts
+@@ -3,6 +3,7 @@
+ import { toast } from 'sonner';
+ import { fetchSnapshot } from './app';
+ import { INITIAL_STATE, MobileSessionsState } from '@/core/state-shape';
++import { measure } from '@/lib/performance';
+ 
+ type MobileActions = {
+   patch: (p: Partial<MobileSessionsState>) => void;
+@@ -13,7 +14,7 @@
+ export const useMobileStore = create<MobileSessionsState & MobileActions>((set) => ({
+   ...INITIAL_STATE.mobileSessions,
+   patch: (p) => set(p),
+-  disconnectDevice: async (deviceId) => {
++  disconnectDevice: measure(async (deviceId) => {
+     const toastId = toast.loading(`Disconnecting device...`);
+     try {
+       await http<void>('/api/auth/logout-device', {
+@@ -26,8 +27,8 @@
+       console.error('Failed to disconnect device', e);
+       toast.error('Failed to disconnect device.', { id: toastId, description: e.message });
+     }
+-  },
+-  logout: async () => {
++  }, 'mobile.disconnectDevice'),
++  logout: measure(async () => {
+     const toastId = toast.loading('Logging out...');
+     try {
+         // Optimistically log out on the client, but also tell the server
+@@ -47,5 +48,5 @@
+         toast.error('Could not log out from server, but you have been logged out locally.', { id: toastId, description: e.message });
+         window.location.href = '/pages/onboarding/mobile-auth';
+     }
+-  }
++  }, 'mobile.logout')
+ }));
+
+``````diff
+--- a/src/stores/notifications.ts
++++ b/src/stores/notifications.ts
+@@ -1,5 +1,6 @@
+ import { create } from "zustand";
+ import { RootState, INITIAL_STATE, Notification } from "../core/state-shape";
++import { measure } from "@/lib/performance";
+ import { http } from "../lib/http";
+ 
+ export type NotificationsState = RootState["notifications"];
+@@ -20,7 +21,7 @@
+   patch: (p) => set(p),
+   reset: () => set({ ...INITIAL_STATE.notifications }),
+ 
+-  fetchAll: async () => {
++  fetchAll: measure(async () => {
+     try {
+       const [activeRes, archivedRes] = await Promise.all([
+         http<{ notifications: Notification[]; unreadCount: number }>('/api/notifications?filter=active'),
+@@ -41,31 +42,31 @@
+     } catch (e) {
+       console.error("Failed to fetch notifications", e);
+     }
+-  },
++  }, 'notifications.fetchAll'),
+ 
+-  markRead: async (ids) => {
++  markRead: measure(async (ids) => {
+     if (ids.length === 0) return;
+     await http<void>('/api/notifications/read', {
+           method: 'POST',
+           body: JSON.stringify({ ids })
+     });
+     // Let the websocket message handle the state update
+-  },
++  }, 'notifications.markRead'),
+ 
+-  archive: async (ids: string[]) => {
++  archive: measure(async (ids: string[]) => {
+     if (ids.length === 0) return;
+     await http<void>('/api/notifications/archive', {
+         method: 'POST',
+         body: JSON.stringify({ ids }),
+     });
+     // Let the websocket message handle the state update
+-  },
++  }, 'notifications.archive'),
+ 
+-  snooze: async (ids: string[], until: string) => {
++  snooze: measure(async (ids: string[], until: string) => {
+     if (ids.length === 0) return;
+     try {
+       for (const id of ids) {
+         await http<void>('/api/notifications/snooze', {
+           method: 'POST',
+           body: JSON.stringify({ id, until }),
+         });
+@@ -75,5 +76,5 @@
+     } catch (e: any) {
+       console.error("Failed to snooze notification(s)", e);
+     }
+-  },
++  }, 'notifications.snooze'),
+ }));
+
+```
+```diff
+--- a/src/stores/projects.ts
++++ b/src/stores/projects.ts
+@@ -3,6 +3,7 @@
+ import { http } from "../lib/http";
+ import { toast } from "sonner";
+ import { fetchSnapshot } from "./app";
++import { measure } from "@/lib/performance";
+ import { useUiStore } from "./ui";
+ 
+ export type ProjectsState = RootState["projects"];
+@@ -26,7 +27,7 @@
+   patch: (p) => set(p),
+   reset: () => set({ ...INITIAL_STATE.projects }),
+ 
+-  async loadProjects() {
++  loadProjects: measure(async () => {
+     try {
+       const projects = await http<Project[]>("/api/projects");
+       const previousById = get().byId || {};
+@@ -46,20 +47,20 @@
+       console.error("Failed to load projects", error);
+       toast.error("Failed to load projects.");
+     }
+-  },
++  }, 'projects.loadProjects'),
+ 
+-  async createProject(projectData) {
++  createProject: measure(async (projectData) => {
+     const newProject = await http<Project>("/api/projects", {
+       method: "POST",
+       body: JSON.stringify(projectData),
+     });
+     await fetchSnapshot(); // Refresh entire state
+     toast.success(`Project "${newProject.name}" created.`);
+     return newProject;
+-  },
++  }, 'projects.createProject'),
+ 
+-  async selectProject(projectId) {
++  selectProject: measure(async (projectId) => {
+     if (!projectId) {
+       set({ activeProjectId: null });
+       useUiStore.getState().setIsFileExplorerSearchVisible(false);
+@@ -72,25 +73,25 @@
+     useUiStore.getState().setIsFileExplorerSearchVisible(false);
+     useUiStore.getState().setIsGitPanelVisible(false);
+     await fetchSnapshot(); // The backend has now switched context
+-  },
++  }, 'projects.selectProject'),
+ 
+-  async removeProject(projectId) {
++  removeProject: measure(async (projectId) => {
+     await http(`/api/projects/${projectId}`, {
+       method: "DELETE",
+     });
+     await fetchSnapshot();
+     toast.success("Project removed.");
+-  },
++  }, 'projects.removeProject'),
+ 
+-  async connectProvider(provider, token) {
++  connectProvider: measure(async (provider, token) => {
+     const res = await http<{ orgsAvailable: Project["orgsAvailable"] }>("/api/projects/connect_provider", {
+       method: "POST",
+       body: JSON.stringify({ provider, token }),
+     });
+     return { orgsAvailable: res.orgsAvailable, provider };
+-  },
+-  async updateProject(projectId, updates) {
++  }, 'projects.connectProvider'),
++  updateProject: measure(async (projectId, updates) => {
+     try {
+       const response = await http<Project>(`/api/projects/${projectId}`, {
+         method: 'PATCH',
+@@ -109,5 +110,5 @@
+     } catch (e: any) {
+       toast.error('Failed to update project.', { description: e.message });
+     }
+-  },
++  }, 'projects.updateProject'),
+ }));
+
+```
+```diff
+--- a/src/stores/proposals.ts
++++ b/src/stores/proposals.ts
+@@ -7,6 +7,7 @@
+ import { toast } from "sonner";
+ import { useReviewStore } from "./review";
+ import { fetchSnapshot } from "./app";
++import { measure } from "@/lib/performance";
+ import { useSettingsStore } from "./settings";
+ import { createProjectScopedStore } from "./projectScoped";
+ 
+@@ -48,7 +49,7 @@
+     patch: (p) => set(p),
+     reset: () => set({ ...INITIAL_STATE.proposals }),
+ 
+-    async generate(taskId, contextBundleId) {
++    generate: measure(async (taskId, contextBundleId) => {
+       const res = await http<{
+         proposalId: string;
+         taskId: string;
+@@ -79,9 +80,9 @@
+       });
+ 
+       return res.proposalId;
+-    },
+-
+-    apply: async (taskId, proposalId) => {
++    }, 'proposals.generate'),
++
++    apply: measure(async (taskId, proposalId) => {
+       const { selections } = useReviewStore.getState();
+ 
+       try {
+@@ -98,11 +99,11 @@
+         await fetchSnapshot(); // Fetch to revert to consistent state
+         throw e;
+       }
+-    },
+-
+-    stageProposal: async (proposalId: string) => {
++    }, 'proposals.apply'),
++
++    stageProposal: measure(async (proposalId: string) => {
+       const { selections, editedContent } = useReviewStore.getState();
+       try {
+         await http<void>(`/api/proposals/${proposalId}/stage`, {
+@@ -114,11 +115,11 @@
+       } catch (e: any) {
+         throw e;
+       }
+-    },
+-
+-    closeProposal: async (taskId, proposalId): Promise<{ taskClosed: boolean }> => {
++    }, 'proposals.stageProposal'),
++
++    closeProposal: measure(async (taskId, proposalId): Promise<{ taskClosed: boolean }> => {
+       const toastId = toast.loading("Closing proposal...");
+       try {
+         await http<void>("/api/proposals/close", {
+@@ -141,9 +142,9 @@
+         });
+         await fetchSnapshot();
+         throw e;
+       }
+-    },
+-
+-    unstageProposal: async (proposalId: string) => {
++    }, 'proposals.closeProposal'),
++
++    unstageProposal: measure(async (proposalId: string) => {
+       // This action reverts a proposal from a "staged" state back to its original diff-based state.
+       // It's called when entering the review page to ensure a clean slate.
+       try {
+@@ -153,8 +154,8 @@
+         });
+         await fetchSnapshot(); // Refresh state to get the clean proposal
+       } catch (e: any) {}
+-    },
+-    proposeFix: async (payload) => {
++    }, 'proposals.unstageProposal'),
++    proposeFix: measure(async (payload) => {
+       const { interactionMode, llmProviderId } =
+         useSettingsStore.getState().workspace;
+       const toastId = toast.loading("Requesting AI to propose a fix...");
+@@ -183,8 +184,8 @@
+         });
+         return null;
+       }
+-    },
+-    respondToProposal: async (taskId, parentProposalId, feedback) => {
++    }, 'proposals.proposeFix'),
++    respondToProposal: measure(async (taskId, parentProposalId, feedback) => {
+       const toastId = toast.loading(
+         "Sending feedback to generate a new proposal..."
+       );
+@@ -204,8 +205,8 @@
+         });
+         return null;
+       }
+-    },
+-    loadProposalsForTask: async (taskId: string) => {
++    }, 'proposals.respondToProposal'),
++    loadProposalsForTask: measure(async (taskId: string) => {
+       try {
+         const res = await http< Proposal[] >(
+           `/api/proposals?task_id=${taskId}`
+@@ -223,7 +224,7 @@
+       } catch (e: any) {
+         toast.error("Failed to load proposals", { description: e.message });
+       }
+-    },
++    }, 'proposals.loadProposalsForTask'),
+   })
+ );
+ 
+
+```
+```diff
+--- a/src/stores/review.ts
++++ b/src/stores/review.ts
+@@ -1,5 +1,6 @@
+ import { RootState, INITIAL_STATE, ValidationStatus } from "../core/state-shape";
+ import { http } from "@/lib/http";
++import { measure } from "@/lib/performance";
+ import { createProjectScopedStore } from "./projectScoped";
+ 
+ export type ReviewState = RootState["review"];
+@@ -52,7 +53,7 @@
+       }
+     }));
+   },
+-  validateHunkContent: async (proposalId, hunkId, filePath, content) => {
++  validateHunkContent: measure(async (proposalId, hunkId, filePath, content) => {
+     try {
+       get().setHunkValidationStatus(hunkId, { status: 'pending' });
+       const res = await http<{ isValid: boolean, error?: any }>('/api/validators/parse-ast', {
+@@ -69,5 +70,5 @@
+       console.error("Validation failed", e);
+       get().setHunkValidationStatus(hunkId, { status: 'invalid', error: { line: 0, column: 0, message: 'Validation request failed' } });
+     }
+-  },
++  }, 'review.validateHunkContent'),
+ }));
+
+```
+```diff
+--- a/src/stores/search.ts
++++ b/src/stores/search.ts
+@@ -1,5 +1,6 @@
+ import { http } from "../lib/http";
+ import { createProjectScopedStore } from "./projectScoped";
++import { measure } from "@/lib/performance";
+ 
+ export type SearchResult = {
+   type: string;
+@@ -47,7 +48,7 @@
+     delete newFilters[filterKey];
+     get().setFilters(newFilters);
+   },
+-  performSearch: async (query, type, filters) => {
++  performSearch: measure(async (query, type, filters) => {
+     if (!query.trim() && Object.keys(filters ?? {}).length === 0) {
+       set({ results: [], loading: false, error: null });
+       return;
+@@ -68,6 +69,6 @@
+       set({ results: res.results, loading: false });
+     } catch (e: any) {
+       set({ error: e.message || "Search failed", loading: false, results: [] });
+     }
+-  },
++  }, 'search.performSearch'),
+   reset: () => set(initialState),
+ }));
+
+```
+```diff
+--- a/src/stores/settings.ts
++++ b/src/stores/settings.ts
+@@ -1,5 +1,6 @@
+ import { create } from "zustand";
+ import { RootState, INITIAL_STATE } from "../core/state-shape";
++import { measure } from "@/lib/performance";
+ import { http } from "@/lib/http";
+ import { toast } from "sonner";
+ export type SettingsState = RootState["settings"];
+@@ -37,7 +38,7 @@
+     }, 1000); // Debounce for 1 second
+   },
+   reset: () => set({ ...INITIAL_STATE.settings }),
+-  saveSettings: async (settingsToSave) => {
++  saveSettings: measure(async (settingsToSave) => {
+     try {
+       await http('/api/settings', {
+           method: 'POST',
+@@ -48,16 +49,16 @@
+         console.error("Failed to save settings:", e);
+         toast.error("Failed to save settings.", { description: e.message });
+     }
+-  },
+-  saveProviderLimits: async (limits) => {
++  }, 'settings.saveSettings'),
++  saveProviderLimits: measure(async (limits) => {
+     try {
+         await http('/api/settings/save-provider-limits', {
+           method: 'POST',
+           body: JSON.stringify({ limits }),
+         });
+     } catch (e: any) {
+         toast.error("Failed to save provider limits.", { description: e.message });
+     }
+-  },
++  }, 'settings.saveProviderLimits'),
+ }));
+ 
+ 
+
+```
+```diff
+--- a/src/stores/tasks.ts
++++ b/src/stores/tasks.ts
+@@ -3,6 +3,7 @@
+ import { http } from "@/lib/http";
+ import { useContextBundlesStore } from "@/stores/contextBundles";
+ import { createProjectScopedStore } from "./projectScoped";
++import { measure } from "@/lib/performance";
+ 
+ import { toast } from "sonner";
+ export type TasksState = RootState["tasks"];
+@@ -32,7 +33,7 @@
+   patch: (p) => set(p),
+   reset: () => set({ ...INITIAL_STATE.tasks, loading: false }),
+ 
+-  async create(draft, draftId) {
++  create: measure(async (draft, draftId) => {
+     try {
+       const res = await http<{ taskId: string; status: string; createdAt: string }>(`/api/tasks`, {
+         method: "POST",
+@@ -53,9 +54,9 @@
+       toast.error('Failed to create task. Please try again.');
+       throw e;
+     }
+-  },
++  }, 'tasks.create'),
+ 
+-  async loadTasks(projectId) {
++  loadTasks: measure(async (projectId) => {
+     set({ loading: true });
+     try {
+       const {tasks} = await http<{tasks: Task[]}>(`/api/tasks?project_id=${encodeURIComponent(projectId)}`);
+@@ -70,16 +71,16 @@
+       });
+       set({ loading: false });
+     }
+-  },
++  }, 'tasks.loadTasks'),
+ 
+-  async loadTask(taskId) {
++  loadTask: measure(async (taskId) => {
+     const task = await http<any>(`/api/tasks/${encodeURIComponent(taskId)}`);
+     const byId = { ...(get().byId || {}) };
+     byId[taskId] = task;
+     const list = get().list?.includes(taskId) ? get().list : [taskId, ...(get().list || [])];
+     set({ byId, list, activeTaskId: taskId } as Partial<TasksState>);
+-  },
++  }, 'tasks.loadTask'),
+ 
+   select: (taskId) => set({ activeTaskId: taskId } as Partial<TasksState>),
+ 
+@@ -109,7 +110,7 @@
+       },
+     })),
+ 
+-  reopen: async (taskId: string) => {
++  reopen: measure(async (taskId: string) => {
+     const originalTask = get().byId[taskId];
+     try {
+       await http<void>(`/api/tasks/${taskId}/reopen`, {
+@@ -121,9 +122,9 @@
+       // No need to rollback optimistic update as we are refetching state on any action.
+       toast.error("Failed to reopen task", { description: e.message });
+     }
+-  },
++  }, 'tasks.reopen'),
+ 
+-  closeTask: async (taskId: string) => {
++  closeTask: measure(async (taskId: string) => {
+     const originalTask = get().byId[taskId];
+     try {
+       await http<void>(`/api/tasks/${taskId}/close`, {
+@@ -135,9 +136,9 @@
+       // Refetch state to ensure consistency after a failed action
+       await fetchSnapshot();
+     }
+-  },
++  }, 'tasks.closeTask'),
+ 
+-  createFollowUp: async (sourceTaskId) => {
++  createFollowUp: measure(async (sourceTaskId) => {
+     const sourceTask = get().byId[sourceTaskId];
+     if (!sourceTask) {
+         throw new Error("Source task not found for follow-up.");
+@@ -166,7 +167,7 @@
+     }));
+     
+     return newDraftId;
+-  },
++  }, 'tasks.createFollowUp'),
+ }));
+ 
+ 
+
+```
+```diff
+--- a/src/stores/validators.ts
++++ b/src/stores/validators.ts
+@@ -1,5 +1,6 @@
+ import { INITIAL_STATE, ValidatorProgress, ValidatorsState } from "../core/state-shape";
+ import { http } from "../lib/http";
++import { measure } from "@/lib/performance";
+ import { useReviewStore } from "./review";
+ import { toast } from 'sonner';
+ import { createProjectScopedStore } from "./projectScoped";
+@@ -19,7 +20,7 @@
+   patch: (p) => set(p),
+   reset: () => set({ ...INITIAL_STATE.validators }),
+ 
+-  async run(input) {
++  run: measure(async (input) => {
+     const { selections, editedContent } = useReviewStore.getState();
+ 
+     // New Step 1: Stage the reviewed content before validation.
+@@ -59,9 +60,9 @@
+     });
+ 
+     return res.runId;
+-  },
++  }, 'validators.run'),
+ 
+-  async poll(runId) {
++  poll: measure(async (runId) => {
+     try {
+       const res = await http<{
+         runId: string;
+@@ -103,9 +104,9 @@
+     } catch (error) {
+       console.error(`Polling failed for runId ${runId}:`, error);
+     }
+-  },
++  }, 'validators.poll'),
+ 
+-  runFullCoverage: async () => {
++  runFullCoverage: measure(async () => {
+       const toastId = toast.loading("Starting full project coverage scan...");
+       try {
+         const res = await http<{ runId: string; status: string }>(`/api/validators/run-full-coverage`, {
+@@ -128,10 +129,10 @@
+     } catch (e: any) {
+       toast.error("Failed to start coverage scan.", { id: toastId, description: e.message });
+       throw e;
+     }
+-  },
++  }, 'validators.runFullCoverage'),
+ 
+-  runTestsForFiles: async (files: string[]) => {
++  runTestsForFiles: measure(async (files: string[]) => {
+     const toastId = toast.loading("Starting test run...");
+     try {
+       const res = await http<{ runId: string; status: string }>('/api/validators/run-tests-for-files', {
+@@ -154,10 +155,10 @@
+       toast.error("Failed to start test run.", { id: toastId, description: e.message });
+       throw e;
+     }
+-  },
++  }, 'validators.runTestsForFiles'),
+ 
+-  loadResultsForProject: async (projectId: string) => {
++  loadResultsForProject: measure(async (projectId: string) => {
+     // try {
+     //   const res = await http<ValidatorResults>(`/api/validators/results?project_id=${encodeURIComponent(projectId)}`);
+     //   set((state) => ({
+@@ -171,5 +172,5 @@
+     //   console.error("Failed to load project validator results", e);
+     //   toast.error("Failed to load validator results.", { description: e.message });
+     // }
+-  },
++  }, 'validators.loadResultsForProject'),
+ }));
+
+```
+```diff
+--- a/src/stores/workspace.ts
++++ b/src/stores/workspace.ts
+@@ -4,6 +4,7 @@
+ import { useSettingsStore } from "./settings";
+ import { FileNode } from "@/pages/workspace/types";
+ import { createProjectScopedStore } from "./projectScoped";
++import { measure } from "@/lib/performance";
+ 
+ // Helper functions for localStorage persistence
+ const TOKEN_BUDGET_STORAGE_KEY = 'workspace_token_budget';
+@@ -101,7 +102,7 @@
+  */
+ export const useWorkspaceStore = createProjectScopedStore<WorkspaceState & WorkspaceActions>('workspace', (set, get) => ({
+   ...initialState,
+-  pasteToTask: async (payload: PasteToTaskPayload) => {
++  pasteToTask: measure(async (payload: PasteToTaskPayload) => {
+     const response = await http<any>("/api/workspace/paste-to-task", {
+       method: "POST",
+       body: JSON.stringify(payload),
+@@ -118,8 +119,8 @@
+       }
+     }
+     return response;
+-  },
+-  findRelevantFiles: async ({ seedFiles, tokenBudget }) => {
++  }, 'workspace.pasteToTask'),
++  findRelevantFiles: measure(async ({ seedFiles, tokenBudget }) => {
+     const tb = tokenBudget === "unlimited" ? 1000000 : tokenBudget;
+     try {
+       const result = await http<string[]>("/api/context/from-file", {
+@@ -133,8 +134,8 @@
+       toast.error("Failed to find relevant files.", { description: e.message });
+       return null;
+     }
+-  },
+-  findRelevantFilesFromInstructions: async ({ instructions, tokenBudget }, signal) => {
++  }, 'workspace.findRelevantFiles'),
++  findRelevantFilesFromInstructions: measure(async ({ instructions, tokenBudget }, signal) => {
+     const tb = tokenBudget === "unlimited" ? 1000000 : tokenBudget;
+     try {
+       // This is a new endpoint that would need to be implemented on the backend.
+@@ -153,8 +154,8 @@
+       }
+       // Return null on abort or error
+       return null;
+     }
+-  },
+-  buildTestPromptAndAct: async (files, action) => {
++  }, 'workspace.findRelevantFilesFromInstructions'),
++  buildTestPromptAndAct: measure(async (files, action) => {
+     const toastId = toast.loading("Generating test improvement prompt...");
+     try {
+       const { prompt } = await http<{ prompt: string }>(
+@@ -204,9 +205,9 @@
+         description: e.message,
+       });
+       return null;
+     }
+-  },
+-
+-  fixFailingTests: async ({ testFilePath, runId }) => {
++  }, 'workspace.buildTestPromptAndAct'),
++
++  fixFailingTests: measure(async ({ testFilePath, runId }) => {
+     const toastId = toast.loading(`Starting AI fix for ${testFilePath}...`);
+     try {
+       const res = await http<{ taskId: string; model: string }>('/api/workspace/fix_tests', {
+@@ -219,7 +220,7 @@
+       toast.error("Failed to start test fix task.", { id: toastId, description: e.message });
+       return null;
+     }
+-  },
++  }, 'workspace.fixFailingTests'),
+ 
+   // State management actions
+   setState: (state) => set(state),
+
+``````
+# === RESULT ===
+23

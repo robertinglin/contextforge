@@ -36,13 +36,25 @@ def _context_before(text: str, idx: int, lines: int = 5) -> str:
     return "\n".join(parts)
 
 
+def _preprocess_fences(text: str) -> str:
+    """
+    Pre-processes markdown to handle ambiguous fence combinations.
+    Specifically, it splits a closing fence followed immediately by an opening
+    fence on the same line into two separate lines.
+    Example: '``````diff' becomes '```\n```diff'.
+    """
+    # This regex finds a fence of 3+ backticks or tildes (group 1)
+    # followed by another fence of 3+ of the same character plus an info string (group 2).
+    return re.sub(r"([`~]{3,})\s*([`~]{3,}[^\n\r]+)", r"\1\n\2", text)
+
 def extract_all_blocks_from_text(markdown_content: str) -> list[dict[str, object]]:
     """
     Extract all **top-level** fenced code blocks. This robust implementation
     correctly handles nested fences, same-line closers, and avoids false
     positives from fence-like sequences inside string literals.
     """
-    text = markdown_content
+    
+    text = _preprocess_fences(markdown_content)
     blocks: list[dict[str, object]] = []
 
     # Regex to find a potential OPENER at the start of a line.
