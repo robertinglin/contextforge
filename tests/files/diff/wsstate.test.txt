@@ -1,0 +1,309 @@
+import { useEffect, useRef, useMemo } from 'react';
+import { useProjectsStore } from '@/stores/projects';
+import { useDebounce } from '@/hooks/use-debounce';
+import { useWorkspaceStore } from '@/stores/workspace';
+import { useInstructionsStore } from '@/stores/instructions';
+
+export const useWorkspaceState = () => {
+  // Centralized workspace store
+  const workspaceState = useWorkspaceStore((state) => ({
+    instructions: state.instructions,
+    userSelectedFiles: state.userSelectedFiles,
+    includeFileTree: state.includeFileTree,
+    expandedFolders: state.expandedFolders,
+    openFilePath: state.openFilePath,
+    openFiles: state.openFiles,
+    previewFilePath: state.previewFilePath,
+    isAutoContextEnabled: state.isAutoContextEnabled,
+    tokenBudget: state.tokenBudget,
+  }));
+  const {
+    instructions,
+    userSelectedFiles,
+    includeFileTree,
+    expandedFolders,
+    openFilePath,
+    openFiles,
+    previewFilePath,
+  } = workspaceState;
+
+  // Store references
+  const { activeProjectId, byId: projectsById, updateProject } = useProjectsStore();
+  const activeProject = activeProjectId ? projectsById[activeProjectId] : null;
+
+  // State for managing hydration logic
+  const isStateLoadedRef = useRef(false);
+
+  // State persistence
+  const workspaceStateToPersist = useMemo(() => ({
+    selectedFiles: Array.from(userSelectedFiles),
+    instructions,
+    includeFileTree,
+    expandedFolders: Array.from(expandedFolders),
+    openFilePath,
+    openFiles,
+    previewFilePath,
+  }), [userSelectedFiles, instructions, includeFileTree, expandedFolders, openFilePath, openFiles, previewFilePath]);
+
+  const debouncedStateToPersist = useDebounce(workspaceStateToPersist, 1000);
+  const lastSavedStateRef = useRef<string>();
+  const prevProjectIdRef = useRef<string | null>(null);
+
+  // Persist state to project
+  useEffect(() => {
+    if (activeProjectId && isStateLoadedRef.current) {
+      const stateString = JSON.stringify(debouncedStateToPersist);
+      if (stateString !== lastSavedStateRef.current) {
+        updateProject(activeProjectId, { workspaceState: debouncedStateToPersist });
+        lastSavedStateRef.current = stateString;
+      }
+    }
+  }, [debouncedStateToPersist, activeProjectId, updateProject]);
+
+  // Persist user settings to localStorage
+  useEffect(() => {
+    try {
+      const userSettings = JSON.stringify({ isAutoContextEnabled: workspaceState.isAutoContextEnabled, tokenBudget: workspaceState.tokenBudget });
+      window.localStorage.setItem('workspace-user-settings', userSettings);
+    } catch (error) {
+      console.warn('Error saving workspace user settings to localStorage', error);
+    }
+  }, [workspaceState.isAutoContextEnabled, workspaceState.tokenBudget]);
+
+
+  // Hydrate state from project only when project ID changes
+  useEffect(() => {
+      if (!activeProject || prevProjectIdRef.current === activeProject.id) return;
+      const ws = activeProject.workspaceState as any;
+
+      let lastInstructionsUpdate = useInstructionsStore.getState().lastUpdated;
+
+      let instructions = ws?.instructions || '';
+      if (lastInstructionsUpdate + 5000 > Date.now() && lastInstructionsUpdate !== 0) {
+        instructions = useInstructionsStore.getState().instructions;
+      }
+
+      if (ws) {
+        useWorkspaceStore.setState({
+          userSelectedFiles: new Set(ws.selectedFiles || []),
+          includeFileTree: ws.includeFileTree || false,
+          expandedFolders: new Set(ws.expandedFolders || []),
+          openFilePath: ws.openFilePath,
+          openFiles: ws.openFiles || [],
+          previewFilePath: ws.previewFilePath || null,
+          instructions: instructions,
+        });
+        useInstructionsStore.getState().setInstructions(instructions || '');
+      } else {
+        // Reset to defaults only when switching to a project with no state
+        useWorkspaceStore.setState({
+          userSelectedFiles: new Set(),
+          includeFileTree: false,
+          expandedFolders: new Set(),
+          openFilePath: undefined,
+          openFiles: [],
+          previewFilePath: null,
+          instructions: instructions,
+        });
+        useInstructionsStore.getState().setInstructions(instructions);
+      }
+
+      console.log('STATE UPDATE?')
+
+      isStateLoadedRef.current = true;
+      prevProjectIdRef.current = activeProject.id;
+
+  }, [activeProject?.id, activeProject?.workspaceState]);
+
+  return { isStateLoaded: isStateLoadedRef.current };
+};
+# === TEST ===
+Of course! Dealing with state hydration and persistence can be tricky. To prevent the application from sending an unnecessary update to the backend immediately after switching projects, I'll modify the `useWorkspaceState` hook.
+
+The solution involves updating a reference to the last saved state right after the new project's state is loaded. This makes the persistence logic aware that the current state is "clean" and doesn't need to be saved again, preventing the unwanted update.
+
+Here are the changes for `src/hooks/workspace/useWorkspaceState.ts`:
+
+```diff
+--- a/src/hooks/workspace/useWorkspaceState.ts
++++ b/src/hooks/workspace/useWorkspaceState.ts
+@@ -69,40 +69,32 @@
+         instructions = useInstructionsStore.getState().instructions;
+       }
+ 
+-      if (ws) {
+-        useWorkspaceStore.setState({
+-          userSelectedFiles: new Set(ws.selectedFiles || []),
+-          includeFileTree: ws.includeFileTree || false,
+-          expandedFolders: new Set(ws.expandedFolders || []),
+-          openFilePath: ws.openFilePath,
+-          openFiles: ws.openFiles || [],
+-          previewFilePath: ws.previewFilePath || null,
+-          instructions: instructions,
+-        });
+-        useInstructionsStore.getState().setInstructions(instructions || '');
+-      } else {
+-        // Reset to defaults only when switching to a project with no state
+-        useWorkspaceStore.setState({
+-          userSelectedFiles: new Set(),
+-          includeFileTree: false,
+-          expandedFolders: new Set(),
+-          openFilePath: undefined,
+-          openFiles: [],
+-          previewFilePath: null,
+-          instructions: instructions,
+-        });
+-        useInstructionsStore.getState().setInstructions(instructions);
+-      }
++      const hydratedState = {
++        userSelectedFiles: new Set(ws?.selectedFiles || []),
++        includeFileTree: ws?.includeFileTree || false,
++        expandedFolders: new Set(ws?.expandedFolders || []),
++        openFilePath: ws?.openFilePath,
++        openFiles: ws?.openFiles || [],
++        previewFilePath: ws?.previewFilePath || null,
++        instructions: instructions,
++      };
++      useWorkspaceStore.setState(hydratedState);
++      useInstructionsStore.getState().setInstructions(instructions || '');
+ 
+-      console.log('STATE UPDATE?')
++      const newPersistedState = {
++        selectedFiles: Array.from(hydratedState.userSelectedFiles),
++        instructions: hydratedState.instructions,
++        includeFileTree: hydratedState.includeFileTree,
++        expandedFolders: Array.from(hydratedState.expandedFolders),
++        openFilePath: hydratedState.openFilePath,
++        openFiles: hydratedState.openFiles,
++        previewFilePath: hydratedState.previewFilePath,
++      };
++
++      // After hydrating, update the last saved state ref to prevent immediate re-saving.
++      lastSavedStateRef.current = JSON.stringify(newPersistedState);
+ 
+       isStateLoadedRef.current = true;
+       prevProjectIdRef.current = activeProject.id;
+ 
+   }, [activeProject?.id, activeProject?.workspaceState]);
+
+```
+
+I've refactored the hydration logic to be more concise and added the key step of updating `lastSavedStateRef` with the newly loaded state. This ensures that the debounced persistence check sees that the state is already in sync with its source, thus preventing the redundant update call to the backend.
+# === RESULT ===
+import { useEffect, useRef, useMemo } from 'react';
+import { useProjectsStore } from '@/stores/projects';
+import { useDebounce } from '@/hooks/use-debounce';
+import { useWorkspaceStore } from '@/stores/workspace';
+import { useInstructionsStore } from '@/stores/instructions';
+
+export const useWorkspaceState = () => {
+  // Centralized workspace store
+  const workspaceState = useWorkspaceStore((state) => ({
+    instructions: state.instructions,
+    userSelectedFiles: state.userSelectedFiles,
+    includeFileTree: state.includeFileTree,
+    expandedFolders: state.expandedFolders,
+    openFilePath: state.openFilePath,
+    openFiles: state.openFiles,
+    previewFilePath: state.previewFilePath,
+    isAutoContextEnabled: state.isAutoContextEnabled,
+    tokenBudget: state.tokenBudget,
+  }));
+  const {
+    instructions,
+    userSelectedFiles,
+    includeFileTree,
+    expandedFolders,
+    openFilePath,
+    openFiles,
+    previewFilePath,
+  } = workspaceState;
+
+  // Store references
+  const { activeProjectId, byId: projectsById, updateProject } = useProjectsStore();
+  const activeProject = activeProjectId ? projectsById[activeProjectId] : null;
+
+  // State for managing hydration logic
+  const isStateLoadedRef = useRef(false);
+
+  // State persistence
+  const workspaceStateToPersist = useMemo(() => ({
+    selectedFiles: Array.from(userSelectedFiles),
+    instructions,
+    includeFileTree,
+    expandedFolders: Array.from(expandedFolders),
+    openFilePath,
+    openFiles,
+    previewFilePath,
+  }), [userSelectedFiles, instructions, includeFileTree, expandedFolders, openFilePath, openFiles, previewFilePath]);
+
+  const debouncedStateToPersist = useDebounce(workspaceStateToPersist, 1000);
+  const lastSavedStateRef = useRef<string>();
+  const prevProjectIdRef = useRef<string | null>(null);
+
+  // Persist state to project
+  useEffect(() => {
+    if (activeProjectId && isStateLoadedRef.current) {
+      const stateString = JSON.stringify(debouncedStateToPersist);
+      if (stateString !== lastSavedStateRef.current) {
+        updateProject(activeProjectId, { workspaceState: debouncedStateToPersist });
+        lastSavedStateRef.current = stateString;
+      }
+    }
+  }, [debouncedStateToPersist, activeProjectId, updateProject]);
+
+  // Persist user settings to localStorage
+  useEffect(() => {
+    try {
+      const userSettings = JSON.stringify({ isAutoContextEnabled: workspaceState.isAutoContextEnabled, tokenBudget: workspaceState.tokenBudget });
+      window.localStorage.setItem('workspace-user-settings', userSettings);
+    } catch (error) {
+      console.warn('Error saving workspace user settings to localStorage', error);
+    }
+  }, [workspaceState.isAutoContextEnabled, workspaceState.tokenBudget]);
+
+
+  // Hydrate state from project only when project ID changes
+  useEffect(() => {
+      if (!activeProject || prevProjectIdRef.current === activeProject.id) return;
+      const ws = activeProject.workspaceState as any;
+
+      let lastInstructionsUpdate = useInstructionsStore.getState().lastUpdated;
+
+      let instructions = ws?.instructions || '';
+      if (lastInstructionsUpdate + 5000 > Date.now() && lastInstructionsUpdate !== 0) {
+        instructions = useInstructionsStore.getState().instructions;
+      }
+
+      const hydratedState = {
+        userSelectedFiles: new Set(ws?.selectedFiles || []),
+        includeFileTree: ws?.includeFileTree || false,
+        expandedFolders: new Set(ws?.expandedFolders || []),
+        openFilePath: ws?.openFilePath,
+        openFiles: ws?.openFiles || [],
+        previewFilePath: ws?.previewFilePath || null,
+        instructions: instructions,
+      };
+      useWorkspaceStore.setState(hydratedState);
+      useInstructionsStore.getState().setInstructions(instructions || '');
+
+      const newPersistedState = {
+        selectedFiles: Array.from(hydratedState.userSelectedFiles),
+        instructions: hydratedState.instructions,
+        includeFileTree: hydratedState.includeFileTree,
+        expandedFolders: Array.from(hydratedState.expandedFolders),
+        openFilePath: hydratedState.openFilePath,
+        openFiles: hydratedState.openFiles,
+        previewFilePath: hydratedState.previewFilePath,
+      };
+
+      // After hydrating, update the last saved state ref to prevent immediate re-saving.
+      lastSavedStateRef.current = JSON.stringify(newPersistedState);
+
+      isStateLoadedRef.current = true;
+      prevProjectIdRef.current = activeProject.id;
+
+  }, [activeProject?.id, activeProject?.workspaceState]);
+
+  return { isStateLoaded: isStateLoadedRef.current };
+};

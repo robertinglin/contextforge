@@ -793,7 +793,7 @@ def _find_all_hunk_candidates(
     
     # If no anchor candidates found but we have context, try matching on context alone
     # This handles cases where the deletion target doesn't exist but context is clear
-    if not anchor_candidates and changed_lines and (lead_ctx or tail_ctx):
+    if not anchor_candidates and changed_lines and (lead_ctx or tail_ctx) and not skip_anchor_approach:
         log.debug(f"No anchors found for changed lines, trying context-only matching")
         
         # Build a pattern from the context
