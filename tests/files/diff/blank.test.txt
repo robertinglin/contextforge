@@ -730,10 +730,10 @@ Here's my fix:
    const [isProviderMenuOpen, setIsProviderMenuOpen] = useState(false);
    const [longPressTimer, setLongPressTimer] = useState<ReturnType<
      typeof setTimeout
+   > | null>(null);
 +  const [mobileInstructions, setMobileInstructions] = useState(\"\");
 +  const isMobile = useIsMobile();
 +  const textareaRef = useRef<HTMLTextAreaElement>(null);
-   > | null>(null);
    const [touchStartPos, setTouchStartPos] = useState<{
      x: number;
 @@ -65,7 +66,6 @@ export const ContextBuilder = ({}) => {
@@ -997,10 +997,10 @@ export const ContextBuilder = ({}) => {
   const [isProviderMenuOpen, setIsProviderMenuOpen] = useState(false);
   const [longPressTimer, setLongPressTimer] = useState<ReturnType<
     typeof setTimeout
+  > | null>(null);
   const [mobileInstructions, setMobileInstructions] = useState(\"\");
   const isMobile = useIsMobile();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  > | null>(null);
   const [touchStartPos, setTouchStartPos] = useState<{
     x: number;
     y: number;
@@ -1063,21 +1063,6 @@ export const ContextBuilder = ({}) => {
   const [isTextareaFocused, setIsTextareaFocused] = React.useState(false);
   const [textareaHeight, setTextareaHeight] = React.useState(0);
   const [visualViewportHeight, setVisualViewportHeight] = React.useState(
-  const handleInstructionsBlur = () => {
-    // Only update instructions on blur for mobile
-    if (isMobile) {
-      setInstructions(mobileInstructions);
-      setCachedInstructionContext(new Set()); // Invalidate cache on blur
-    }
-  };
-
-  // Sync mobile instructions when instructions change from other sources
-  useEffect(() => {
-    if (isMobile && instructions !== mobileInstructions) {
-      setMobileInstructions(instructions);
-    }
-  }, [instructions, isMobile]);
-
     typeof window !== "undefined" ? window.innerHeight : 0
   );
 
@@ -1209,6 +1194,21 @@ export const ContextBuilder = ({}) => {
       setInlineSearchQuery("");
     }
   };
+
+  const handleInstructionsBlur = () => {
+    // Only update instructions on blur for mobile
+    if (isMobile) {
+      setInstructions(mobileInstructions);
+      setCachedInstructionContext(new Set()); // Invalidate cache on blur
+    }
+  };
+
+  // Sync mobile instructions when instructions change from other sources
+  useEffect(() => {
+    if (isMobile && instructions !== mobileInstructions) {
+      setMobileInstructions(instructions);
+    }
+  }, [instructions, isMobile]);
 
   const handleInlineSearchSelect = (result: SearchResult) => {
     if (result.path) {

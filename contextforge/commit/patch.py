@@ -716,14 +716,46 @@ def _find_all_hunk_candidates(
             elif old_content:
                 # Contiguous pure addition with context
                 log.debug("Pure addition with context - locating insertion point")
-                ins_pos = _locate_insertion_index(target_lines, lead_ctx, tail_ctx, start_hint, ctx_probe)
-                return [{
-                    "start_idx": ins_pos,
-                    "end_idx": ins_pos,
-                    "replacement_lines": addition_lines,
-                    "match_type": "pure_addition",
-                    "confidence": 0.9
-                }]
+                
+                # Find ALL valid insertion points where context matches
+                lead_slice = lead_ctx[-min(ctx_probe, len(lead_ctx)):] if lead_ctx else []
+                tail_slice = tail_ctx[:min(ctx_probe, len(tail_ctx))] if tail_ctx else []
+                
+                lead_hits = _find_block_matches(target_lines, lead_slice, loose=True) if lead_slice else []
+                tail_hits = _find_block_matches(target_lines, tail_slice, loose=True) if tail_slice else []
+                
+                candidates = []
+                
+                if lead_hits and tail_hits:
+                    # Find all valid insertion points between lead and tail matches
+                    for L in lead_hits:
+                        L_end = L + len(lead_slice)
+                        for T in tail_hits:
+                            if search_min <= L_end <= T < search_max:
+                                candidates.append({
+                                    "start_idx": L_end,
+                                    "end_idx": L_end,
+                                    "replacement_lines": addition_lines,
+                                    "match_type": "pure_addition",
+                                    "confidence": 0.9,
+                                    "distance_from_hint": abs(L_end - start_hint)
+                                })
+                
+                if not candidates:
+                    # Fallback to single best position if no valid pairs found
+                    ins_pos = _locate_insertion_index(target_lines, lead_ctx, tail_ctx, start_hint, ctx_probe)
+                    candidates = [{
+                        "start_idx": ins_pos,
+                        "end_idx": ins_pos,
+                        "replacement_lines": addition_lines,
+                        "match_type": "pure_addition",
+                        "confidence": 0.9,
+                        "distance_from_hint": abs(ins_pos - start_hint)
+                    }]
+                
+                # Sort by distance from hint
+                candidates.sort(key=lambda c: c["distance_from_hint"])
+                return candidates[:max_candidates]
         
         # If additions are non-contiguous, fall through to block matching below
         log.debug("Non-contiguous additions - using block matching with from_lines")
@@ -758,7 +790,7 @@ def _find_all_hunk_candidates(
         log.debug(f"Searching for anchor (changed content): {len(changed_lines)} lines")
         
         # Search for changed content with fuzzy matching
-        for i in range(max(0, search_min), min(len(target_lines) - len(changed_lines) + 1, search_max)):
+        for i in range(max(0, search_min), min(len(target_lines), search_max)):
             window = target_lines[i : i + len(changed_lines)]
             
             # Exact match on changed lines
@@ -833,7 +865,9 @@ def _find_all_hunk_candidates(
         
         for L in lead_hits:
             for T in tail_hits:
-                if L + len(lead_slice) <= T and search_min <= L < search_max:
+                # Ensure the insertion point falls within bounds
+                insertion_pos = L + len(lead_slice)
+                if insertion_pos <= T and search_min <= insertion_pos < search_max:
                     anchor_candidates.append(L + len(lead_slice))
                     log.debug(f"  Found lead at {L} and tail at {T}, anchor at {L + len(lead_slice)}")
     
@@ -1193,7 +1227,7 @@ def _assign_hunks_to_candidates(all_candidates: list[list[dict]], log: logging.L
             
             # Check if this overlaps with any already-assigned region
             overlaps = any(
-                not (end <= used_start or start >= used_end)
+                _regions_overlap(start, end, used_start, used_end)
                 for used_start, used_end in used_regions
             )
             
@@ -1229,6 +1263,22 @@ def _assign_hunks_to_candidates(all_candidates: list[list[dict]], log: logging.L
         return [candidates[0] if candidates else None for candidates in all_candidates]
     
     return result
+
+def _regions_overlap(start: int, end: int, other_start: int, other_end: int) -> bool:
+    """
+    Check if two regions overlap.
+    Pure insertions at boundaries are OK. Pure insertions strictly inside replacements are conflicts.
+    """
+    # Pure insertion - only conflicts if strictly inside a replacement range
+    if start == end:
+        return start > other_start and start < other_end
+    
+    # If comparing with a pure insertion, no conflict
+    if other_start == other_end:
+        return False
+    
+    # Standard overlap check for replacements
+    return not (end <= other_start or start >= other_end)
 
 
 def patch_text(
@@ -1465,12 +1515,78 @@ def patch_text(
         )
         
         if new_candidates:
-            # Take the best candidate
-            new_location = new_candidates[0]
-            new_location["hunk_index"] = loc["hunk_index"]
-            new_location["hunk"] = h
-            locations[i] = new_location
-            log.debug(f"  ✅ Refined (new confidence={new_location['confidence']:.2f})")
+            # Filter out candidates that would overlap with already-assigned locations
+            non_overlapping = []
+            for cand in new_candidates:
+                cand_start = cand["start_idx"]
+                cand_end = cand["end_idx"]
+                
+                # Check for overlap with any assigned location (including this one's current assignment)
+                overlaps = False
+                for j, other_loc in enumerate(locations):
+                    if j == i or other_loc["start_idx"] < 0:
+                        continue  # Skip self or failed hunks
+                    
+                    other_start = other_loc["start_idx"]
+                    other_end = other_loc["end_idx"]
+                    
+                    if _regions_overlap(cand_start, cand_end, other_start, other_end):
+                        overlaps = True
+                        break
+                
+                if not overlaps:
+                    non_overlapping.append(cand)
+            
+            if non_overlapping:
+                new_location = non_overlapping[0]
+                new_location["hunk_index"] = loc["hunk_index"]
+                new_location["hunk"] = h
+                locations[i] = new_location
+                log.debug(f"  ✅ Refined (new confidence={new_location['confidence']:.2f})")
+            else:
+                log.debug(f"  ⚠️ All candidates overlap with existing assignments")
+                # Continue with existing logic for merge conflict or failure
+                if prev_perfect and next_perfect:
+                    log.debug(f"  💡 Creating merge conflict between anchors")
+                    
+                    # Calculate proportional position
+                    patch_total = sum(
+                        len(locations[j]["hunk"].get("lines", [])) 
+                        for j in range(len(locations))
+                    )
+                    patch_before = sum(
+                        len(locations[j]["hunk"].get("lines", [])) 
+                        for j in range(i)
+                    )
+                    ratio = patch_before / max(patch_total, 1)
+                    
+                    file_range = search_max - search_min
+                    insert_pos = search_min + int(ratio * file_range)
+                    
+                    # Get what we expected vs what's there
+                    old_content, new_content, _ = _split_hunk_components(h["lines"])
+                    window_size = min(len(old_content), search_max - insert_pos) if old_content else 5
+                    actual_content = original_lines[insert_pos:insert_pos + window_size]
+                    
+                    conflict_lines = []
+                    conflict_lines.append("<<<<<<< CURRENT (file content)")
+                    conflict_lines.extend(actual_content)
+                    conflict_lines.append("=======")
+                    conflict_lines.extend(new_content if new_content else ["(empty)"])
+                    conflict_lines.append(f">>>>>>> PATCH (hunk #{loc['hunk_index'] + 1})")
+                    
+                    locations[i] = {
+                        "hunk_index": loc["hunk_index"],
+                        "hunk": h,
+                        "start_idx": insert_pos,
+                        "end_idx": insert_pos + window_size,
+                        "replacement_lines": conflict_lines,
+                        "match_type": "merge_conflict",
+                        "confidence": 0.5
+                    }
+                    log.debug(f"  ✅ Merge conflict created at line {insert_pos}")
+                else:
+                    log.debug(f"  ✗ Still failed, no both-side anchors for merge conflict")
         else:
             # Still can't find it - create merge conflict if we have both bounds
             if prev_perfect and next_perfect:

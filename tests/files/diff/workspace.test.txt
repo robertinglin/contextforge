@@ -1,0 +1,1368 @@
+import { http } from "../lib/http";
+import { fetchSnapshot } from "./app";
+import { toast } from "sonner";
+import { useSettingsStore } from "./settings";
+import { FileNode } from "@/pages/workspace/types";
+import { useSearchPreferencesStore } from "./searchPreferences";
+import { createProjectScopedStore } from "./projectScoped";
+import { measure } from "@/lib/performance";
+import { FileTab, TabGroup } from "@/types";
+
+// Helper functions for localStorage persistence
+const TOKEN_BUDGET_STORAGE_KEY = 'workspace_token_budget';
+
+const getStoredTokenBudget = (): number | 'unlimited' => {
+  const stored = localStorage.getItem(TOKEN_BUDGET_STORAGE_KEY);
+  if (stored === 'unlimited') return 'unlimited';
+  if (stored) {
+    const parsed = parseInt(stored, 10);
+    if (!isNaN(parsed)) return parsed;
+  }
+  return 'unlimited'; // default
+};
+
+// Helper copied from Monaco.tsx to avoid dependency cycles
+export const getLanguageFromPath = (filePath: string): string => {
+  const extension = filePath.split(".").pop()?.toLowerCase();
+  switch (extension) {
+    case "js": case "jsx": return "javascript";
+    case "ts": case "tsx": return "typescript";
+    case "py": return "python";
+    case "css": return "css";
+    case "html": return "html";
+    case "json": return "json";
+    case "md": return "markdown";
+    case "java": return "java";
+    case "cs": return "csharp";
+    case "cpp": case "h": return "cpp";
+    case "go": return "go";
+    case "rs": return "rust";
+    default: return "plaintext";
+  }
+};
+
+
+export interface WorkspaceState {
+  // From useWorkspaceState
+  fileTree: FileNode[];
+  userSelectedFiles: Set<string>;
+  contextSelectedFiles: Map<string, Set<string>>;
+  treeStringTokenCount: number;
+  includeFileTree: boolean;
+  expandedFolders: Set<string>;
+  editedContent: Record<string, string>;
+  isAutoContextEnabled: boolean;
+  tokenBudget: number | 'unlimited';
+  cachedInstructionContext: Set<string>;
+  instructions: string;
+  // Active file for editor to display
+  openFilePath?: string;
+  // from tabs store
+  tabs: FileTab[];
+  selectedTabIds: string[];
+  groups: TabGroup[];
+}
+
+const initialState: WorkspaceState = {
+    fileTree: [],
+    userSelectedFiles: new Set(),
+    contextSelectedFiles: new Map(),
+    treeStringTokenCount: 0,
+    includeFileTree: false,
+    expandedFolders: new Set(),
+    editedContent: {},
+    isAutoContextEnabled: true,
+    tokenBudget: getStoredTokenBudget(),
+    cachedInstructionContext: new Set(),
+    openFilePath: undefined,
+    instructions: '',
+    tabs: [],
+    selectedTabIds: [],
+    groups: [],
+};
+
+/**
+ * Payload for the paste-to-task API endpoint.
+ */
+export type PasteToTaskPayload = {
+  markdownContent: string;
+  instructions: string;
+};
+
+/**
+ * Represents a successful response where a task was created.
+ */
+export type PasteToTaskSuccessResponse = {
+  action: "task_created";
+  taskId: string;
+  proposalId: string;
+  filesChangedCount?: number;
+};
+
+export type PasteToTaskSwitchProjectResponse = {
+  action: "request_project_switch";
+    // from tabs store
+    tabs: [],
+    selectedTabIds: [],
+    groups: [],
+  newPath: string;
+  message: string;
+};
+
+/**
+ * Represents a response where no action was taken by the backend.
+ */
+export type PasteToTaskNoActionResponse = {
+  action: "no_action";
+  message: string;
+};
+
+/**
+ * The possible responses from the paste-to-task API.
+ */
+export type PasteToTaskResponse =
+  | PasteToTaskSuccessResponse
+  | PasteToTaskNoActionResponse
+  | PasteToTaskSwitchProjectResponse;
+
+/**
+ * Response for finding relevant files.
+ */
+export type FindRelevantFilesResponse = string[];
+
+/**
+ * Defines the actions available in the workspace store.
+ */
+export type WorkspaceActions = {
+  /**
+   * Sends pasted content to the backend to potentially create a new task.
+   * @param oldId The transient ID of the new file (e.g., 'untitled:1').
+   * @param payload The content that was pasted.
+   */
+  pasteToTask: (
+    payload: PasteToTaskPayload
+  ) => Promise<PasteToTaskResponse | null>;
+  findRelevantFiles: (payload: {
+    seedFiles: string[];
+    tokenBudget: number | "unlimited";
+  }) => Promise<FindRelevantFilesResponse | null>;
+  findRelevantFilesFromInstructions: (
+    payload: { instructions: string; tokenBudget: number | "unlimited" },
+    signal?: AbortSignal
+  ) => Promise<FindRelevantFilesResponse | null>;
+  buildTestPromptAndAct: (
+    files: string[],
+    action?: "copy" | "api"
+  ) => Promise<{ taskId: string; model: string } | null>;
+  fixFailingTests: (payload: { testFilePath: string; runId: string }) => Promise<{ taskId: string; model: string } | null>;
+  saveNewFile: (oldId: string, newPath: string) => Promise<void>;
+  loadFileTree: (path: string) => Promise<void>;
+  // Actions to manage state
+  setState: (state: Partial<WorkspaceState>) => void;
+  setFileTree: (tree: FileNode[]) => void;
+  setCachedInstructionContext: (files: Set<string>) => void;
+  setUserSelectedFiles: (updater: (prev: Set<string>) => Set<string>) => void;
+  setContextSelectedFiles: (files: Map<string, Set<string>>) => void;
+  setTreeStringTokenCount: (count: number) => void;
+  setIncludeFileTree: (include: boolean) => void;
+  setExpandedFolders: (updater: (prev: Set<string>) => Set<string>) => void;
+  setEditedContent: (updater: (prev: Record<string, string>) => Record<string, string>) => void;
+  setIsAutoContextEnabled: (enabled: boolean) => void;
+  setTokenBudget: (budget: number | 'unlimited') => void;
+  // --- Tab actions ---
+  createNewFile: () => void;
+  setActiveFile: (path: string) => void;
+  openInPreview: (path: string) => void;
+  openPermanently: (path: string) => void;
+  selectTab: (tabId: string) => void;
+  closeFile: (path: string) => void;
+  closeTab: (tabId: string) => void;
+  closeOtherTabs: (tabId: string) => void;
+  closeAllTabs: () => void;
+  pinTab: (tabId: string, pin: boolean) => void;
+  updateTab: (tabId: string, updates: Partial<FileTab>) => void;
+  promoteCurrentPreview: () => void;
+  reorderTabs: (fromIndex: number, toIndex: number) => void;
+  toggleTabSelection: (tabId: string) => void;
+  reset: () => void;
+};
+
+/**
+ * Zustand store for managing workspace-specific actions.
+ */
+export const useWorkspaceStore = createProjectScopedStore<WorkspaceState & WorkspaceActions>('workspace', (set, get) => ({
+  ...initialState,
+  pasteToTask: measure(async (payload: PasteToTaskPayload) => {
+    const response = await http<any>("/api/workspace/paste-to-task", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+
+    if (response) {
+      if (response.action === "request_project_switch") {
+        return response as PasteToTaskSwitchProjectResponse;
+      }
+      if (response.taskId) {
+        (response as PasteToTaskSuccessResponse).action = "task_created";
+        await fetchSnapshot();
+      } else {
+        (response as PasteToTaskNoActionResponse).action = "no_action";
+      }
+    }
+    return response;
+  }, 'workspace.pasteToTask'),
+  findRelevantFiles: measure(async ({ seedFiles, tokenBudget }) => {
+    const tb = tokenBudget === "unlimited" ? 1000000 : tokenBudget;
+    try {
+      const result = await http<string[]>("/api/context/from-file", {
+        method: "POST",
+        body: JSON.stringify({
+          files: seedFiles,
+          tokenBudget: tb,
+        }),
+      });
+      return result;
+    } catch (e: any) {
+      toast.error("Failed to find relevant files.", { description: e.message });
+      return null;
+    }
+  }, 'workspace.findRelevantFiles'),
+  findRelevantFilesFromInstructions: measure(async ({ instructions, tokenBudget }, signal) => {
+    const tb = tokenBudget === "unlimited" ? 1000000 : tokenBudget;
+    const { searchMethod } = useSearchPreferencesStore.getState();
+    try {
+      // This is a new endpoint that would need to be implemented on the backend.
+      const result = await http<string[]>("/api/context/from-instructions", {
+        method: "POST",
+        body: JSON.stringify({
+          searchMethod,
+          instructions,
+          tokenBudget: tb,
+        }),
+        signal,
+      });
+      return result;
+    } catch (e: any) {
+      if (e.name !== "AbortError") {
+        // Don't show toast for this, as it can be noisy while typing.
+        console.error("Failed to find relevant files from instructions.", e);
+      }
+      // Return null on abort or error
+      return null;
+    }
+  }, 'workspace.findRelevantFilesFromInstructions'),
+  buildTestPromptAndAct: measure(async (files, action) => {
+    const toastId = toast.loading("Generating test improvement prompt...");
+    try {
+      const { prompt } = await http<{ prompt: string }>(
+        "/api/context/build_test_prompt",
+        {
+          method: "POST",
+          body: JSON.stringify({ files }),
+        }
+      );
+      if (
+        !prompt ||
+        !prompt.trim() ||
+        prompt.includes("No untested functions found")
+      ) {
+        toast.info("No uncovered code found to test.", { id: toastId });
+        return null;
+      }
+      const interactionMode =
+        action || useSettingsStore.getState().workspace.interactionMode;
+      if (interactionMode === "copy") {
+        await navigator.clipboard.writeText(prompt);
+        toast.success("Test improvement prompt copied to clipboard.", {
+          id: toastId,
+        });
+        return null;
+      } else {
+        const model = interactionMode;
+        // 'api' mode
+        const endpoint = model === 'gemini' ? '/api/proposals/run-gemini' : '/api/proposals/run-qwen';
+        const res = await http<{ taskId: string }>(endpoint, {
+          method: "POST",
+          body: JSON.stringify({
+            instructions: prompt,
+            files: [], // The prompt is self-contained with code snippets
+            includeFileTree: false,
+            title: `Improve Test Coverage for: ${files.join(", ")}`,
+          }),
+        });
+        if (res.taskId) {
+          toast.success("Started proposal generation for tests.", {
+            id: toastId,
+          });
+          return { taskId: res.taskId, model };
+        }
+        throw new Error("Did not receive a Task ID from the server.");
+      }
+    } catch (e: any) {
+      toast.error("Failed to generate test prompt.", {
+        id: toastId,
+        description: e.message,
+      });
+      return null;
+    }
+  }, 'workspace.buildTestPromptAndAct'),
+
+  fixFailingTests: measure(async ({ testFilePath, runId }) => {
+    const toastId = toast.loading(`Starting AI fix for ${testFilePath}...`);
+    try {
+      const res = await http<{ taskId: string; model: string }>('/api/workspace/fix_tests', {
+        method: 'POST',
+        body: JSON.stringify({ testFilePath, runId }),
+      });
+      toast.success("Test fix task started.", { id: toastId });
+      return res;
+    } catch (e: any) {
+      toast.error("Failed to start test fix task.", { id: toastId, description: e.message });
+      return null;
+    }
+  }, 'workspace.fixFailingTests'),
+
+  saveNewFile: measure(async (oldId: string, newPath: string) => {
+    const { editedContent } = get();
+    const content = editedContent[oldId] ?? '';
+    
+    try {
+        await http<void>(`/api/files/content`, {
+            method: 'POST',
+            body: JSON.stringify({
+                path: newPath,
+                content: content,
+            }),
+        });
+
+        set(state => {
+            const newTabs = state.tabs.map(tab => {
+                if (tab.id === oldId) {
+                    return {
+                        ...tab,
+                        id: newPath,
+                        path: newPath,
+                        name: newPath.split('/').pop() || newPath,
+                        language: getLanguageFromPath(newPath),
+                        isNew: false,
+                    };
+                }
+                return tab;
+            });
+            
+            const newEditedContent = { ...state.editedContent };
+            delete newEditedContent[oldId];
+            
+            let newOpenFilePath = state.openFilePath;
+            if (state.openFilePath === oldId) {
+                newOpenFilePath = newPath;
+            }
+
+            return {
+                tabs: newTabs,
+                editedContent: newEditedContent,
+                openFilePath: newOpenFilePath,
+                selectedTabIds: [newPath],
+            };
+        });
+
+        await get().loadFileTree('.');
+        toast.success(`Saved ${newPath}`);
+
+    } catch (error: any) {
+        toast.error('Failed to save file', { description: error.message });
+        throw error;
+    }
+  }, 'workspace.saveNewFile'),
+
+  // State management actions
+  setState: (state) => set(state),
+  setFileTree: (tree) => set({ fileTree: tree, cachedInstructionContext: new Set() }),
+  setCachedInstructionContext: (files) => {
+    const cachedInstructionContext = get().cachedInstructionContext;
+    if (files.size === cachedInstructionContext.size && Array.from(files).every(f => cachedInstructionContext.has(f))) {
+      return; // No change
+    }
+    set({
+      cachedInstructionContext: files,
+    });
+  },
+  setUserSelectedFiles: (updater) => set((state) => ({ userSelectedFiles: typeof updater === 'function' ? updater(state.userSelectedFiles) : updater })),
+  setContextSelectedFiles: (files) => set({ contextSelectedFiles: files }),
+  setTreeStringTokenCount: (count) => set({ treeStringTokenCount: count }),
+  setIncludeFileTree: (include) => set({ includeFileTree: include }),
+  setExpandedFolders: (updater) => set((state) => ({ expandedFolders: updater(state.expandedFolders) })),
+  setEditedContent: (updater) => set((state) => ({ editedContent: updater(state.editedContent) })),
+  setIsAutoContextEnabled: (enabled) => set({ isAutoContextEnabled: enabled }),
+  setTokenBudget: (budget) => {
+    localStorage.setItem(TOKEN_BUDGET_STORAGE_KEY, budget.toString());
+    set({ tokenBudget: budget });
+  },
+
+  // --- File/Tab Actions ---
+  createNewFile: () => {
+    set((state) => {
+        const newTabs = [...state.tabs];
+        let newFileCounter = 1;
+        while (newTabs.some(tab => tab.id === `untitled:${newFileCounter}`)) {
+            newFileCounter++;
+        }
+
+        const newFileId = `untitled:${newFileCounter}`;
+        const newFileName = `Untitled-${newFileCounter}`;
+
+        const newTab: FileTab = {
+            id: newFileId,
+            path: newFileId,
+            name: newFileName,
+            language: 'plaintext',
+            isDirty: false, // will become dirty on first edit
+            isNew: true,
+            isPreview: false,
+            isPinned: false,
+            isModified: false,
+        };
+
+        return { tabs: [...newTabs, newTab], openFilePath: newFileId, selectedTabIds: [newFileId] };
+    });
+  },
+  setActiveFile: (path) => {
+    get().openPermanently(path);
+  },
+
+  openInPreview: (path) => {
+  const { tabs, openFilePath } = get();
+  const existingTab = tabs.find(t => t.id === path);
+
+  if (existingTab && existingTab.isPreview && openFilePath === path) {
+    return;
+  }
+
+  const currentPreview = tabs.find(t => t.isPreview);
+  let newTabs = [...tabs];
+  
+  if (currentPreview && currentPreview.id !== path) {
+    newTabs = newTabs.filter(t => t.id !== currentPreview.id);
+  }
+
+  if (!newTabs.find(t => t.id === path)) {
+    const newTab: FileTab = {
+      id: path,
+      path: path,
+      name: path.split('/').pop() || path,
+      language: getLanguageFromPath(path),
+      isDirty: false,
+      isPreview: true,
+      isPinned: false,
+      isModified: false,
+    };
+    newTabs.push(newTab);
+  }
+  
+  set({
+    tabs: newTabs,
+    openFilePath: path,
+    selectedTabIds: [path],
+  });
+},
+
+openPermanently: (path) => {
+  const { tabs } = get();
+  const existingTab = tabs.find(t => t.id === path);
+  let newTabs = [...tabs];
+  
+  if (existingTab) {
+    newTabs = newTabs.map(t => 
+      t.id === path ? { ...t, isPreview: false } : t
+    );
+  } else {
+    const currentPreview = tabs.find(t => t.isPreview);
+    if (currentPreview) {
+      newTabs = newTabs.filter(t => t.id !== currentPreview.id);
+    }
+    const newTab: FileTab = {
+      id: path,
+      path: path,
+      name: path.split('/').pop() || path,
+      language: getLanguageFromPath(path),
+      isDirty: false,
+      isPreview: false,
+      isPinned: false,
+      isModified: false,
+    };
+    newTabs.push(newTab);
+  }
+  
+  set({
+    tabs: newTabs,
+    openFilePath: path,
+    selectedTabIds: [path],
+  });
+},
+
+promoteCurrentPreview: () => {
+  const { tabs, openFilePath } = get();
+  const activeTab = tabs.find(t => t.id === openFilePath);
+  
+  if (activeTab && activeTab.isPreview) {
+    const newTabs = tabs.map(t => 
+      t.id === openFilePath ? { ...t, isPreview: false } : t
+    );
+    set({ tabs: newTabs });
+  }
+},
+
+selectTab: (tabId) => {
+  const { tabs } = get();
+  const activeTab = tabs.find(t => t.id === tabId);
+  const newTabs = activeTab && activeTab.isPreview
+    ? tabs.map(t => t.id === tabId ? { ...t, isPreview: false } : t)
+    : tabs;
+  
+  set({
+    tabs: newTabs,
+    openFilePath: tabId,
+    selectedTabIds: [tabId],
+  });
+},
+
+closeTab: (tabId) => {
+  const { tabs, openFilePath, selectedTabIds } = get();
+  const filteredTabs = tabs.filter(t => t.id !== tabId);
+  let newActiveId: string | undefined = openFilePath;
+
+  if (openFilePath === tabId) {
+    const closedIndex = tabs.findIndex(t => t.id === tabId);
+    if (filteredTabs.length > 0) {
+      newActiveId = filteredTabs[Math.max(0, closedIndex - 1)].id;
+    } else {
+      newActiveId = undefined;
+    }
+  }
+
+  set({
+    tabs: filteredTabs,
+    openFilePath: newActiveId,
+    selectedTabIds: selectedTabIds.filter(id => id !== tabId),
+  });
+},
+
+closeOtherTabs: (tabId) => {
+  const { tabs } = get();
+  const filteredTabs = tabs.filter(t => t.id === tabId || t.isPinned);
+  
+  set({
+    tabs: filteredTabs,
+    openFilePath: tabId,
+    selectedTabIds: [tabId],
+  });
+},
+
+closeAllTabs: () => {
+  const { tabs } = get();
+  const filteredTabs = tabs.filter(t => t.isPinned);
+  
+  set({
+    tabs: filteredTabs,
+    openFilePath: undefined,
+    selectedTabIds: [],
+  });
+},
+
+pinTab: (tabId, pin) => {
+  const { tabs } = get();
+  const newTabs = tabs.map(t => 
+    t.id === tabId 
+      ? { ...t, isPinned: pin, isPreview: pin ? false : t.isPreview }
+      : t
+  );
+  
+  set({ tabs: newTabs });
+},
+
+updateTab: (tabId, updates) => {
+  set(state => ({
+    tabs: state.tabs.map(t =>
+      t.id === tabId
+        ? { ...t, ...updates }
+        : t
+    )
+  }));
+},
+toggleTabSelection: (tabId) => {
+  const { selectedTabIds } = get();
+  const isSelected = selectedTabIds.includes(tabId);
+  const newSelectedTabIds = isSelected
+    ? selectedTabIds.filter(id => id !== tabId)
+    : [...selectedTabIds, tabId];
+  
+  set({ selectedTabIds: newSelectedTabIds });
+},
+
+reorderTabs: (fromIndex, toIndex) => {
+  const { tabs } = get();
+  const newTabs = [...tabs];
+  const [movedTab] = newTabs.splice(fromIndex, 1);
+  newTabs.splice(toIndex, 0, movedTab);
+  
+  set({ tabs: newTabs });
+},
+
+
+  closeFile: (path) => {
+    get().closeTab(path);
+  },
+
+  reset: () => {
+    console.log('resetting workspace store');
+    // Preserve tokenBudget from localStorage during reset
+    set({
+      ...initialState,
+      tokenBudget: getStoredTokenBudget(),
+    });
+  },
+  loadFileTree: measure(async (path: string) => {
+    try {
+      const data = await http<{
+        tree: FileNode[];
+        tree_string_token_count: number;
+      }>(`/api/files/tree?path=${encodeURIComponent(path)}`);
+      set({
+        fileTree: data.tree || [],
+        treeStringTokenCount: data.tree_string_token_count || 0,
+      });
+    } catch (error: any) {
+      set({ fileTree: [] });
+      throw error;
+    }
+  }, 'loadFileTree')
+}));
+# === TEST ===
+--- a/src/stores/workspace.ts
++++ b/src/stores/workspace.ts
+@@ -38,6 +38,7 @@
+   cachedInstructionContext: Set<string>;
+   instructions: string;
+   // Active file for editor to display
++  openFileOptions?: { line?: number; character?: number };
+   openFilePath?: string;
+   // from tabs store
+   tabs: FileTab[];
+@@ -56,6 +57,7 @@
+     tokenBudget: getStoredTokenBudget(),
+     cachedInstructionContext: new Set(),
+     openFilePath: undefined,
++    openFileOptions: undefined,
+     instructions: '',
+     tabs: [],
+     selectedTabIds: [],
+@@ -107,8 +109,8 @@
+   // --- Tab actions ---
+   createNewFile: () => void;
+   setActiveFile: (path: string) => void;
+-  openInPreview: (path: string) => void;
+-  openPermanently: (path: string) => void;
++  openInPreview: (path: string, options?: { line?: number; character?: number }) => void;
++  openPermanently: (path: string, options?: { line?: number; character?: number }) => void;
+   selectTab: (tabId: string) => void;
+   closeFile: (path: string) => void;
+   closeTab: (tabId: string) => void;
+@@ -118,6 +120,7 @@
+   promoteCurrentPreview: () => void;
+   reorderTabs: (fromIndex: number, toIndex: number) => void;
+   toggleTabSelection: (tabId: string) => void;
++  setOpenFileOptions: (options: { line?: number; character?: number } | undefined) => void;
+   reset: () => void;
+ };
+ 
+@@ -279,7 +282,7 @@
+     get().openPermanently(path);
+   },
+ 
+-  openInPreview: (path) => {
++  openInPreview: (path, options) => {
+   const { tabs, openFilePath } = get();
+   const existingTab = tabs.find(t => t.id === path);
+ 
+@@ -311,11 +314,12 @@
+   set({
+     tabs: newTabs,
+     openFilePath: path,
++    openFileOptions: options,
+     selectedTabIds: [path],
+   });
+ },
+ 
+-openPermanently: (path) => {
++openPermanently: (path, options) => {
+   const { tabs } = get();
+   const existingTab = tabs.find(t => t.id === path);
+   let newTabs = [...tabs];
+@@ -345,6 +349,7 @@
+   set({
+     tabs: newTabs,
+     openFilePath: path,
++    openFileOptions: options,
+     selectedTabIds: [path],
+   });
+ },
+@@ -433,6 +438,10 @@
+   set({ tabs: newTabs });
+ },
+ 
++setOpenFileOptions: (options) => {
++    set({ openFileOptions: options });
++},
++
+ updateTab: (tabId, updates) => {
+   set(state => ({
+     tabs: state.tabs.map(t =>
+# === RESULT ===
+import { http } from "../lib/http";
+import { fetchSnapshot } from "./app";
+import { toast } from "sonner";
+import { useSettingsStore } from "./settings";
+import { FileNode } from "@/pages/workspace/types";
+import { useSearchPreferencesStore } from "./searchPreferences";
+import { createProjectScopedStore } from "./projectScoped";
+import { measure } from "@/lib/performance";
+import { FileTab, TabGroup } from "@/types";
+
+// Helper functions for localStorage persistence
+const TOKEN_BUDGET_STORAGE_KEY = 'workspace_token_budget';
+
+const getStoredTokenBudget = (): number | 'unlimited' => {
+  const stored = localStorage.getItem(TOKEN_BUDGET_STORAGE_KEY);
+  if (stored === 'unlimited') return 'unlimited';
+  if (stored) {
+    const parsed = parseInt(stored, 10);
+    if (!isNaN(parsed)) return parsed;
+  }
+  return 'unlimited'; // default
+};
+
+// Helper copied from Monaco.tsx to avoid dependency cycles
+export const getLanguageFromPath = (filePath: string): string => {
+  const extension = filePath.split(".").pop()?.toLowerCase();
+  switch (extension) {
+    case "js": case "jsx": return "javascript";
+    case "ts": case "tsx": return "typescript";
+    case "py": return "python";
+    case "css": return "css";
+    case "html": return "html";
+    case "json": return "json";
+    case "md": return "markdown";
+    case "java": return "java";
+    case "cs": return "csharp";
+    case "cpp": case "h": return "cpp";
+    case "go": return "go";
+    case "rs": return "rust";
+    default: return "plaintext";
+  }
+};
+
+
+export interface WorkspaceState {
+  // From useWorkspaceState
+  fileTree: FileNode[];
+  userSelectedFiles: Set<string>;
+  contextSelectedFiles: Map<string, Set<string>>;
+  treeStringTokenCount: number;
+  includeFileTree: boolean;
+  expandedFolders: Set<string>;
+  editedContent: Record<string, string>;
+  isAutoContextEnabled: boolean;
+  tokenBudget: number | 'unlimited';
+  cachedInstructionContext: Set<string>;
+  instructions: string;
+  // Active file for editor to display
+  openFileOptions?: { line?: number; character?: number };
+  openFilePath?: string;
+  // from tabs store
+  tabs: FileTab[];
+  selectedTabIds: string[];
+  groups: TabGroup[];
+}
+
+const initialState: WorkspaceState = {
+    fileTree: [],
+    userSelectedFiles: new Set(),
+    contextSelectedFiles: new Map(),
+    treeStringTokenCount: 0,
+    includeFileTree: false,
+    expandedFolders: new Set(),
+    editedContent: {},
+    isAutoContextEnabled: true,
+    tokenBudget: getStoredTokenBudget(),
+    cachedInstructionContext: new Set(),
+    openFilePath: undefined,
+    openFileOptions: undefined,
+    instructions: '',
+    tabs: [],
+    selectedTabIds: [],
+    groups: [],
+};
+
+/**
+ * Payload for the paste-to-task API endpoint.
+ */
+export type PasteToTaskPayload = {
+  markdownContent: string;
+  instructions: string;
+};
+
+/**
+ * Represents a successful response where a task was created.
+ */
+export type PasteToTaskSuccessResponse = {
+  action: "task_created";
+  taskId: string;
+  proposalId: string;
+  filesChangedCount?: number;
+};
+
+export type PasteToTaskSwitchProjectResponse = {
+  action: "request_project_switch";
+    // from tabs store
+    tabs: [],
+    selectedTabIds: [],
+    groups: [],
+  newPath: string;
+  message: string;
+};
+
+/**
+ * Represents a response where no action was taken by the backend.
+ */
+export type PasteToTaskNoActionResponse = {
+  action: "no_action";
+  message: string;
+};
+
+/**
+ * The possible responses from the paste-to-task API.
+ */
+export type PasteToTaskResponse =
+  | PasteToTaskSuccessResponse
+  | PasteToTaskNoActionResponse
+  | PasteToTaskSwitchProjectResponse;
+
+/**
+ * Response for finding relevant files.
+ */
+export type FindRelevantFilesResponse = string[];
+
+/**
+ * Defines the actions available in the workspace store.
+ */
+export type WorkspaceActions = {
+  /**
+   * Sends pasted content to the backend to potentially create a new task.
+   * @param oldId The transient ID of the new file (e.g., 'untitled:1').
+   * @param payload The content that was pasted.
+   */
+  pasteToTask: (
+    payload: PasteToTaskPayload
+  ) => Promise<PasteToTaskResponse | null>;
+  findRelevantFiles: (payload: {
+    seedFiles: string[];
+    tokenBudget: number | "unlimited";
+  }) => Promise<FindRelevantFilesResponse | null>;
+  findRelevantFilesFromInstructions: (
+    payload: { instructions: string; tokenBudget: number | "unlimited" },
+    signal?: AbortSignal
+  ) => Promise<FindRelevantFilesResponse | null>;
+  buildTestPromptAndAct: (
+    files: string[],
+    action?: "copy" | "api"
+  ) => Promise<{ taskId: string; model: string } | null>;
+  fixFailingTests: (payload: { testFilePath: string; runId: string }) => Promise<{ taskId: string; model: string } | null>;
+  saveNewFile: (oldId: string, newPath: string) => Promise<void>;
+  loadFileTree: (path: string) => Promise<void>;
+  // Actions to manage state
+  setState: (state: Partial<WorkspaceState>) => void;
+  setFileTree: (tree: FileNode[]) => void;
+  setCachedInstructionContext: (files: Set<string>) => void;
+  setUserSelectedFiles: (updater: (prev: Set<string>) => Set<string>) => void;
+  setContextSelectedFiles: (files: Map<string, Set<string>>) => void;
+  setTreeStringTokenCount: (count: number) => void;
+  setIncludeFileTree: (include: boolean) => void;
+  setExpandedFolders: (updater: (prev: Set<string>) => Set<string>) => void;
+  setEditedContent: (updater: (prev: Record<string, string>) => Record<string, string>) => void;
+  setIsAutoContextEnabled: (enabled: boolean) => void;
+  setTokenBudget: (budget: number | 'unlimited') => void;
+  // --- Tab actions ---
+  createNewFile: () => void;
+  setActiveFile: (path: string) => void;
+  openInPreview: (path: string, options?: { line?: number; character?: number }) => void;
+  openPermanently: (path: string, options?: { line?: number; character?: number }) => void;
+  selectTab: (tabId: string) => void;
+  closeFile: (path: string) => void;
+  closeTab: (tabId: string) => void;
+  closeOtherTabs: (tabId: string) => void;
+  closeAllTabs: () => void;
+  pinTab: (tabId: string, pin: boolean) => void;
+  updateTab: (tabId: string, updates: Partial<FileTab>) => void;
+  promoteCurrentPreview: () => void;
+  reorderTabs: (fromIndex: number, toIndex: number) => void;
+  toggleTabSelection: (tabId: string) => void;
+  setOpenFileOptions: (options: { line?: number; character?: number } | undefined) => void;
+  reset: () => void;
+};
+
+/**
+ * Zustand store for managing workspace-specific actions.
+ */
+export const useWorkspaceStore = createProjectScopedStore<WorkspaceState & WorkspaceActions>('workspace', (set, get) => ({
+  ...initialState,
+  pasteToTask: measure(async (payload: PasteToTaskPayload) => {
+    const response = await http<any>("/api/workspace/paste-to-task", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+
+    if (response) {
+      if (response.action === "request_project_switch") {
+        return response as PasteToTaskSwitchProjectResponse;
+      }
+      if (response.taskId) {
+        (response as PasteToTaskSuccessResponse).action = "task_created";
+        await fetchSnapshot();
+      } else {
+        (response as PasteToTaskNoActionResponse).action = "no_action";
+      }
+    }
+    return response;
+  }, 'workspace.pasteToTask'),
+  findRelevantFiles: measure(async ({ seedFiles, tokenBudget }) => {
+    const tb = tokenBudget === "unlimited" ? 1000000 : tokenBudget;
+    try {
+      const result = await http<string[]>("/api/context/from-file", {
+        method: "POST",
+        body: JSON.stringify({
+          files: seedFiles,
+          tokenBudget: tb,
+        }),
+      });
+      return result;
+    } catch (e: any) {
+      toast.error("Failed to find relevant files.", { description: e.message });
+      return null;
+    }
+  }, 'workspace.findRelevantFiles'),
+  findRelevantFilesFromInstructions: measure(async ({ instructions, tokenBudget }, signal) => {
+    const tb = tokenBudget === "unlimited" ? 1000000 : tokenBudget;
+    const { searchMethod } = useSearchPreferencesStore.getState();
+    try {
+      // This is a new endpoint that would need to be implemented on the backend.
+      const result = await http<string[]>("/api/context/from-instructions", {
+        method: "POST",
+        body: JSON.stringify({
+          searchMethod,
+          instructions,
+          tokenBudget: tb,
+        }),
+        signal,
+      });
+      return result;
+    } catch (e: any) {
+      if (e.name !== "AbortError") {
+        // Don't show toast for this, as it can be noisy while typing.
+        console.error("Failed to find relevant files from instructions.", e);
+      }
+      // Return null on abort or error
+      return null;
+    }
+  }, 'workspace.findRelevantFilesFromInstructions'),
+  buildTestPromptAndAct: measure(async (files, action) => {
+    const toastId = toast.loading("Generating test improvement prompt...");
+    try {
+      const { prompt } = await http<{ prompt: string }>(
+        "/api/context/build_test_prompt",
+        {
+          method: "POST",
+          body: JSON.stringify({ files }),
+        }
+      );
+      if (
+        !prompt ||
+        !prompt.trim() ||
+        prompt.includes("No untested functions found")
+      ) {
+        toast.info("No uncovered code found to test.", { id: toastId });
+        return null;
+      }
+      const interactionMode =
+        action || useSettingsStore.getState().workspace.interactionMode;
+      if (interactionMode === "copy") {
+        await navigator.clipboard.writeText(prompt);
+        toast.success("Test improvement prompt copied to clipboard.", {
+          id: toastId,
+        });
+        return null;
+      } else {
+        const model = interactionMode;
+        // 'api' mode
+        const endpoint = model === 'gemini' ? '/api/proposals/run-gemini' : '/api/proposals/run-qwen';
+        const res = await http<{ taskId: string }>(endpoint, {
+          method: "POST",
+          body: JSON.stringify({
+            instructions: prompt,
+            files: [], // The prompt is self-contained with code snippets
+            includeFileTree: false,
+            title: `Improve Test Coverage for: ${files.join(", ")}`,
+          }),
+        });
+        if (res.taskId) {
+          toast.success("Started proposal generation for tests.", {
+            id: toastId,
+          });
+          return { taskId: res.taskId, model };
+        }
+        throw new Error("Did not receive a Task ID from the server.");
+      }
+    } catch (e: any) {
+      toast.error("Failed to generate test prompt.", {
+        id: toastId,
+        description: e.message,
+      });
+      return null;
+    }
+  }, 'workspace.buildTestPromptAndAct'),
+
+  fixFailingTests: measure(async ({ testFilePath, runId }) => {
+    const toastId = toast.loading(`Starting AI fix for ${testFilePath}...`);
+    try {
+      const res = await http<{ taskId: string; model: string }>('/api/workspace/fix_tests', {
+        method: 'POST',
+        body: JSON.stringify({ testFilePath, runId }),
+      });
+      toast.success("Test fix task started.", { id: toastId });
+      return res;
+    } catch (e: any) {
+      toast.error("Failed to start test fix task.", { id: toastId, description: e.message });
+      return null;
+    }
+  }, 'workspace.fixFailingTests'),
+
+  saveNewFile: measure(async (oldId: string, newPath: string) => {
+    const { editedContent } = get();
+    const content = editedContent[oldId] ?? '';
+    
+    try {
+        await http<void>(`/api/files/content`, {
+            method: 'POST',
+            body: JSON.stringify({
+                path: newPath,
+                content: content,
+            }),
+        });
+
+        set(state => {
+            const newTabs = state.tabs.map(tab => {
+                if (tab.id === oldId) {
+                    return {
+                        ...tab,
+                        id: newPath,
+                        path: newPath,
+                        name: newPath.split('/').pop() || newPath,
+                        language: getLanguageFromPath(newPath),
+                        isNew: false,
+                    };
+                }
+                return tab;
+            });
+            
+            const newEditedContent = { ...state.editedContent };
+            delete newEditedContent[oldId];
+            
+            let newOpenFilePath = state.openFilePath;
+            if (state.openFilePath === oldId) {
+                newOpenFilePath = newPath;
+            }
+
+            return {
+                tabs: newTabs,
+                editedContent: newEditedContent,
+                openFilePath: newOpenFilePath,
+                selectedTabIds: [newPath],
+            };
+        });
+
+        await get().loadFileTree('.');
+        toast.success(`Saved ${newPath}`);
+
+    } catch (error: any) {
+        toast.error('Failed to save file', { description: error.message });
+        throw error;
+    }
+  }, 'workspace.saveNewFile'),
+
+  // State management actions
+  setState: (state) => set(state),
+  setFileTree: (tree) => set({ fileTree: tree, cachedInstructionContext: new Set() }),
+  setCachedInstructionContext: (files) => {
+    const cachedInstructionContext = get().cachedInstructionContext;
+    if (files.size === cachedInstructionContext.size && Array.from(files).every(f => cachedInstructionContext.has(f))) {
+      return; // No change
+    }
+    set({
+      cachedInstructionContext: files,
+    });
+  },
+  setUserSelectedFiles: (updater) => set((state) => ({ userSelectedFiles: typeof updater === 'function' ? updater(state.userSelectedFiles) : updater })),
+  setContextSelectedFiles: (files) => set({ contextSelectedFiles: files }),
+  setTreeStringTokenCount: (count) => set({ treeStringTokenCount: count }),
+  setIncludeFileTree: (include) => set({ includeFileTree: include }),
+  setExpandedFolders: (updater) => set((state) => ({ expandedFolders: updater(state.expandedFolders) })),
+  setEditedContent: (updater) => set((state) => ({ editedContent: updater(state.editedContent) })),
+  setIsAutoContextEnabled: (enabled) => set({ isAutoContextEnabled: enabled }),
+  setTokenBudget: (budget) => {
+    localStorage.setItem(TOKEN_BUDGET_STORAGE_KEY, budget.toString());
+    set({ tokenBudget: budget });
+  },
+
+  // --- File/Tab Actions ---
+  createNewFile: () => {
+    set((state) => {
+        const newTabs = [...state.tabs];
+        let newFileCounter = 1;
+        while (newTabs.some(tab => tab.id === `untitled:${newFileCounter}`)) {
+            newFileCounter++;
+        }
+
+        const newFileId = `untitled:${newFileCounter}`;
+        const newFileName = `Untitled-${newFileCounter}`;
+
+        const newTab: FileTab = {
+            id: newFileId,
+            path: newFileId,
+            name: newFileName,
+            language: 'plaintext',
+            isDirty: false, // will become dirty on first edit
+            isNew: true,
+            isPreview: false,
+            isPinned: false,
+            isModified: false,
+        };
+
+        return { tabs: [...newTabs, newTab], openFilePath: newFileId, selectedTabIds: [newFileId] };
+    });
+  },
+  setActiveFile: (path) => {
+    get().openPermanently(path);
+  },
+
+  openInPreview: (path, options) => {
+  const { tabs, openFilePath } = get();
+  const existingTab = tabs.find(t => t.id === path);
+
+  if (existingTab && existingTab.isPreview && openFilePath === path) {
+    return;
+  }
+
+  const currentPreview = tabs.find(t => t.isPreview);
+  let newTabs = [...tabs];
+  
+  if (currentPreview && currentPreview.id !== path) {
+    newTabs = newTabs.filter(t => t.id !== currentPreview.id);
+  }
+
+  if (!newTabs.find(t => t.id === path)) {
+    const newTab: FileTab = {
+      id: path,
+      path: path,
+      name: path.split('/').pop() || path,
+      language: getLanguageFromPath(path),
+      isDirty: false,
+      isPreview: true,
+      isPinned: false,
+      isModified: false,
+    };
+    newTabs.push(newTab);
+  }
+  
+  set({
+    tabs: newTabs,
+    openFilePath: path,
+    openFileOptions: options,
+    selectedTabIds: [path],
+  });
+},
+
+openPermanently: (path, options) => {
+  const { tabs } = get();
+  const existingTab = tabs.find(t => t.id === path);
+  let newTabs = [...tabs];
+  
+  if (existingTab) {
+    newTabs = newTabs.map(t => 
+      t.id === path ? { ...t, isPreview: false } : t
+    );
+  } else {
+    const currentPreview = tabs.find(t => t.isPreview);
+    if (currentPreview) {
+      newTabs = newTabs.filter(t => t.id !== currentPreview.id);
+    }
+    const newTab: FileTab = {
+      id: path,
+      path: path,
+      name: path.split('/').pop() || path,
+      language: getLanguageFromPath(path),
+      isDirty: false,
+      isPreview: false,
+      isPinned: false,
+      isModified: false,
+    };
+    newTabs.push(newTab);
+  }
+  
+  set({
+    tabs: newTabs,
+    openFilePath: path,
+    openFileOptions: options,
+    selectedTabIds: [path],
+  });
+},
+
+promoteCurrentPreview: () => {
+  const { tabs, openFilePath } = get();
+  const activeTab = tabs.find(t => t.id === openFilePath);
+  
+  if (activeTab && activeTab.isPreview) {
+    const newTabs = tabs.map(t => 
+      t.id === openFilePath ? { ...t, isPreview: false } : t
+    );
+    set({ tabs: newTabs });
+  }
+},
+
+selectTab: (tabId) => {
+  const { tabs } = get();
+  const activeTab = tabs.find(t => t.id === tabId);
+  const newTabs = activeTab && activeTab.isPreview
+    ? tabs.map(t => t.id === tabId ? { ...t, isPreview: false } : t)
+    : tabs;
+  
+  set({
+    tabs: newTabs,
+    openFilePath: tabId,
+    selectedTabIds: [tabId],
+  });
+},
+
+closeTab: (tabId) => {
+  const { tabs, openFilePath, selectedTabIds } = get();
+  const filteredTabs = tabs.filter(t => t.id !== tabId);
+  let newActiveId: string | undefined = openFilePath;
+
+  if (openFilePath === tabId) {
+    const closedIndex = tabs.findIndex(t => t.id === tabId);
+    if (filteredTabs.length > 0) {
+      newActiveId = filteredTabs[Math.max(0, closedIndex - 1)].id;
+    } else {
+      newActiveId = undefined;
+    }
+  }
+
+  set({
+    tabs: filteredTabs,
+    openFilePath: newActiveId,
+    selectedTabIds: selectedTabIds.filter(id => id !== tabId),
+  });
+},
+
+closeOtherTabs: (tabId) => {
+  const { tabs } = get();
+  const filteredTabs = tabs.filter(t => t.id === tabId || t.isPinned);
+  
+  set({
+    tabs: filteredTabs,
+    openFilePath: tabId,
+    selectedTabIds: [tabId],
+  });
+},
+
+closeAllTabs: () => {
+  const { tabs } = get();
+  const filteredTabs = tabs.filter(t => t.isPinned);
+  
+  set({
+    tabs: filteredTabs,
+    openFilePath: undefined,
+    selectedTabIds: [],
+  });
+},
+
+pinTab: (tabId, pin) => {
+  const { tabs } = get();
+  const newTabs = tabs.map(t => 
+    t.id === tabId 
+      ? { ...t, isPinned: pin, isPreview: pin ? false : t.isPreview }
+      : t
+  );
+  
+  set({ tabs: newTabs });
+},
+
+setOpenFileOptions: (options) => {
+    set({ openFileOptions: options });
+},
+
+updateTab: (tabId, updates) => {
+  set(state => ({
+    tabs: state.tabs.map(t =>
+      t.id === tabId
+        ? { ...t, ...updates }
+        : t
+    )
+  }));
+},
+toggleTabSelection: (tabId) => {
+  const { selectedTabIds } = get();
+  const isSelected = selectedTabIds.includes(tabId);
+  const newSelectedTabIds = isSelected
+    ? selectedTabIds.filter(id => id !== tabId)
+    : [...selectedTabIds, tabId];
+  
+  set({ selectedTabIds: newSelectedTabIds });
+},
+
+reorderTabs: (fromIndex, toIndex) => {
+  const { tabs } = get();
+  const newTabs = [...tabs];
+  const [movedTab] = newTabs.splice(fromIndex, 1);
+  newTabs.splice(toIndex, 0, movedTab);
+  
+  set({ tabs: newTabs });
+},
+
+
+  closeFile: (path) => {
+    get().closeTab(path);
+  },
+
+  reset: () => {
+    console.log('resetting workspace store');
+    // Preserve tokenBudget from localStorage during reset
+    set({
+      ...initialState,
+      tokenBudget: getStoredTokenBudget(),
+    });
+  },
+  loadFileTree: measure(async (path: string) => {
+    try {
+      const data = await http<{
+        tree: FileNode[];
+        tree_string_token_count: number;
+      }>(`/api/files/tree?path=${encodeURIComponent(path)}`);
+      set({
+        fileTree: data.tree || [],
+        treeStringTokenCount: data.tree_string_token_count || 0,
+      });
+    } catch (error: any) {
+      set({ fileTree: [] });
+      throw error;
+    }
+  }, 'loadFileTree')
+}));
