@@ -1,0 +1,118 @@
+--- a/src/pages/workspace/SaveNewFileDialog.tsx
++++ b/src/pages/workspace/SaveNewFileDialog.tsx
+@@ -16,6 +16,7 @@
+   onSave: (path: string) => void;
+   fileName: string;
+   language: string;
++  basePath?: string;
+ }
+ 
+ export const SaveNewFileDialog: React.FC<SaveNewFileDialogProps> = ({
+@@ -24,6 +25,7 @@
+   onSave,
+   fileName,
+   language,
++  basePath = '',
+ }) => {
+   const [path, setPath] = useState('');
+   const inputRef = useRef<HTMLInputElement>(null);
+@@ -31,7 +33,7 @@
+   useEffect(() => {
+     if (isOpen) {
+       const ext = langToExt[language] || '';
+-      const initialValue = `${fileName}${ext}`;
++      const initialValue = `${basePath}${fileName}${ext}`;
+       setPath(initialValue);
+       
+       setTimeout(() => {
+@@ -42,7 +44,7 @@
+         }
+       }, 100);
+     }
+-  }, [isOpen, fileName, language]);
++  }, [isOpen, fileName, language, basePath]);
+ 
+   const handleSave = () => {
+     if (path.trim()) {
+
+``````diff
+--- a/src/pages/workspace/explorer/FileExplorer.tsx
++++ b/src/pages/workspace/explorer/FileExplorer.tsx
+@@ -29,6 +29,7 @@
+   useProcessedFileTree,
+ } from "@/hooks/workspace/useFileTree";
+ import { useIsMobile } from "@/hooks/use-is-mobile";
++import { SaveNewFileDialog } from "../SaveNewFileDialog";
+ import { useShallow } from 'zustand/react/shallow';
+ import { useUiStore } from '@/stores/ui';
+ import { WorkspaceSearch } from "./WorkspaceSearch";
+@@ -217,6 +218,36 @@
+     isGitPanelVisible: state.isGitPanelVisible,
+     setIsGitPanelVisible: state.setIsGitPanelVisible,
+   })));
++  const [newFileDialog, setNewFileDialog] = useState<{ isOpen: boolean, basePath: string }>({ isOpen: false, basePath: '' });
++  
++  const handleCreateNewFile = (node: FileNode) => {
++    const basePath = node.type === 'directory' 
++      ? (node.path.endsWith('/') ? node.path : `${node.path}/`) 
++      : (node.path.substring(0, node.path.lastIndexOf('/') + 1) || '');
++    setNewFileDialog({ isOpen: true, basePath });
++  };
++  
++  const handleSaveNewFileFromDialog = async (newPath: string) => {
++      try {
++        // The path from the dialog will include the base path, so it's a full path
++        await http<void>(`/api/files/content`, {
++          method: 'POST',
++          body: JSON.stringify({
++            path: newPath,
++            content: '',
++          }),
++        });
++        toast.success(`File "${newPath}" created.`);
++        setNewFileDialog({ isOpen: false, basePath: '' });
++        onRefresh();
++        openPermanently(newPath);
++      } catch (error: any) {
++        toast.error('Failed to create file.', { description: error.message });
++      }
++    };
++
++
+   const [showIgnoredFiles, setShowIgnoredFiles] = useState(false);
+   const [showSelectedFilesOnly, setShowSelectedFilesOnly] = useState(false);
+   const isMobile = useIsMobile();
+@@ -375,7 +406,7 @@
+             <FileContextMenu
+               onRename={() => handleDummyAction("Rename", node.path)}
+               onDelete={() => handleDummyAction("Delete", node.path)}
+-              onCreateNewFile={() => handleDummyAction("New File", node.path)}
++              onCreateNewFile={() => handleCreateNewFile(node)}
+               onCopyFile={
+                 node.type === "file"
+                   ? () => copyFileToClipboard(node)
+@@ -515,6 +546,15 @@
+   );
+ 
+   return (
++    <>
++      <SaveNewFileDialog
++        isOpen={newFileDialog.isOpen}
++        onClose={() => setNewFileDialog({ isOpen: false, basePath: '' })}
++        onSave={handleSaveNewFileFromDialog}
++        fileName=""
++        language="plaintext"
++        basePath={newFileDialog.basePath}
++      />
+     <ScrollArea className="h-full p-1 border rounded">
+       <div className="sticky top-0 z-30 flex justify-between items-center mb-1 pl-1 bg-background pb-1">
+         <div className="flex items-center gap-1">
+@@ -569,6 +609,7 @@
+       }
+       <ScrollBar orientation="horizontal" />
+     </ScrollArea>
++    </>
+   );
+ };
+# === RESULT ===
+2
