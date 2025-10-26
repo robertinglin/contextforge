@@ -450,13 +450,14 @@ def _split_noncontiguous_hunks(hunks: list[dict]) -> list[dict]:
                 if had_context_after_additions and current_hunk_lines:
                     # Start a new hunk
                     if current_hunk_lines:
-                        new_hunk = {
-                            "old_start": hunk["old_start"],
-                            "old_len": 0,  # Will be calculated
-                            "new_start": hunk["new_start"],
-                            "new_len": 0,  # Will be calculated
-                            "lines": current_hunk_lines[:]
-                        }
+                        new_hunk = {"lines": current_hunk_lines[:]}
+                        if "old_start" in hunk:
+                            new_hunk.update({
+                                "old_start": hunk["old_start"],
+                                "old_len": 0,
+                                "new_start": hunk["new_start"],
+                                "new_len": 0,
+                            })
                         split_hunks.append(new_hunk)
                         current_hunk_lines = []
                         had_context_after_additions = False
@@ -476,13 +477,14 @@ def _split_noncontiguous_hunks(hunks: list[dict]) -> list[dict]:
         
         # Add the final hunk
         if current_hunk_lines:
-            new_hunk = {
-                "old_start": hunk["old_start"],
-                "old_len": 0,
-                "new_start": hunk["new_start"],
-                "new_len": 0,
-                "lines": current_hunk_lines
-            }
+            new_hunk = {"lines": current_hunk_lines}
+            if "old_start" in hunk:
+                new_hunk.update({
+                    "old_start": hunk["old_start"],
+                    "old_len": 0,
+                    "new_start": hunk["new_start"],
+                    "new_len": 0,
+                })
             split_hunks.append(new_hunk)
     
     return split_hunks
