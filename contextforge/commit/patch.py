@@ -792,7 +792,7 @@ def _find_all_hunk_candidates(
         log.debug(f"Searching for anchor (changed content): {len(changed_lines)} lines")
         
         # Search for changed content with fuzzy matching
-        for i in range(max(0, search_min), min(len(target_lines), search_max)):
+        for i in range(max(0, search_min), min(len(target_lines) - len(changed_lines) + 1, search_max)):
             window = target_lines[i : i + len(changed_lines)]
             
             # Exact match on changed lines
