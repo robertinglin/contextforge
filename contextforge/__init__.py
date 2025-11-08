@@ -1,5 +1,5 @@
 # contextforge/__init__.py
-from .commit import commit_changes, patch_text
+from .commit import commit_changes, patch_text, fuzzy_patch_partial
 from .context import build_context
 from .core import parse_markdown_string, plan_and_generate_changes
 from .errors import (
@@ -25,6 +25,7 @@ __all__ = [
     "extract_diffs_from_text",
     "extract_file_info_from_context_and_code",
     "detect_new_files",
+    "fuzzy_patch_partial",
     "patch_text",
     "commit_changes",
     "append_context",
