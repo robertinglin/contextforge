@@ -3,10 +3,14 @@ import contextlib
 import os
 import shutil
 import tempfile
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from ..errors.path import PathViolation
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -151,6 +155,10 @@ def commit_changes(
                 continue
             try:
                 dirpath = os.path.dirname(resolved)
+                if ch.action not in ("create", "modify"):
+                    # Only create content for create/modify. Other actions are handled later.
+                    continue
+
                 os.makedirs(dirpath, exist_ok=True)
                 fd, tmp = tempfile.mkstemp(prefix=".cf-", suffix=".tmp", dir=dirpath)
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -165,9 +173,13 @@ def commit_changes(
 
         if staging_failed and mode == "fail_fast":
             # Nothing promoted yet: delete stage files; filesystem unchanged.
-            for tmp, _ch in [v for v in staged.values()]:
-                with contextlib.suppress(Exception):
-                    os.remove(tmp)
+            for dest, (tmp, _ch) in list(staged.items()):
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    # Best-effort cleanup; do not raise.
+                    pass
             return summary
 
         # Phase 2: Apply all changes (deletes, renames, promotions)
@@ -176,9 +188,20 @@ def commit_changes(
             try:
                 if ch.action in ("create", "modify"):
                     dest = resolved
-                    tmp, _ = staged[dest]
+                    staged_entry = staged.get(dest)
+                    # It is possible (for malformed input) to have a modify without staged content.
+                    if not staged_entry:
+                        raise FileNotFoundError(f"Missing staged content for {ch.action} '{ch.path}'")
+                    tmp, _ = staged_entry
                     # Optional backup of existing file before replacement
                     if backup_ext and os.path.exists(dest) and ch.action == "modify":
+                        # If original_content is None, read from disk so backups are faithful.
+                        if ch.original_content is None:
+                            try:
+                                with open(dest, "r", encoding="utf-8") as src_f:
+                                    ch.original_content = src_f.read()
+                            except OSError:
+                                ch.original_content = ""
                         with open(_backup_path(dest, backup_ext), "w", encoding="utf-8") as b:
                             b.write(ch.original_content or "")
                     os.replace(tmp, dest)  # atomic within a filesystem
@@ -201,29 +224,46 @@ def commit_changes(
                 summary.errors[ch.path] = str(e)
                 # Ensure staged blob is cleaned up if replace failed
                 if ch.action in ("create", "modify"):
-                    tmp, _ = staged[resolved]
-                    with contextlib.suppress(Exception):
-                        if os.path.exists(tmp):
-                            os.remove(tmp)
+                    staged_entry = staged.get(resolved)
+                    if staged_entry:
+                        tmp, _ = staged_entry
+                        with contextlib.suppress(Exception):
+                            if os.path.exists(tmp):
+                                os.remove(tmp)
 
                 if mode == "fail_fast":
                     # Roll back previous promotions—restore original contents.
                     for pth, pch in reversed(promoted):
                         try:
                             if pch.action == "create":
+                                # Created file: just remove it.
                                 with contextlib.suppress(Exception):
-                                    os.remove(pth)
+                                    if os.path.exists(pth):
+                                        os.remove(pth)
                             elif pch.action == "modify":
-                                with open(pth, "w", encoding="utf-8") as f:
-                                    f.write(pch.original_content or "")
+                                # Restore original contents if we have them; if not, best-effort no-op.
+                                if pch.original_content is not None:
+                                    try:
+                                        with open(pth, "w", encoding="utf-8") as f:
+                                            f.write(pch.original_content)
+                                    except OSError:
+                                        pass
                             elif pch.action == "delete":
-                                # This is tricky, we'd need original content to restore
-                                with open(pth, "w", encoding="utf-8") as f:
-                                    f.write(pch.original_content or "")
+                                # Deleted file: only restore if we have original content.
+                                if pch.original_content is not None:
+                                    try:
+                                        with open(pth, "w", encoding="utf-8") as f:
+                                            f.write(pch.original_content)
+                                    except OSError:
+                                        pass
                             elif pch.action == "rename" and pch.from_path:
-                                from_path_rb = _normalized_path(base_real, pch.from_path, check_exists=False)
+                                # Move file back to original path.
+                                from_path_rb = _normalized_path(
+                                    base_real, pch.from_path, check_exists=False
+                                )
                                 with contextlib.suppress(Exception):
-                                    os.rename(pth, from_path_rb)
+                                    if os.path.exists(pth):
+                                        os.rename(pth, from_path_rb)
                         except Exception:
                             # Best-effort rollback; remain silent per library default.
                             pass
@@ -232,6 +272,8 @@ def commit_changes(
         return summary
 
     # Non-atomic path: write each file directly.
+    # NOTE: This mode is intentionally best-effort and does NOT guarantee a clean FS
+    # on failure. It also does not attempt a rollback if mode == "fail_fast".
     written: List[Tuple[str, Change]] = []
     for ch, resolved in normalized:
         try:
@@ -242,6 +284,15 @@ def commit_changes(
                     shutil.copy2(resolved, _backup_path(resolved, backup_ext))
                 with open(resolved, "w", encoding="utf-8") as f:
                     f.write(ch.new_content or "")
+                # If this was a modify and original_content is missing, populate it
+                # so callers inspecting CommitSummary/written changes have accurate data.
+                if ch.action == "modify" and ch.original_content is None:
+                    try:
+                        with open(resolved, "r", encoding="utf-8") as rf:
+                            ch.original_content = rf.read()
+                    except OSError:
+                        # Best effort; if we can't read it, leave as None.
+                        pass
                 summary.success.append(ch.path)
                 written.append((resolved, ch))
             elif ch.action == "delete":

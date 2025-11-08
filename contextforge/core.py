@@ -3,7 +3,12 @@ import logging
 import os
 from typing import Dict, Generator, List, Any
 
-from patch import fromstring as patch_fromstring
+try:
+    # Optional dependency: python-patch or compatible.
+    # If unavailable, we fall back to our internal fuzzy patcher.
+    from patch import fromstring as patch_fromstring  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - absent in many environments
+    patch_fromstring = None  # type: ignore[assignment]
 
 from .commit import Change, patch_text
 from .errors import PatchFailedError
@@ -134,16 +139,24 @@ def plan_and_generate_changes(planned_changes: List[Dict], codebase_dir: str) ->
             new_content = block["code"]
         elif change_type == "diff":
             try:
-                patch_set = patch_fromstring(block["code"].encode("utf-8"))
-                applied_bytes = patch_set.apply(original_content.encode("utf-8"))
-                if applied_bytes is False:
-                    raise ValueError("Standard patch library returned False.")
-                new_content = applied_bytes.decode("utf-8")
+                if patch_fromstring is not None:
+                    # First, try the standard patch library if available.
+                    patch_set = patch_fromstring(block["code"].encode("utf-8"))
+                    applied_bytes = patch_set.apply(original_content.encode("utf-8"))
+                    if applied_bytes is False:
+                        raise ValueError("Standard patch library returned False.")
+                    new_content = applied_bytes.decode("utf-8")
+                else:
+                    # Directly use our robust fuzzy patcher.
+                    new_content = patch_text(original_content, block["code"])
             except Exception:
+                # Fallback to fuzzy patch if the standard library either failed or mis-applied.
                 try:
                     new_content = patch_text(original_content, block["code"])
                 except PatchFailedError as e:
-                    logger.error(f"  - ERROR: Fuzzy patch failed for {file_path}: {e}")
+                    logger.error(
+                        f"  - ERROR: Fuzzy patch failed for {file_path}: {e}"
+                    )
                     new_content = None
         else:
             logger.info(f"  - Unknown change type '{change_type}' for {file_path}. Skipping.")

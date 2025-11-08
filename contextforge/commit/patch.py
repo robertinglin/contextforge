@@ -1305,8 +1305,16 @@ def patch_text(
     """
     log = resolve_logger(logger=logger, enabled=log, name=__name__, level=logging.DEBUG)
 
+    # If an explicit debug flag is provided, override the enabled state.
+    # NOTE: we must not replace the logger with a bare bool.
     if debug is not None:
-        log = log or bool(debug)
+        if isinstance(log, logging.Logger):
+            # Ensure logger is enabled at DEBUG level when debug is True.
+            if debug:
+                log.setLevel(logging.DEBUG)
+        else:
+            # Re-resolve to a real logger or NoopLogger based on debug flag.
+            log = resolve_logger(logger=None, enabled=bool(debug), name=__name__, level=logging.DEBUG)
 
     # Structured patch path: list of dicts
     if isinstance(patch, list):
