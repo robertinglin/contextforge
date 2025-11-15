@@ -1,0 +1,544 @@
+import getLogger from '@mesh/logger';
+
+const logger = getLogger('AudioSink');
+const AUTOPLAY_EVENTS: Array<keyof DocumentEventMap> = ['click', 'touchstart', 'keydown'];
+
+/**
+ * Minimal audio sink that mirrors the behaviour used in example_app.js.
+ * Creates hidden <audio> tags for every remote participant and retries
+ * playback on the next user interaction when Chrome blocks autoplay.
+ */
+export class AudioSink {
+  private container: HTMLElement | null = null;
+  private elements = new Map<string, HTMLAudioElement>();
+  private pendingPlay = new Set<HTMLAudioElement>();
+  private interactionHandler: (() => void) | null = null;
+
+  public attach(userId: string, stream: MediaStream): void {
+    if (typeof document === 'undefined') return;
+
+    logger.info({ userId, streamId: stream.id }, '[AudioSink-Debug] Attach called.');
+    const element = this.elements.get(userId) ?? this.createElement(userId);
+
+    // Original behavior without delay.
+    if (element.srcObject !== stream) {
+      element.srcObject = stream;
+    }
+  
+    setTimeout(() => this.tryPlay(element), 0);
+  }
+
+  public setMute(userId: string, muted: boolean): void {
+    const element = this.elements.get(userId);
+    if (element) {
+      element.muted = muted;
+    }
+  }
+
+  public detach(userId: string): void {
+    const element = this.elements.get(userId);
+    if (!element) return;
+    logger.info({ userId }, '[AudioSink-Debug] Detaching audio element.');
+
+    this.elements.delete(userId);
+    this.pendingPlay.delete(element);
+    element.pause();
+    element.srcObject = null;
+    element.remove();
+  }
+
+  public clear(): void {
+    logger.info('[AudioSink-Debug] Clear called. Detaching all elements.');
+    this.elements.forEach((_, userId) => this.detach(userId));
+    this.disableInteractionFallback();
+  }
+
+  private ensureContainer(): HTMLElement | null {
+    if (typeof document === 'undefined') return null;
+    if (this.container?.isConnected) return this.container;
+
+    const existing = document.getElementById('voice-audio-sink');
+    if (existing) {
+      this.container = existing;
+      return this.container;
+    }
+
+    const sink = document.createElement('div');
+    sink.id = 'voice-audio-sink';
+    sink.style.position = 'fixed';
+    sink.style.left = '-9999px';
+    sink.style.bottom = '0';
+    sink.style.width = '1px';
+    sink.style.height = '1px';
+    sink.style.overflow = 'hidden';
+    document.body.appendChild(sink);
+    this.container = sink;
+    return sink;
+  }
+
+  private createElement(userId: string): HTMLAudioElement {
+    const container = this.ensureContainer();
+    logger.info({ userId }, '[AudioSink-Debug] Creating new <audio> element.');
+    const audio = document.createElement('audio');
+    audio.dataset.userId = userId;
+    audio.autoplay = true;
+    audio.playsInline = true;
+    audio.controls = false;
+    audio.muted = false;
+    audio.preload = 'auto';
+
+    container?.appendChild(audio);
+    this.elements.set(userId, audio);
+    return audio;
+  }
+
+  private tryPlay(audio: HTMLAudioElement): void {
+    logger.info({ userId: audio.dataset.userId }, '[AudioSink-Debug] Attempting to play audio...');
+    audio
+      .play()
+      .then(() => {
+        this.pendingPlay.delete(audio);
+      })
+      .catch((error) => {
+        // Autoplay restrictions (Chrome) manifest as NotAllowedError.
+        logger.warn({ userId: audio.dataset.userId, error }, 'Audio playback failed or was interrupted.');
+        this.pendingPlay.add(audio);
+        this.enableInteractionFallback();
+      });
+  }
+
+  private enableInteractionFallback(): void {
+    if (this.interactionHandler || typeof document === 'undefined') return;
+
+    this.interactionHandler = () => {
+      this.flushPending();
+      if (this.pendingPlay.size === 0) {
+        this.disableInteractionFallback();
+      }
+    };
+
+    AUTOPLAY_EVENTS.forEach((event) =>
+      document.addEventListener(event, this.interactionHandler!, { once: false }),
+    );
+  }
+
+  private disableInteractionFallback(): void {
+    if (!this.interactionHandler || typeof document === 'undefined') return;
+    AUTOPLAY_EVENTS.forEach((event) =>
+      document.removeEventListener(event, this.interactionHandler!),
+    );
+    this.interactionHandler = null;
+  }
+
+  private flushPending(): void {
+    this.pendingPlay.forEach((audio) => this.tryPlay(audio));
+  }
+}
+# === TEST ===
+```diff
+--- a/packages/voice/src/AudioSink.ts
++++ b/packages/voice/src/AudioSink.ts
+@@ -3,17 +3,42 @@
+ const logger = getLogger('AudioSink');
+ const AUTOPLAY_EVENTS: Array<keyof DocumentEventMap> = ['click', 'touchstart', 'keydown'];
+ 
++interface AudioNodes {
++  source: MediaStreamAudioSourceNode;
++  gain: GainNode;
++  destination: MediaStreamAudioDestinationNode;
++}
++
+ /**
+  * Minimal audio sink that mirrors the behaviour used in example_app.js.
+  * Creates hidden <audio> tags for every remote participant and retries
+  * playback on the next user interaction when Chrome blocks autoplay.
++ *
++ * This version uses the Web Audio API to allow for volume amplification
++ * (volume > 100%) via a GainNode.
+  */
+ export class AudioSink {
+   private container: HTMLElement | null = null;
+   private elements = new Map<string, HTMLAudioElement>();
+   private pendingPlay = new Set<HTMLAudioElement>();
+   private interactionHandler: (() => void) | null = null;
++  private audioContext: AudioContext | null = null;
++  private audioNodes = new Map<string, AudioNodes>();
+ 
++  private initAudioContext(): AudioContext {
++    if (this.audioContext && this.audioContext.state !== 'closed') {
++      return this.audioContext;
++    }
++    const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
++    if (!AudioContext) {
++      throw new Error('Web Audio API not supported');
++    }
++    this.audioContext = new AudioContext();
++    logger.info('AudioContext created.');
++    return this.audioContext;
++  }
++
+   public attach(userId: string, stream: MediaStream): void {
+     if (typeof document === 'undefined') return;
+ 
+@@ -21,13 +46,30 @@
+     logger.info({ userId, streamId: stream.id }, '[AudioSink-Debug] Attach called.');
+     const element = this.elements.get(userId) ?? this.createElement(userId);
+ 
+-    // Original behavior without delay.
+-    if (element.srcObject !== stream) {
++    // Clean up previous nodes for this user if they exist
++    this.cleanupNodes(userId);
++
++    try {
++      const audioContext = this.initAudioContext();
++      const source = audioContext.createMediaStreamSource(stream);
++      const gain = audioContext.createGain();
++      const destination = audioContext.createMediaStreamDestination();
++
++      source.connect(gain);
++      gain.connect(destination);
++
++      this.audioNodes.set(userId, { source, gain, destination });
++
++      if (element.srcObject !== destination.stream) {
++        element.srcObject = destination.stream;
++      }
++
++      setTimeout(() => this.tryPlay(element), 0);
++    } catch (error) {
++      logger.error({ userId, error }, '[AudioSink] Failed to set up audio nodes. Falling back to direct stream.');
+       element.srcObject = stream;
++      setTimeout(() => this.tryPlay(element), 0);
+     }
+-  
+-    setTimeout(() => this.tryPlay(element), 0);
+   }
+ 
+   public setMute(userId: string, muted: boolean): void {
+@@ -38,6 +80,26 @@
+     }
+   }
+ 
++  public setVolume(userId: string, volume: number): void {
++    const nodes = this.audioNodes.get(userId);
++    if (nodes) {
++      // Gain value is a linear multiplier.
++      nodes.gain.gain.setValueAtTime(volume, this.audioContext!.currentTime);
++      logger.info({ userId, volume }, '[AudioSink] Set volume.');
++    } else {
++      logger.warn({ userId, volume }, '[AudioSink] Cannot set volume, no audio nodes found. Falling back to element volume.');
++      const element = this.elements.get(userId);
++      if(element) {
++        // The native volume property is clamped between 0 and 1.
++        element.volume = Math.max(0, Math.min(1, volume));
++      }
++    }
++  }
++  private cleanupNodes(userId: string): void {
++    const nodes = this.audioNodes.get(userId);
++    if (nodes) {
++      nodes.source.disconnect();
++      nodes.gain.disconnect();
++      this.audioNodes.delete(userId);
++    }
++  }
++
+   public detach(userId: string): void {
+     const element = this.elements.get(userId);
+     if (!element) return;
+@@ -48,12 +110,20 @@
+     element.pause();
+     element.srcObject = null;
+     element.remove();
++
++    this.cleanupNodes(userId);
+   }
+ 
+   public clear(): void {
+     logger.info('[AudioSink-Debug] Clear called. Detaching all elements.');
+     this.elements.forEach((_, userId) => this.detach(userId));
+     this.disableInteractionFallback();
++    if (this.audioContext && this.audioContext.state !== 'closed') {
++      this.audioContext.close().then(() => {
++        this.audioContext = null;
++        logger.info('AudioContext closed.');
++      });
++    }
+   }
+ 
+   private ensureContainer(): HTMLElement | null {
+@@ -98,6 +168,14 @@
+ 
+   private tryPlay(audio: HTMLAudioElement): void {
+     logger.info({ userId: audio.dataset.userId }, '[AudioSink-Debug] Attempting to play audio...');
++
++    if (this.audioContext && this.audioContext.state === 'suspended') {
++      logger.warn('[AudioSink] AudioContext is suspended. Playback will be deferred until user interaction.');
++      this.pendingPlay.add(audio);
++      this.enableInteractionFallback();
++      return;
++    }
++
+     audio
+       .play()
+       .then(() => {
+@@ -110,12 +188,21 @@
+         this.enableInteractionFallback();
+       });
+   }
++  private async flushPending(): Promise<void> {
++    if (this.audioContext && this.audioContext.state === 'suspended') {
++      try {
++        await this.audioContext.resume();
++        logger.info('[AudioSink] AudioContext resumed on user interaction.');
++      } catch (e) {
++        logger.error({ err: e }, '[AudioSink] Failed to resume AudioContext.');
++      }
++    }
++    this.pendingPlay.forEach((audio) => this.tryPlay(audio));
++  }
+ 
+   private enableInteractionFallback(): void {
+     if (this.interactionHandler || typeof document === 'undefined') return;
+ 
+-    this.interactionHandler = () => {
++    this.interactionHandler = () => {
+       this.flushPending();
+       if (this.pendingPlay.size === 0) {
+         this.disableInteractionFallback();
+@@ -136,8 +223,4 @@
+     );
+     this.interactionHandler = null;
+   }
+-
+-  private flushPending(): void {
+-    this.pendingPlay.forEach((audio) => this.tryPlay(audio));
+-  }
+ }
+```
+# === RESULT ===
+import getLogger from '@mesh/logger';
+
+const logger = getLogger('AudioSink');
+const AUTOPLAY_EVENTS: Array<keyof DocumentEventMap> = ['click', 'touchstart', 'keydown'];
+
+interface AudioNodes {
+  source: MediaStreamAudioSourceNode;
+  gain: GainNode;
+  destination: MediaStreamAudioDestinationNode;
+}
+
+/**
+ * Minimal audio sink that mirrors the behaviour used in example_app.js.
+ * Creates hidden <audio> tags for every remote participant and retries
+ * playback on the next user interaction when Chrome blocks autoplay.
+ *
+ * This version uses the Web Audio API to allow for volume amplification
+ * (volume > 100%) via a GainNode.
+ */
+export class AudioSink {
+  private container: HTMLElement | null = null;
+  private elements = new Map<string, HTMLAudioElement>();
+  private pendingPlay = new Set<HTMLAudioElement>();
+  private interactionHandler: (() => void) | null = null;
+  private audioContext: AudioContext | null = null;
+  private audioNodes = new Map<string, AudioNodes>();
+
+  private initAudioContext(): AudioContext {
+    if (this.audioContext && this.audioContext.state !== 'closed') {
+      return this.audioContext;
+    }
+    const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioContext) {
+      throw new Error('Web Audio API not supported');
+    }
+    this.audioContext = new AudioContext();
+    logger.info('AudioContext created.');
+    return this.audioContext;
+  }
+
+  public attach(userId: string, stream: MediaStream): void {
+    if (typeof document === 'undefined') return;
+
+    logger.info({ userId, streamId: stream.id }, '[AudioSink-Debug] Attach called.');
+    const element = this.elements.get(userId) ?? this.createElement(userId);
+
+    // Clean up previous nodes for this user if they exist
+    this.cleanupNodes(userId);
+
+    try {
+      const audioContext = this.initAudioContext();
+      const source = audioContext.createMediaStreamSource(stream);
+      const gain = audioContext.createGain();
+      const destination = audioContext.createMediaStreamDestination();
+
+      source.connect(gain);
+      gain.connect(destination);
+
+      this.audioNodes.set(userId, { source, gain, destination });
+
+      if (element.srcObject !== destination.stream) {
+        element.srcObject = destination.stream;
+      }
+
+      setTimeout(() => this.tryPlay(element), 0);
+    } catch (error) {
+      logger.error({ userId, error }, '[AudioSink] Failed to set up audio nodes. Falling back to direct stream.');
+      element.srcObject = stream;
+      setTimeout(() => this.tryPlay(element), 0);
+    }
+  }
+
+  public setMute(userId: string, muted: boolean): void {
+    const element = this.elements.get(userId);
+    if (element) {
+      element.muted = muted;
+    }
+  }
+
+  public setVolume(userId: string, volume: number): void {
+    const nodes = this.audioNodes.get(userId);
+    if (nodes) {
+      // Gain value is a linear multiplier.
+      nodes.gain.gain.setValueAtTime(volume, this.audioContext!.currentTime);
+      logger.info({ userId, volume }, '[AudioSink] Set volume.');
+    } else {
+      logger.warn({ userId, volume }, '[AudioSink] Cannot set volume, no audio nodes found. Falling back to element volume.');
+      const element = this.elements.get(userId);
+      if(element) {
+        // The native volume property is clamped between 0 and 1.
+        element.volume = Math.max(0, Math.min(1, volume));
+      }
+    }
+  }
+  private cleanupNodes(userId: string): void {
+    const nodes = this.audioNodes.get(userId);
+    if (nodes) {
+      nodes.source.disconnect();
+      nodes.gain.disconnect();
+      this.audioNodes.delete(userId);
+    }
+  }
+
+  public detach(userId: string): void {
+    const element = this.elements.get(userId);
+    if (!element) return;
+    logger.info({ userId }, '[AudioSink-Debug] Detaching audio element.');
+
+    this.elements.delete(userId);
+    this.pendingPlay.delete(element);
+    element.pause();
+    element.srcObject = null;
+    element.remove();
+
+    this.cleanupNodes(userId);
+  }
+
+  public clear(): void {
+    logger.info('[AudioSink-Debug] Clear called. Detaching all elements.');
+    this.elements.forEach((_, userId) => this.detach(userId));
+    this.disableInteractionFallback();
+    if (this.audioContext && this.audioContext.state !== 'closed') {
+      this.audioContext.close().then(() => {
+        this.audioContext = null;
+        logger.info('AudioContext closed.');
+      });
+    }
+  }
+
+  private ensureContainer(): HTMLElement | null {
+    if (typeof document === 'undefined') return null;
+    if (this.container?.isConnected) return this.container;
+
+    const existing = document.getElementById('voice-audio-sink');
+    if (existing) {
+      this.container = existing;
+      return this.container;
+    }
+
+    const sink = document.createElement('div');
+    sink.id = 'voice-audio-sink';
+    sink.style.position = 'fixed';
+    sink.style.left = '-9999px';
+    sink.style.bottom = '0';
+    sink.style.width = '1px';
+    sink.style.height = '1px';
+    sink.style.overflow = 'hidden';
+    document.body.appendChild(sink);
+    this.container = sink;
+    return sink;
+  }
+
+  private createElement(userId: string): HTMLAudioElement {
+    const container = this.ensureContainer();
+    logger.info({ userId }, '[AudioSink-Debug] Creating new <audio> element.');
+    const audio = document.createElement('audio');
+    audio.dataset.userId = userId;
+    audio.autoplay = true;
+    audio.playsInline = true;
+    audio.controls = false;
+    audio.muted = false;
+    audio.preload = 'auto';
+
+    container?.appendChild(audio);
+    this.elements.set(userId, audio);
+    return audio;
+  }
+
+  private tryPlay(audio: HTMLAudioElement): void {
+    logger.info({ userId: audio.dataset.userId }, '[AudioSink-Debug] Attempting to play audio...');
+
+    if (this.audioContext && this.audioContext.state === 'suspended') {
+      logger.warn('[AudioSink] AudioContext is suspended. Playback will be deferred until user interaction.');
+      this.pendingPlay.add(audio);
+      this.enableInteractionFallback();
+      return;
+    }
+
+    audio
+      .play()
+      .then(() => {
+        this.pendingPlay.delete(audio);
+      })
+      .catch((error) => {
+        // Autoplay restrictions (Chrome) manifest as NotAllowedError.
+        logger.warn({ userId: audio.dataset.userId, error }, 'Audio playback failed or was interrupted.');
+        this.pendingPlay.add(audio);
+        this.enableInteractionFallback();
+      });
+  }
+  private async flushPending(): Promise<void> {
+    if (this.audioContext && this.audioContext.state === 'suspended') {
+      try {
+        await this.audioContext.resume();
+        logger.info('[AudioSink] AudioContext resumed on user interaction.');
+      } catch (e) {
+        logger.error({ err: e }, '[AudioSink] Failed to resume AudioContext.');
+      }
+    }
+    this.pendingPlay.forEach((audio) => this.tryPlay(audio));
+  }
+
+  private enableInteractionFallback(): void {
+    if (this.interactionHandler || typeof document === 'undefined') return;
+
+    this.interactionHandler = () => {
+      this.flushPending();
+      if (this.pendingPlay.size === 0) {
+        this.disableInteractionFallback();
+      }
+    };
+
+    AUTOPLAY_EVENTS.forEach((event) =>
+      document.addEventListener(event, this.interactionHandler!, { once: false }),
+    );
+  }
+
+  private disableInteractionFallback(): void {
+    if (!this.interactionHandler || typeof document === 'undefined') return;
+    AUTOPLAY_EVENTS.forEach((event) =>
+      document.removeEventListener(event, this.interactionHandler!),
+    );
+    this.interactionHandler = null;
+  }
+}
