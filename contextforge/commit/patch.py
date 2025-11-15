@@ -59,7 +59,16 @@ def _find_block_end_by_braces(lines: list[str], start: int) -> int:
 
 def _eq_loose(a: str, b: str) -> bool:
     """Whitespace-insensitive equality for fuzzy/context matching."""
-    return a == b or a.strip() == b.strip()
+    if a == b:
+        return True
+    a_stripped = a.strip()
+    b_stripped = b.strip()
+    if a_stripped == b_stripped:
+        return True
+    # Also try stripping trailing semicolons (but not commas, as they're significant in many contexts)
+    a_no_semi = a_stripped.rstrip(';')
+    b_no_semi = b_stripped.rstrip(';')
+    return a_no_semi == b_no_semi
 
 
 def _indent(s: str) -> int:
@@ -738,9 +747,9 @@ def _find_all_hunk_candidates(
                 
                 lead_hits = _find_block_matches(target_lines, lead_slice, loose=True) if lead_slice else []
                 tail_hits = _find_block_matches(target_lines, tail_slice, loose=True) if tail_slice else []
-                
+
                 candidates = []
-                
+
                 if lead_hits and tail_hits:
                     # Find all valid insertion points between lead and tail matches
                     for L in lead_hits:
@@ -755,22 +764,38 @@ def _find_all_hunk_candidates(
                                     "confidence": 0.9,
                                     "distance_from_hint": abs(L_end - start_hint)
                                 })
-                
-                if not candidates:
-                    # Fallback to single best position if no valid pairs found
-                    ins_pos = _locate_insertion_index(target_lines, lead_ctx, tail_ctx, start_hint, ctx_probe)
-                    candidates = [{
-                        "start_idx": ins_pos,
-                        "end_idx": ins_pos,
-                        "replacement_lines": addition_lines,
-                        "match_type": "pure_addition",
-                        "confidence": 0.9,
-                        "distance_from_hint": abs(ins_pos - start_hint)
-                    }]
-                
-                # Sort by distance from hint
-                candidates.sort(key=lambda c: c["distance_from_hint"])
-                return candidates[:max_candidates]
+                elif lead_hits:
+                    # Only lead context matches - use it with lower confidence
+                    for L in lead_hits:
+                        L_end = L + len(lead_slice)
+                        if search_min <= L_end < search_max:
+                            candidates.append({
+                                "start_idx": L_end,
+                                "end_idx": L_end,
+                                "replacement_lines": addition_lines,
+                                "match_type": "pure_addition_lead_only",
+                                "confidence": 0.85,
+                                "distance_from_hint": abs(L_end - start_hint)
+                            })
+
+                # Only return early if we found candidates from matching context
+                if candidates:
+                    # Sort by distance from hint
+                    candidates.sort(key=lambda c: c["distance_from_hint"])
+                    return candidates[:max_candidates]
+
+                # If no context-based candidates found, use insertion heuristic as fallback
+                # This ensures pure additions always result in an insertion, not a replacement
+                log.debug("No valid pure addition candidates found with context matching, using insertion heuristic")
+                ins_pos = _locate_insertion_index(target_lines, lead_ctx, tail_ctx, start_hint, ctx_probe)
+                return [{
+                    "start_idx": ins_pos,
+                    "end_idx": ins_pos,
+                    "replacement_lines": addition_lines,
+                    "match_type": "pure_addition_fallback",
+                    "confidence": 0.7,
+                    "distance_from_hint": abs(ins_pos - start_hint)
+                }]
         
         # If additions are non-contiguous, fall through to block matching below
         log.debug("Non-contiguous additions - using block matching with from_lines")
