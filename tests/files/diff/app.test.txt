@@ -1,0 +1,452 @@
+import './App.css'
+import { Splash } from '@mesh/ui_splash'
+import { useAtomValue, useSetAtom } from 'jotai'
+import { useState, useEffect, useCallback } from 'react'
+import { identityAtom, privateKeyAtom, identityProfileAtom } from './atoms'
+import getLogger from '@mesh/logger'
+import { IdentityManager } from '@mesh/ui_user_settings'
+import { MeshChat } from '@mesh/ui_chrome'
+import { CreateServer, JoinServer } from '@mesh/ui_admin_settings'
+import { decodeInvite, type InviteData } from '@mesh/invite'
+import { services, identityService } from './services'
+import { Button, Card, Text } from '@mesh/elements'
+
+import { setupAppServices } from './services'
+// Ensure the app uses the same service graph as the rest of the UI.
+const { stateManager } = services
+
+const logger = getLogger('App')
+
+      setupAppServices()
+
+
+function App() {
+  const identity = useAtomValue(identityAtom)
+  const [hasServer, setHasServer] = useState(false)
+  const [showCreateServer, setShowCreateServer] = useState(false)
+  const [inviteData, setInviteData] = useState<InviteData | null>(null)
+  const [showJoinServer, setShowJoinServer] = useState(false)
+  const [appStarted, setAppStarted] = useState(false)
+  const setPrivateKey = useSetAtom(privateKeyAtom)
+  const setProfile = useSetAtom(identityProfileAtom)
+
+  // Bridge IdentityService events to Jotai atoms
+  useEffect(() => {
+    const handleIdentityChange = (identity: {
+      privkey: Uint8Array;
+      pubkey: string;
+      displayName?: string;
+      avatarUrl?: string;
+    } | null) => {
+      // 1. Update the private key atom used across the app.
+      setPrivateKey(identity ? identity.privkey : null);
+
+      // 2. When identity is cleared, also clear profile atom.
+      if (!identity) {
+        setProfile(null);
+        return;
+      }
+
+      // 3. Update profile atom with sanitized values.
+      const avatarUrl =
+        identity.avatarUrl && identity.avatarUrl.startsWith('data:image/')
+          ? identity.avatarUrl
+          : undefined;
+
+      setProfile({
+        displayName: identity.displayName,
+        avatarUrl,
+      });
+
+      // 4. Ensure transport/state graph see the new identity so server state can load.
+      try {
+        services.transportManager.setIdentity({
+          privkey: identity.privkey,
+          pubkey: identity.pubkey,
+          displayName: identity.displayName,
+          avatarUrl,
+        });
+      } catch (err) {
+        logger.error({ err }, 'Failed to propagate identity to TransportManager on identityChanged');
+      }
+    };
+
+    identityService.on('identityChanged', handleIdentityChange);
+    // Initial sync
+    handleIdentityChange(identityService.getIdentity());
+
+    return () => {
+      identityService.off('identityChanged', handleIdentityChange);
+    };
+  }, [setPrivateKey, setProfile]);
+
+  useEffect(() => {
+    if (!appStarted) return
+    setHasServer(stateManager.hasStoredServer())
+
+    // When identity becomes available and we already have a stored server,
+    // ensure TransportManager is wired so the mesh client gets created.
+    if (identity && stateManager.hasStoredServer()) {
+      try {
+        services.transportManager.setIdentity({
+          pubkey: identity.pubkey,
+          privkey: identity.privkey,
+          displayName: identity.displayName,
+          avatarUrl: identity.avatarUrl,
+        });
+      } catch(err) {
+        logger.error({ err }, 'Failed to set identity on TransportManager after app start');
+      }
+    }
+
+    const fragment = window.location.hash.slice(1)
+    if (fragment) {
+      try {
+        const invite = decodeInvite(fragment)
+        setInviteData(invite)
+        if (identity && !stateManager.hasStoredServer()) {
+          setShowJoinServer(true)
+        }
+      } catch (error) {
+        logger.warn({ err: error }, 'Invalid invite link.')
+        window.history.replaceState({}, document.title, window.location.pathname)
+        setInviteData(null)
+      }
+    } else {
+      setInviteData(null)
+    }
+  }, [identity, appStarted])
+
+  const handleStartApp = useCallback(() => {
+    setAppStarted(true)
+  }, [])
+
+  const handleServerCreated = () => {
+    setHasServer(true)
+    setShowCreateServer(false)
+    setShowJoinServer(false)
+    window.history.replaceState({}, document.title, window.location.pathname)
+  }
+
+  const handleServerJoined = () => {
+    setHasServer(true)
+    setShowJoinServer(false)
+    window.history.replaceState({}, document.title, window.location.pathname)
+  }
+
+  return (
+    <div className="app-shell">
+      {!appStarted ? (
+        <Splash onStart={handleStartApp} />
+      ) : (
+        <>
+          <header className="app-header">
+            <div className="app-logo">mesh</div>
+            <div className="header-actions">
+              <Text as="span">
+                {identity
+                  ? identity.displayName
+                    ? `${identity.displayName} (${identity.pubkey.slice(0, 8)}...)`
+                    : `Signed in as ${identity.pubkey.slice(0, 12)}...`
+                  : 'Load or generate an identity to continue'}
+              </Text>
+            </div>
+          </header>
+
+          <div className="app-content">
+            {!identity ? (
+              <Card style={{ maxWidth: 720, margin: '2rem auto', padding: '1.5rem' }}>
+                <IdentityManager />
+              </Card>
+            ) : (
+              <>
+                {identity && !hasServer && showJoinServer && inviteData && (
+                  <Card>
+                    <JoinServer inviteData={inviteData} onServerJoined={handleServerJoined} />
+                  </Card>
+                )}
+
+                {identity && showCreateServer && !hasServer && (
+                  <Card>
+                    <CreateServer onServerCreated={handleServerCreated} />
+                  </Card>
+                )}
+
+                {identity && !hasServer && !showCreateServer && !showJoinServer && (
+                  <Card className="cta-card">
+                    <div>
+                      <Text as="h2">Spin up your first server</Text>
+                      <Text>Everything happens inside a server. Create one or join via an invite.</Text>
+                    </div>
+                    <div className="cta-actions">
+                      <Button onClick={() => setShowCreateServer(true)}>Create Server</Button>
+                      {inviteData && (
+                        <Button onClick={() => setShowJoinServer(true)}>Join with Invite</Button>
+                      )}
+                    </div>
+                  </Card>
+                )}
+
+                {identity && hasServer && (
+                  <MeshChat
+                    onCreateServer={() => setShowCreateServer(true)}
+                    onJoinServer={inviteData ? () => setShowJoinServer(true) : undefined}
+                  />
+                )}
+              </>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+export default App
+# === TEST ===
+
+```diff
+--- a/packages/app/src/App.tsx
++++ b/packages/app/src/App.tsx
+@@ -98,8 +98,21 @@ function App() {
+ 
+   const handleServerJoined = () => {
+     setHasServer(true);
+     setShowJoinServer(false);
+     window.history.replaceState({}, document.title, window.location.pathname);
++    
++    // After server is joined, ensure the mesh client is created
++    // The state and epoch should now be available
++    logger.info('Server joined, triggering mesh client creation');
++    
++    // Give a small delay to ensure state is fully persisted
++    setTimeout(() => {
++      if (identity) {
++        // Trigger client creation by re-setting identity
++        services.transportManager.setIdentity(null);
++        services.transportManager.setIdentity(identity);
++      }
++    }, 100);
+   }
+ 
+   const handleStartApp = useCallback(() => {
+```
+# === RESULT ===
+import './App.css'
+import { Splash } from '@mesh/ui_splash'
+import { useAtomValue, useSetAtom } from 'jotai'
+import { useState, useEffect, useCallback } from 'react'
+import { identityAtom, privateKeyAtom, identityProfileAtom } from './atoms'
+import getLogger from '@mesh/logger'
+import { IdentityManager } from '@mesh/ui_user_settings'
+import { MeshChat } from '@mesh/ui_chrome'
+import { CreateServer, JoinServer } from '@mesh/ui_admin_settings'
+import { decodeInvite, type InviteData } from '@mesh/invite'
+import { services, identityService } from './services'
+import { Button, Card, Text } from '@mesh/elements'
+
+import { setupAppServices } from './services'
+// Ensure the app uses the same service graph as the rest of the UI.
+const { stateManager } = services
+
+const logger = getLogger('App')
+
+      setupAppServices()
+
+
+function App() {
+  const identity = useAtomValue(identityAtom)
+  const [hasServer, setHasServer] = useState(false)
+  const [showCreateServer, setShowCreateServer] = useState(false)
+  const [inviteData, setInviteData] = useState<InviteData | null>(null)
+  const [showJoinServer, setShowJoinServer] = useState(false)
+  const [appStarted, setAppStarted] = useState(false)
+  const setPrivateKey = useSetAtom(privateKeyAtom)
+  const setProfile = useSetAtom(identityProfileAtom)
+
+  // Bridge IdentityService events to Jotai atoms
+  useEffect(() => {
+    const handleIdentityChange = (identity: {
+      privkey: Uint8Array;
+      pubkey: string;
+      displayName?: string;
+      avatarUrl?: string;
+    } | null) => {
+      // 1. Update the private key atom used across the app.
+      setPrivateKey(identity ? identity.privkey : null);
+
+      // 2. When identity is cleared, also clear profile atom.
+      if (!identity) {
+        setProfile(null);
+        return;
+      }
+
+      // 3. Update profile atom with sanitized values.
+      const avatarUrl =
+        identity.avatarUrl && identity.avatarUrl.startsWith('data:image/')
+          ? identity.avatarUrl
+          : undefined;
+
+      setProfile({
+        displayName: identity.displayName,
+        avatarUrl,
+      });
+
+      // 4. Ensure transport/state graph see the new identity so server state can load.
+      try {
+        services.transportManager.setIdentity({
+          privkey: identity.privkey,
+          pubkey: identity.pubkey,
+          displayName: identity.displayName,
+          avatarUrl,
+        });
+      } catch (err) {
+        logger.error({ err }, 'Failed to propagate identity to TransportManager on identityChanged');
+      }
+    };
+
+    identityService.on('identityChanged', handleIdentityChange);
+    // Initial sync
+    handleIdentityChange(identityService.getIdentity());
+
+    return () => {
+      identityService.off('identityChanged', handleIdentityChange);
+    };
+  }, [setPrivateKey, setProfile]);
+
+  useEffect(() => {
+    if (!appStarted) return
+    setHasServer(stateManager.hasStoredServer())
+
+    // When identity becomes available and we already have a stored server,
+    // ensure TransportManager is wired so the mesh client gets created.
+    if (identity && stateManager.hasStoredServer()) {
+      try {
+        services.transportManager.setIdentity({
+          pubkey: identity.pubkey,
+          privkey: identity.privkey,
+          displayName: identity.displayName,
+          avatarUrl: identity.avatarUrl,
+        });
+      } catch(err) {
+        logger.error({ err }, 'Failed to set identity on TransportManager after app start');
+      }
+    }
+
+    const fragment = window.location.hash.slice(1)
+    if (fragment) {
+      try {
+        const invite = decodeInvite(fragment)
+        setInviteData(invite)
+        if (identity && !stateManager.hasStoredServer()) {
+          setShowJoinServer(true)
+        }
+      } catch (error) {
+        logger.warn({ err: error }, 'Invalid invite link.')
+        window.history.replaceState({}, document.title, window.location.pathname)
+        setInviteData(null)
+      }
+    } else {
+      setInviteData(null)
+    }
+  }, [identity, appStarted])
+
+  const handleStartApp = useCallback(() => {
+    setAppStarted(true)
+  }, [])
+
+  const handleServerCreated = () => {
+    setHasServer(true)
+    setShowCreateServer(false)
+    setShowJoinServer(false)
+    window.history.replaceState({}, document.title, window.location.pathname)
+  }
+
+  const handleServerJoined = () => {
+    setHasServer(true)
+    setShowJoinServer(false)
+    window.history.replaceState({}, document.title, window.location.pathname)
+    
+    // After server is joined, ensure the mesh client is created
+    // The state and epoch should now be available
+    logger.info('Server joined, triggering mesh client creation');
+    
+    // Give a small delay to ensure state is fully persisted
+    setTimeout(() => {
+      if (identity) {
+        // Trigger client creation by re-setting identity
+        services.transportManager.setIdentity(null);
+        services.transportManager.setIdentity(identity);
+      }
+    }, 100);
+  }
+
+  return (
+    <div className="app-shell">
+      {!appStarted ? (
+        <Splash onStart={handleStartApp} />
+      ) : (
+        <>
+          <header className="app-header">
+            <div className="app-logo">mesh</div>
+            <div className="header-actions">
+              <Text as="span">
+                {identity
+                  ? identity.displayName
+                    ? `${identity.displayName} (${identity.pubkey.slice(0, 8)}...)`
+                    : `Signed in as ${identity.pubkey.slice(0, 12)}...`
+                  : 'Load or generate an identity to continue'}
+              </Text>
+            </div>
+          </header>
+
+          <div className="app-content">
+            {!identity ? (
+              <Card style={{ maxWidth: 720, margin: '2rem auto', padding: '1.5rem' }}>
+                <IdentityManager />
+              </Card>
+            ) : (
+              <>
+                {identity && !hasServer && showJoinServer && inviteData && (
+                  <Card>
+                    <JoinServer inviteData={inviteData} onServerJoined={handleServerJoined} />
+                  </Card>
+                )}
+
+                {identity && showCreateServer && !hasServer && (
+                  <Card>
+                    <CreateServer onServerCreated={handleServerCreated} />
+                  </Card>
+                )}
+
+                {identity && !hasServer && !showCreateServer && !showJoinServer && (
+                  <Card className="cta-card">
+                    <div>
+                      <Text as="h2">Spin up your first server</Text>
+                      <Text>Everything happens inside a server. Create one or join via an invite.</Text>
+                    </div>
+                    <div className="cta-actions">
+                      <Button onClick={() => setShowCreateServer(true)}>Create Server</Button>
+                      {inviteData && (
+                        <Button onClick={() => setShowJoinServer(true)}>Join with Invite</Button>
+                      )}
+                    </div>
+                  </Card>
+                )}
+
+                {identity && hasServer && (
+                  <MeshChat
+                    onCreateServer={() => setShowCreateServer(true)}
+                    onJoinServer={inviteData ? () => setShowJoinServer(true) : undefined}
+                  />
+                )}
+              </>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+export default App
