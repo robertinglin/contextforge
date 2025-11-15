@@ -1,0 +1,133 @@
+import getLogger from '@mesh/logger';
+
+const logger = getLogger('AudioSink');
+const AUTOPLAY_EVENTS: Array<keyof DocumentEventMap> = ['click', 'touchstart', 'keydown'];
+
+/**
+ * Minimal audio sink that mirrors the behaviour used in example_app.js.
+ * Creates hidden <audio> tags for every remote participant and retries
+ * playback on the next user interaction when Chrome blocks autoplay.
+ */
+export class AudioSink {
+  private container: HTMLElement | null = null;
+  private elements = new Map<string, HTMLAudioElement>();
+  private pendingPlay = new Set<HTMLAudioElement>();
+  private interactionHandler: (() => void) | null = null;
+
+  public attach(userId: string, stream: MediaStream): void {
+    if (typeof document === 'undefined') return;
+
+    logger.info({ userId, streamId: stream.id }, '[AudioSink-Debug] Attach called.');
+    const element = this.elements.get(userId) ?? this.createElement(userId);
+
+    // Original behavior without delay.
+    if (element.srcObject !== stream) {
+      element.srcObject = stream;
+    }
+  
+    setTimeout(() => this.tryPlay(element), 0);
+  }
+
+}
+# === TEST ===
+```diff
+--- a/packages/voice/src/AudioSink.ts
++++ b/packages/voice/src/AudioSink.ts
+@@ -3,17 +3,42 @@
+ const logger = getLogger('AudioSink');
+ const AUTOPLAY_EVENTS: Array<keyof DocumentEventMap> = ['click', 'touchstart', 'keydown'];
+ 
++interface AudioNodes {
++  source: MediaStreamAudioSourceNode;
++  gain: GainNode;
++  destination: MediaStreamAudioDestinationNode;
++}
++
+ /**
+  * Minimal audio sink that mirrors the behaviour used in example_app.js.
+  * Creates hidden <audio> tags for every remote participant and retries
+  * playback on the next user interaction when Chrome blocks autoplay.
++ *
++ * This version uses the Web Audio API to allow for volume amplification
++ * (volume > 100%) via a GainNode.
+  */
+ export class AudioSink {
+   private container: HTMLElement | null = null;
+   private elements = new Map<string, HTMLAudioElement>();
+   private pendingPlay = new Set<HTMLAudioElement>();
+   private interactionHandler: (() => void) | null = null;
++  private audioContext: AudioContext | null = null;
++  private audioNodes = new Map<string, AudioNodes>();
+ 
++  private initAudioContext(): AudioContext {
++    if (this.audioContext && this.audioContext.state !== 'closed') {
++      return this.audioContext;
++    }
++    const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
++    if (!AudioContext) {
++      throw new Error('Web Audio API not supported');
++    }
++    this.audioContext = new AudioContext();
++    logger.info('AudioContext created.');
++    return this.audioContext;
++  }
++
+   public attach(userId: string, stream: MediaStream): void {
+     if (typeof document === 'undefined') return; 
+```
+# === RESULT ===
+import getLogger from '@mesh/logger';
+
+const logger = getLogger('AudioSink');
+const AUTOPLAY_EVENTS: Array<keyof DocumentEventMap> = ['click', 'touchstart', 'keydown'];
+
+interface AudioNodes {
+  source: MediaStreamAudioSourceNode;
+  gain: GainNode;
+  destination: MediaStreamAudioDestinationNode;
+}
+
+/**
+ * Minimal audio sink that mirrors the behaviour used in example_app.js.
+ * Creates hidden <audio> tags for every remote participant and retries
+ * playback on the next user interaction when Chrome blocks autoplay.
+ *
+ * This version uses the Web Audio API to allow for volume amplification
+ * (volume > 100%) via a GainNode.
+ */
+export class AudioSink {
+  private container: HTMLElement | null = null;
+  private elements = new Map<string, HTMLAudioElement>();
+  private pendingPlay = new Set<HTMLAudioElement>();
+  private interactionHandler: (() => void) | null = null;
+  private audioContext: AudioContext | null = null;
+  private audioNodes = new Map<string, AudioNodes>();
+
+  private initAudioContext(): AudioContext {
+    if (this.audioContext && this.audioContext.state !== 'closed') {
+      return this.audioContext;
+    }
+    const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioContext) {
+      throw new Error('Web Audio API not supported');
+    }
+    this.audioContext = new AudioContext();
+    logger.info('AudioContext created.');
+    return this.audioContext;
+  }
+
+  public attach(userId: string, stream: MediaStream): void {
+    if (typeof document === 'undefined') return;
+
+    logger.info({ userId, streamId: stream.id }, '[AudioSink-Debug] Attach called.');
+    const element = this.elements.get(userId) ?? this.createElement(userId);
+
+    // Original behavior without delay.
+    if (element.srcObject !== stream) {
+      element.srcObject = stream;
+    }
+  
+    setTimeout(() => this.tryPlay(element), 0);
+  }
+
+}

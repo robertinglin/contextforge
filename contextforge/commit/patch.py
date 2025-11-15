@@ -448,19 +448,32 @@ def _split_noncontiguous_hunks(hunks: list[dict]) -> list[dict]:
         for line in lines:
             if line and line[0] == "+":
                 if had_context_after_additions and current_hunk_lines:
-                    # Start a new hunk
-                    if current_hunk_lines:
-                        new_hunk = {"lines": current_hunk_lines[:]}
+                    # Non-contiguous addition found. Split the hunk here.
+                    # The context that separates the addition blocks will become the
+                    # leading context for the new hunk, preventing content overlap.
+
+                    # 1. Find the start of the intervening context block by looking backwards.
+                    first_context_idx = 0
+                    for i in range(len(current_hunk_lines) - 1, -1, -1):
+                        l = current_hunk_lines[i]
+                        if not (l == "" or (l and l[0] == " ")):
+                            first_context_idx = i + 1
+                            break
+
+                    # 2. Partition the lines. The previous hunk gets everything BEFORE the context bridge.
+                    lines_for_prev_hunk = current_hunk_lines[:first_context_idx]
+                    lines_for_next_hunk = current_hunk_lines[first_context_idx:]
+
+                    # 3. Create the previous hunk if it's not empty.
+                    if lines_for_prev_hunk:
+                        new_hunk = {"lines": lines_for_prev_hunk}
                         if "old_start" in hunk:
-                            new_hunk.update({
-                                "old_start": hunk["old_start"],
-                                "old_len": 0,
-                                "new_start": hunk["new_start"],
-                                "new_len": 0,
-                            })
+                            new_hunk.update({"old_start": hunk["old_start"], "old_len": 0, "new_start": hunk["new_start"], "new_len": 0})
                         split_hunks.append(new_hunk)
-                        current_hunk_lines = []
-                        had_context_after_additions = False
+                    
+                    # 4. The rest of the lines (the context bridge) start the next hunk.
+                    current_hunk_lines = lines_for_next_hunk
+                    had_context_after_additions = False
                 
                 current_hunk_lines.append(line)
                 in_addition_block = True
@@ -1471,7 +1484,9 @@ def patch_text(
     log.debug(f"Perfect hunks: {[locations[i]['hunk_index'] + 1 for i in perfect_indices]}")
     
     for i, loc in enumerate(locations):
-        if loc["confidence"] >= PERFECT_THRESHOLD:
+        # Skip hunks that are already placed with high confidence.
+        # "pure_addition" is often correct even with slightly lower confidence and shouldn't be refined.
+        if loc["confidence"] >= PERFECT_THRESHOLD or (loc["confidence"] >= 0.9 and "pure_addition" in loc["match_type"]):
             continue  # Already good
         
         log.debug(f"\nRefining Hunk #{loc['hunk_index'] + 1} (confidence={loc['confidence']:.2f})")
