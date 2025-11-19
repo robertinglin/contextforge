@@ -88,7 +88,7 @@ def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
         # Generic classification: is it a diff or a file?
         is_diff = False
         diff_file_path = None
-        
+
         # Explicit diff/patch language tag
         if language in ("diff", "patch"):
             is_diff = True
@@ -136,6 +136,8 @@ def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
             results.append({
                 "type": "file",
                 "language": language,
+                "is_pre_classified": False,
+                "pre_classification": None,
                 "start": blk.get("start", 0),
                 "end": blk.get("end", 0),
                 "code": final_code,
@@ -157,18 +159,20 @@ def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
     
     # If the same file path is provided multiple times, use the last one based on start position.
     # This handles cases where a model refines its answer in a single response.
-    latest_blocks_by_path = {}
+    # Deduplication only applies to file blocks with file_path - diffs keep all occurrences
+    # since they might target different files or represent different changes
+    latest_file_blocks_by_path = {}
     other_blocks = []
     for block in results:
-        file_path = block.get("file_path")
-        if file_path:
-            if file_path not in latest_blocks_by_path or block["start"] > latest_blocks_by_path[file_path]["start"]:
-                latest_blocks_by_path[file_path] = block
+        if block["type"] == "file" and block.get("file_path"):
+            fp = block["file_path"]
+            if fp not in latest_file_blocks_by_path or block["start"] > latest_file_blocks_by_path[fp]["start"]:
+                latest_file_blocks_by_path[fp] = block
         else:
             other_blocks.append(block)
 
-    # Combine the deduplicated blocks with the others and sort to restore order.
-    deduped = other_blocks + list(latest_blocks_by_path.values())
+    # Combine the deduplicated file blocks with others
+    deduped = other_blocks + list(latest_file_blocks_by_path.values())
     
     # Sort by start position for stable ordering
     return sorted(deduped, key=lambda b: b["start"])

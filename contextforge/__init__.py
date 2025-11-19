@@ -24,6 +24,7 @@ __all__ = [
     "extract_blocks_from_text",
     "extract_diffs_from_text",
     "extract_file_info_from_context_and_code",
+    "parse_markdown_string",
     "detect_new_files",
     "fuzzy_patch_partial",
     "patch_text",

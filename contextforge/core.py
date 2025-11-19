@@ -12,6 +12,7 @@ except Exception:  # pragma: no cover - absent in many environments
 
 from .commit import Change, patch_text
 from .errors import PatchFailedError
+from .errors.path import PathViolation
 from .extract import extract_blocks_from_text
 from .extract.metadata import extract_file_info_from_context_and_code
 from .utils.parsing import _contains_truncation_marker
@@ -118,8 +119,19 @@ def plan_and_generate_changes(planned_changes: List[Dict], codebase_dir: str) ->
             logger.warning("  - WARNING: Change plan is missing 'file_path'. Skipping.")
             continue
 
+        # SECURITY: Verify path is within codebase_dir BEFORE reading
+        try:
+            base_real = os.path.realpath(codebase_dir)
+            target_path = os.path.join(base_real, file_path)
+            target_real = os.path.realpath(target_path)
+            if os.path.commonpath([base_real, target_real]) != base_real:
+                logger.error(f"  - SECURITY: Path traversal attempt detected for '{file_path}'. Skipping.")
+                continue
+        except Exception as e:
+            logger.error(f"  - ERROR: Path resolution failed for '{file_path}': {e}")
+            continue
+
         original_content = ""
-        target_path = os.path.join(codebase_dir, file_path)
         if os.path.exists(target_path):
             try:
                 with open(target_path, encoding="utf-8") as f:

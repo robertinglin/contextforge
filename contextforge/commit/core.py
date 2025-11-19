@@ -188,6 +188,11 @@ def commit_changes(
             try:
                 if ch.action in ("create", "modify"):
                     dest = resolved
+
+                    # Hardening: Ensure 'modify' target still exists before swapping
+                    if ch.action == "modify" and not os.path.exists(dest):
+                        raise FileNotFoundError(f"File expected for modification not found: '{dest}'")
+
                     staged_entry = staged.get(dest)
                     # It is possible (for malformed input) to have a modify without staged content.
                     if not staged_entry:

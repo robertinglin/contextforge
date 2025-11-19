@@ -189,7 +189,7 @@ def test_level_4_simplified_indented_hunks():
         Some commentary above
 
         @@
-        -hello
+        - hello
         +HELLO
 
         End.

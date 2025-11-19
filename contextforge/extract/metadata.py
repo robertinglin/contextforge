@@ -1,7 +1,9 @@
 # contextforge/extract/metadata.py
 import re
+import logging
 from typing import Dict, List, Optional
 
+log = logging.getLogger(__name__)
 from ..utils.parsing import _contains_truncation_marker
 
 
@@ -9,7 +11,7 @@ def detect_rename_from_diff(code: str) -> Optional[Dict[str, str]]:
     """Detects 'rename from'/'rename to' in a diff block."""
     rename_from_match = re.search(r"^rename from (.+)$", code, re.MULTILINE)
     rename_to_match = re.search(r"^rename to (.+)$", code, re.MULTILINE)
-    if rename_from_match and rename_to_match:
+    if rename_from_match and rename_to_match and rename_from_match.group(1).strip() and rename_to_match.group(1).strip():
         return {
             "from_path": rename_from_match.group(1).strip(),
             "to_path": rename_to_match.group(1).strip(),
@@ -36,7 +38,7 @@ def detect_deletion_from_diff(code: str) -> Optional[str]:
 
 
 def extract_file_info_from_context_and_code(
-    context: str, code: str, lang: str
+    context: str, code: str, lang: str = ""
 ) -> Optional[Dict[str, str]]:
     """
     Deterministically extract file path and change type without LLM.

@@ -6,6 +6,8 @@ from ..errors import ContextError
 from ..utils.gitignore import get_gitignore
 from ..utils.tree import _generate_tree_string
 
+# Hardening: Max file size (e.g., 10MB) to prevent context bloat/OOM
+MAX_FILE_SIZE = 10_000_000
 
 def _build_context_string(request: Any) -> str:
     """Helper function to construct the full context string."""
@@ -41,8 +43,31 @@ def _build_context_string(request: Any) -> str:
                 )
                 continue
 
-            with open(resolved_path, encoding="utf-8", errors="ignore") as f:
-                content = f.read()
+            # Hardening: Check file size
+            try:
+                file_size = os.path.getsize(resolved_path)
+                if file_size > MAX_FILE_SIZE:
+                    context_str += (
+                        f"File: {file_path}\n"
+                        "---\n"
+                        f"Info: File skipped because it is too large ({file_size} bytes > {MAX_FILE_SIZE} limit).\n"
+                        "---\n\n"
+                    )
+                    continue
+
+                # Hardening: Read binary to detect NULL bytes (binary check)
+                with open(resolved_path, "rb") as f_bin:
+                    raw_chunk = f_bin.read(8192)
+                    if b"\0" in raw_chunk:
+                        context_str += f"File: {file_path}\n---\nInfo: File skipped because it appears to be binary.\n---\n\n"
+                        continue
+
+                with open(resolved_path, encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except OSError:
+                 # Handled by outer try/except
+                 raise
+
             lang = os.path.splitext(file_path)[1].lstrip(".")
             context_str += f"File: {file_path}\n```{lang}\n{content}\n```\n\n"
         except FileNotFoundError as e:
