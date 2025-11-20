@@ -1425,6 +1425,74 @@ def patch_text(
         hunks = _parse_patch_hunks(dedented_patch)
     else:
         hunks = _parse_simplified_patch_hunks(dedented_patch)
+
+    # Analyze if we should treat this as a full file replacement
+    # Criteria for full replacement:
+    # 1. No hunks detected OR
+    # 2. Hunks contain no changes (+/-) AND the patch doesn't use explicit '@@' delimiters.
+    #    (This handles the case where a code block is misparsed as context-only hunks due to indentation)
+    
+    has_changes = False
+    for h in hunks:
+        for line in h["lines"]:
+            if line and line[0] in ("+", "-"):
+                has_changes = True
+                break
+        if has_changes:
+            break
+            
+    has_simplified_markers = any(line.strip() == "@@" for line in dedented_patch.splitlines())
+    
+    # We fallback ONLY if there are no hunks/changes AND no explicit markers to suggest it is a diff.
+    should_fallback = (not hunks) or (not has_changes and not has_simplified_markers and not standard_match)
+
+    if should_fallback:
+        # Check if it looks like a diff header (and thus is a broken patch)
+        # If it has diff headers but no hunks, it's an error, not a full replacement.
+        is_diff_signature = re.search(
+            r"^(?:diff --git |index [0-9a-f]+\.\.[0-9a-f]+|new file mode |deleted file mode |--- (?:a/|/dev/null)|\+\+\+ (?:b/|/dev/null))", 
+            dedented_patch, 
+            re.MULTILINE
+        )
+        
+        if is_diff_signature:
+            raise PatchFailedError("Patch string looks like a diff header but contains no valid hunks.")
+
+        log.debug("Patch contains no changes or hunk markers. Treating as full file replacement.")
+        
+        # Fallback logic: return cleaned text
+        lines = dedented_patch.splitlines()
+        
+        # Strip surrounding markdown fences if present
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+
+        # Skip common diff headers if they somehow exist but didn't trigger standard parsing
+        start_idx = 0
+        for i, line in enumerate(lines):
+             if (
+                line.startswith("diff --git") or
+                line.startswith("index ") or
+                line.startswith("new file mode") or
+                line.startswith("deleted file mode") or
+                (line.startswith("--- ") and not line.strip() == "---") or
+                (line.startswith("+++ ") and not line.strip() == "+++") or
+                line.strip() == "@@"
+            ):
+                start_idx = i + 1
+             else:
+                break
+                
+        if start_idx >= len(lines):
+             # If everything was skipped, it's an empty replacement
+             return ""
+
+        new_text = eol.join(lines[start_idx:])
+        if had_trailing_nl:
+            new_text += eol
+        return new_text
     
     # Split non-contiguous additions into separate hunks
     original_hunk_count = len(hunks)

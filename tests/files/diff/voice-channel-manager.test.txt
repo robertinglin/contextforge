@@ -1,0 +1,1811 @@
+import React, { useState, useEffect } from 'react';
+import { Mic, Video } from 'lucide-react';
+import type { IdentityProfile } from '@mosh/types';
+import { VideoGrid } from './VideoGrid';
+import { VoiceControls, SpeakerIndicator } from './VoiceControls';
+import { WaveVisualizer } from './WaveVisualizer';
+import {
+  type VoiceState, type SpeakerAnalysis, type VideoState, type VideoParticipant,
+} from '@mosh/voice';
+import type { Channel } from '@mosh/types';
+import { Button, Text } from '@mosh/elements';
+import { services } from '@mosh/app/services';
+import getLogger from '@mosh/logger';
+const logger = getLogger('VoiceChannelManager');
+const { voiceService } = services;
+
+interface VoiceChannelManagerProps {
+  channels: Channel[];
+  currentUserId: string;
+  onError?: (error: string) => void;
+  getUserProfile?: (userId: string) => IdentityProfile | null;
+}
+
+interface ConnectionStats {
+  connectedPeers: number;
+  totalPeers: number;
+  avgLatency: number;
+  packetLoss: number;
+}
+
+export const VoiceChannelManager: React.FC<VoiceChannelManagerProps> = ({
+  channels,
+  currentUserId,
+  onError,
+  getUserProfile
+}) => {
+  const [voiceState, setVoiceState] = useState<VoiceState>(() => voiceService.getState());
+  const [activeSpeakers, setActiveSpeakers] = useState<SpeakerAnalysis[]>([]);
+  const [videoState, setVideoState] = useState<VideoState>({ 
+    activeParticipants: [], 
+    localVideo: false, 
+    remoteVideoCount: 0,
+    maxVideos: 6 
+  });
+  
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [showAdvancedControls, setShowAdvancedControls] = useState(false);
+  const [showVideoGrid, setShowVideoGrid] = useState(true);
+  const [showSpeakerAnalysis, setShowSpeakerAnalysis] = useState(true);
+  const [useRealTimeVisualizer, setUseRealTimeVisualizer] = useState(true);
+  const [connectionStats, setConnectionStats] = useState<ConnectionStats>({
+    connectedPeers: 0,
+    totalPeers: 0,
+    avgLatency: 0,
+    packetLoss: 0
+  });
+
+  // Local UI-only focus state for the main video layout.
+  const [selectedParticipant, setSelectedParticipant] = useState<string | null>(null);
+
+  useEffect(() => {
+    const handleVoiceState = (state: VoiceState) => {
+      setVoiceState(state);
+      setActiveSpeakers(state.activeSpeakers);
+      setVideoState(state.videoState);
+      
+      // Update connection stats
+      const totalParticipants = Object.values(state.channelParticipants).flat().length;
+      setConnectionStats(prev => ({
+        ...prev,
+        totalPeers: totalParticipants,
+        connectedPeers: totalParticipants // Simplified - in real implementation, get from mosh client
+      }));
+    };
+
+    const handleError = (error: string) => {
+      onError?.(error);
+    };
+
+    const handleActiveSpeakers = (speakers: SpeakerAnalysis[]) => {
+      setActiveSpeakers(speakers);
+    };
+
+    const handleVideoState = (videoState: VideoState) => {
+      setVideoState(videoState);
+    };
+
+    const handleConnectionQuality = (quality: VoiceState['connectionQuality']) => {
+      logger.info({ quality }, 'Connection quality changed:');
+    };
+
+    voiceService.on('stateChanged', handleVoiceState);
+    voiceService.on('error', handleError);
+    voiceService.on('connectionQualityChanged', handleConnectionQuality);
+
+    return () => {
+      voiceService.off('stateChanged', handleVoiceState);
+      voiceService.off('error', handleError);
+      voiceService.off('connectionQualityChanged', handleConnectionQuality);
+    };
+  }, [onError]);
+
+  const handleStartScreenShare = async () => {
+    setPendingAction('screen-share');
+    try {
+      // voiceService is imported via services in app; here we use global services
+      await voiceService.startScreenShare();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to start screen share';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleStopScreenShare = async () => {
+    setPendingAction('screen-share-stop');
+    try {
+      await voiceService.stopScreenShare();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to stop screen share';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+  const handleJoinVoice = async (channelId: string, options: { enableVideo?: boolean } = {}) => {
+    setPendingAction(`join-${channelId}`);
+    try {
+      await voiceService.joinVoice(channelId, options);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to join voice channel';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleLeaveVoice = async () => {
+    setPendingAction('leave');
+    try {
+      await voiceService.leaveVoice();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to leave voice channel';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleToggleVideo = async () => {
+    setPendingAction('toggle-video');
+    try {
+      if (voiceState.isVideoEnabled) {
+        await voiceService.disableVideo();
+      } else {
+        await voiceService.enableVideo();
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to toggle video';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleToggleMicrophone = async () => {
+    // For now, just leave/rejoin to toggle microphone
+    // In a full implementation, you'd want to mute/unmute the track
+    if (voiceState.isMicrophoneActive && voiceState.activeChannelId) {
+      await handleLeaveVoice();
+    }
+  };
+
+  /**
+   * Toggle focus behavior:
+   * - Clicking any user in the grid makes them the main screen, others move to 200px grid.
+   * - Clicking the focused user again returns to normal grid view (selectedParticipant = null).
+   */
+  const handleParticipantDoubleClick = (userId: string, _participant: VideoParticipant) => {
+    setSelectedParticipant((current) => (current === userId ? null : userId));
+  };
+
+  const getConnectionQualityColor = (): string => {
+    switch (voiceState.connectionQuality) {
+      case 'excellent': return '#28a745';
+      case 'good': return '#ffc107';
+      case 'poor': return '#fd7e14';
+      case 'disconnected': return '#dc3545';
+      default: return '#6c757d';
+    }
+  };
+
+  const voiceChannels = channels.filter(channel => channel.type === 'voice');
+
+  const containerStyle: React.CSSProperties = {
+    padding: '20px',
+    backgroundColor: '#f8f9fa',
+    borderRadius: '8px',
+    border: '1px solid #dee2e6'
+  };
+
+  const headerStyle: React.CSSProperties = {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: '20px',
+    paddingBottom: '10px',
+    borderBottom: '1px solid #e9ecef'
+  };
+
+  const channelGridStyle: React.CSSProperties = {
+    display: 'grid',
+    gap: '16px',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
+    marginBottom: '20px'
+  };
+
+  const channelCardStyle: React.CSSProperties = {
+    backgroundColor: '#fff',
+    borderRadius: '6px',
+    border: '1px solid #e9ecef',
+    padding: '16px'
+  };
+
+  const activeChannelStyle: React.CSSProperties = {
+    ...channelCardStyle,
+    border: '2px solid #007bff',
+    backgroundColor: '#e7f5ff'
+  };
+
+  const statsGridStyle: React.CSSProperties = {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+    gap: '12px',
+    marginTop: '16px'
+  };
+
+  const statCardStyle: React.CSSProperties = {
+    backgroundColor: '#fff',
+    padding: '12px',
+    borderRadius: '4px',
+    border: '1px solid #e9ecef',
+    textAlign: 'center'
+  };
+
+  const controlsStyle: React.CSSProperties = {
+    display: 'flex',
+    gap: '12px',
+    marginBottom: '16px',
+    flexWrap: 'wrap'
+  };
+
+  const toggleButtonStyle: React.CSSProperties = {
+    padding: '6px 12px',
+    border: '1px solid #dee2e6',
+    borderRadius: '4px',
+    backgroundColor: '#fff',
+    cursor: 'pointer',
+    fontSize: '12px'
+  };
+
+  return (
+    <div style={containerStyle}>
+      <div style={headerStyle}>
+        <Text as="h3">Voice Channel Manager</Text>
+        <div style={controlsStyle}>
+          <Button
+            style={{...toggleButtonStyle, color: '#212529', backgroundColor: '#ffffff'}}
+            onClick={() => setShowAdvancedControls(!showAdvancedControls)}
+          >
+            {showAdvancedControls ? 'Hide' : 'Show'} Advanced
+          </Button>
+          <Button
+            style={{...toggleButtonStyle, color: '#212529', backgroundColor: '#ffffff'}}
+            onClick={() => setShowVideoGrid(!showVideoGrid)}
+          >
+            {showVideoGrid ? 'Hide' : 'Show'} Video
+          </Button>
+          <Button
+            style={{...toggleButtonStyle, color: '#212529', backgroundColor: '#ffffff'}}
+            onClick={() => setShowSpeakerAnalysis(!showSpeakerAnalysis)}
+          >
+            {showSpeakerAnalysis ? 'Hide' : 'Show'} Audio Analysis
+          </Button>
+        </div>
+      </div>
+
+      {/* Voice Channels Grid */}
+      <div style={channelGridStyle}>
+        {voiceChannels.map(channel => {
+          const participants = voiceState.channelParticipants[channel.id] || [];
+          const isActive = voiceState.activeChannelId === channel.id;
+          const isPending = pendingAction?.includes(channel.id);
+
+          return (
+            <div
+              key={channel.id}
+              style={isActive ? activeChannelStyle : channelCardStyle}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                <div>
+                  <Text as="h4" style={{ margin: '0 0 4px 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Mic size={16} />
+                    {channel.name}
+                    {isActive && voiceState.selectiveForwardingActive && (
+                      <Text as="span" style={{
+                        fontSize: '10px',
+                        backgroundColor: '#fff3cd',
+                        color: '#856404',
+                        padding: '2px 6px',
+                        borderRadius: '3px',
+                        border: '1px solid #ffeaa7'
+                      }}>
+                        SF Active
+                      </Text>
+                    )}
+                  </Text>
+                  <div style={{ fontSize: '12px', color: '#6c757d' }}>
+                    {participants.length} participant{participants.length !== 1 ? 's' : ''}
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  {isActive ? (
+                    <Button
+                      onClick={handleLeaveVoice}
+                      disabled={isPending}
+                      variant="danger"
+                    >
+                      {isPending ? 'Leaving...' : 'Leave'}
+                    </Button>
+                  ) : (
+                    <>
+                      <Button
+                        onClick={() => handleJoinVoice(channel.id, { enableVideo: false })}
+                        disabled={Boolean(pendingAction)}
+                        variant="success"
+                      >
+                        {isPending ? 'Joining...' : 'Join'}
+                      </Button>
+                      <Button
+                        onClick={() => handleJoinVoice(channel.id, { enableVideo: true })}
+                        disabled={Boolean(pendingAction)}
+                      >
+                        <Video size={14} style={{ marginRight: 4 }} />
+                        Join + Video
+                      </Button>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              {/* Participants List */}
+              <div style={{ marginTop: '12px' }}>
+                {participants.length === 0 ? (
+                  <div style={{ fontSize: '12px', color: '#6c757d', fontStyle: 'italic' }}>
+                    No one is connected yet.
+                  </div>
+                ) : (
+                  participants.map(participant => {
+                    const displayName = participant.pubkey === currentUserId ? 'You' : (getUserProfile?.(participant.pubkey)?.displayName ?? `${participant.pubkey.slice(0, 8)}...`);
+                    return (
+                      <div
+                        key={participant.pubkey}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '8px',
+                          padding: '4px 0',
+                          fontSize: '13px'
+                        }}
+                      >
+                        <div
+                          style={{
+                            width: '6px',
+                            height: '6px',
+                            borderRadius: '50%',
+                            backgroundColor: participant.isLocal ? '#0ca678' : '#748ffc'
+                          }}
+                        />
+                        <Text as="span">
+                          {displayName}
+                        </Text>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Active Voice Controls */}
+      {voiceState.activeChannelId && (
+        <div style={{ backgroundColor: '#fff', padding: '16px', borderRadius: '6px', border: '1px solid #e9ecef', marginBottom: '20px' }}>
+          <Text as="h4" style={{ margin: '0 0 16px 0' }}>Voice Controls</Text>
+          
+          <VoiceControls
+            isMicrophoneActive={voiceState.isMicrophoneActive}
+            isMicrophoneMuted={voiceState.isMicrophoneMuted}
+            isDeafened={voiceState.isDeafened}
+            isVideoEnabled={voiceState.isVideoEnabled}
+            connectionQuality={voiceState.connectionQuality}
+            onToggleMicrophone={handleToggleMicrophone}
+            onToggleVideo={handleToggleVideo}
+            onStartScreenShare={handleStartScreenShare}
+            onStopScreenShare={handleStopScreenShare}
+            onLeaveVoice={handleLeaveVoice}
+            disabled={Boolean(pendingAction)}
+          />
+
+          {/* Connection Quality Indicator */}
+          <div style={{
+            marginTop: '16px',
+            padding: '8px 12px',
+            backgroundColor: '#f8f9fa',
+            borderRadius: '4px',
+            fontSize: '12px'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <Text as="span">Connection Quality:</Text>
+              <Text as="span" style={{ 
+                color: getConnectionQualityColor(),
+                fontWeight: 'bold',
+                textTransform: 'capitalize'
+              }}>
+                {voiceState.connectionQuality}
+              </Text>
+            </div>
+          </div>
+
+          {/* Advanced Stats */}
+          {showAdvancedControls && (
+            <div style={statsGridStyle}>
+              <div style={statCardStyle}>
+                <div style={{ fontWeight: 'bold', color: '#007bff' }}>
+                  {connectionStats.connectedPeers}/{connectionStats.totalPeers}
+                </div>
+                <div style={{ fontSize: '11px', color: '#6c757d' }}>Connected Peers</div>
+              </div>
+              <div style={statCardStyle}>
+                <div style={{ fontWeight: 'bold', color: voiceState.selectiveForwardingActive ? '#fd7e14' : '#28a745' }}>
+                  {voiceState.selectiveForwardingActive ? 'ON' : 'OFF'}
+                </div>
+                <div style={{ fontSize: '11px', color: '#6c757d' }}>Selective Forwarding</div>
+              </div>
+              <div style={statCardStyle}>
+                <div style={{ fontWeight: 'bold', color: '#17a2b8' }}>
+                  {videoState.remoteVideoCount}
+                </div>
+                <div style={{ fontSize: '11px', color: '#6c757d' }}>Video Streams</div>
+              </div>
+              <div style={statCardStyle}>
+                <div style={{ fontWeight: 'bold', color: '#6f42c1' }}>
+                  {activeSpeakers.filter(s => s.isSpeaking).length}
+                </div>
+                <div style={{ fontSize: '11px', color: '#6c757d' }}>Active Speakers</div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Audio Analysis */}
+      {showSpeakerAnalysis && activeSpeakers.length > 0 && (
+        <div style={{ marginBottom: '20px' }}>
+          <SpeakerIndicator speakers={activeSpeakers} maxVisible={8} />
+        </div>
+      )}
+
+      {/* Video Grid */}
+      {showVideoGrid && videoState.activeParticipants.length > 0 && (
+        <div style={{ backgroundColor: '#fff', padding: '16px', borderRadius: '6px', border: '1px solid #e9ecef' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+            <Text as="h4" style={{ margin: 0 }}>
+              Video Participants ({videoState.activeParticipants.length}/{videoState.maxVideos})
+            </Text>
+            {selectedParticipant && (
+              <Button
+                onClick={() => setSelectedParticipant(null)}
+                size="sm"
+                variant="secondary"
+              >
+                Clear Focus
+              </Button>
+            )}
+          </div>
+          
+          <VideoGrid
+            participants={videoState.activeParticipants}
+            // Use latest activeSpeakers from voiceState to highlight
+            // speaking participants in the video grid.
+            speakers={activeSpeakers}
+            maxVideos={videoState.maxVideos}
+            // Pass our focus-toggle handler so clicks drive the layout behavior.
+            onParticipantDoubleClick={handleParticipantDoubleClick}
+            // Drive layout from this component's selectedParticipant state.
+            selectedParticipantId={selectedParticipant}
+            getUserProfile={getUserProfile}
+          />
+          
+          {selectedParticipant && (
+            <div style={{
+              marginTop: '12px',
+              padding: '8px 12px',
+              backgroundColor: '#e7f5ff',
+              borderRadius: '4px',
+              fontSize: '12px',
+              color: '#004085'
+            }}>
+              Focused on participant: {selectedParticipant.slice(0, 16)}...
+            </div>
+          )}
+        </div>
+      )}
+
+      {voiceChannels.length === 0 && (
+        <div style={{
+          textAlign: 'center',
+          padding: '40px',
+          color: '#6c757d',
+          backgroundColor: '#fff',
+          borderRadius: '6px',
+          border: '1px solid #e9ecef'
+        }}>
+          <div style={{ fontSize: '48px', marginBottom: '16px' }}>
+            <Mic size={48} />
+          </div>
+          <Text as="h4">No Voice Channels Available</Text>
+          <Text>Ask an admin to create voice channels to get started with voice chat.</Text>
+        </div>
+      )}
+    </div>
+  );
+};
+# === TEST ===
+
+```typescript
+import React, { useState, useEffect, useRef } from 'react';
+import { Mic, Video } from 'lucide-react';
+import type { IdentityProfile } from '@mosh/types';
+import { VideoGrid } from './VideoGrid';
+import { VoiceControls, SpeakerIndicator } from './VoiceControls';
+import { WaveVisualizer } from './WaveVisualizer';
+import {
+  type VoiceState, type SpeakerAnalysis, type VideoState, type VideoParticipant,
+} from '@mosh/voice';
+import type { Channel } from '@mosh/types';
+import { Button, Text } from '@mosh/elements';
+import { services } from '@mosh/app/services';
+import { StreamThumbnailManager } from '@mosh/video';
+import getLogger from '@mosh/logger';
+const logger = getLogger('VoiceChannelManager');
+const { voiceService } = services;
+
+interface VoiceChannelManagerProps {
+  channels: Channel[];
+  currentUserId: string;
+  onError?: (error: string) => void;
+  getUserProfile?: (userId: string) => IdentityProfile | null;
+}
+
+interface ConnectionStats {
+  connectedPeers: number;
+  totalPeers: number;
+  avgLatency: number;
+  packetLoss: number;
+}
+
+export const VoiceChannelManager: React.FC<VoiceChannelManagerProps> = ({
+  channels,
+  currentUserId,
+  onError,
+  getUserProfile
+}) => {
+  const [voiceState, setVoiceState] = useState<VoiceState>(() => voiceService.getState());
+  const [activeSpeakers, setActiveSpeakers] = useState<SpeakerAnalysis[]>([]);
+  const [videoState, setVideoState] = useState<VideoState>({ 
+    activeParticipants: [], 
+    localVideo: false, 
+    remoteVideoCount: 0,
+    maxVideos: 6 
+  });
+  
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [showAdvancedControls, setShowAdvancedControls] = useState(false);
+  const [showVideoGrid, setShowVideoGrid] = useState(true);
+  const [showSpeakerAnalysis, setShowSpeakerAnalysis] = useState(true);
+  const [useRealTimeVisualizer, setUseRealTimeVisualizer] = useState(true);
+  const [connectionStats, setConnectionStats] = useState<ConnectionStats>({
+    connectedPeers: 0,
+    totalPeers: 0,
+    avgLatency: 0,
+    packetLoss: 0
+  });
+
+  const [selectedParticipant, setSelectedParticipant] = useState<string | null>(null);
+  const [streamThumbnails, setStreamThumbnails] = useState<Map<string, string>>(new Map());
+  const [watchingStreams, setWatchingStreams] = useState<Set<string>>(new Set());
+  
+  const thumbnailManagerRef = useRef<StreamThumbnailManager | null>(null);
+  const screenShareStreamRef = useRef<MediaStream | null>(null);
+
+  useEffect(() => {
+    const handleVoiceState = (state: VoiceState) => {
+      setVoiceState(state);
+      setActiveSpeakers(state.activeSpeakers);
+      setVideoState(state.videoState);
+      
+      const totalParticipants = Object.values(state.channelParticipants).flat().length;
+      setConnectionStats(prev => ({
+        ...prev,
+        totalPeers: totalParticipants,
+        connectedPeers: totalParticipants
+      }));
+    };
+
+    const handleError = (error: string) => {
+      onError?.(error);
+    };
+
+    const handleActiveSpeakers = (speakers: SpeakerAnalysis[]) => {
+      setActiveSpeakers(speakers);
+    };
+
+    const handleVideoState = (videoState: VideoState) => {
+      setVideoState(videoState);
+    };
+
+    const handleConnectionQuality = (quality: VoiceState['connectionQuality']) => {
+      logger.info({ quality }, 'Connection quality changed:');
+    };
+
+    voiceService.on('stateChanged', handleVoiceState);
+    voiceService.on('error', handleError);
+    voiceService.on('connectionQualityChanged', handleConnectionQuality);
+
+    return () => {
+      voiceService.off('stateChanged', handleVoiceState);
+      voiceService.off('error', handleError);
+      voiceService.off('connectionQualityChanged', handleConnectionQuality);
+    };
+  }, [onError]);
+
+  useEffect(() => {
+    if (!thumbnailManagerRef.current) {
+      thumbnailManagerRef.current = new StreamThumbnailManager();
+      
+      const unsubscribe = thumbnailManagerRef.current.onThumbnail((thumbnail) => {
+        setStreamThumbnails(prev => {
+          const newMap = new Map(prev);
+          newMap.set(thumbnail.userId, thumbnail.dataUrl);
+          return newMap;
+        });
+        
+        logger.debug({ userId: thumbnail.userId }, 'Received thumbnail update');
+      });
+
+      return () => {
+        unsubscribe();
+        thumbnailManagerRef.current?.cleanup();
+        thumbnailManagerRef.current = null;
+      };
+    }
+  }, []);
+
+  useEffect(() => {
+    const remoteScreenShares = videoState.activeParticipants.filter(
+      p => p.hasVideo && !p.isLocal && p.stream
+    );
+
+    remoteScreenShares.forEach(participant => {
+      if (!watchingStreams.has(participant.userId)) {
+        if (!streamThumbnails.has(participant.userId) && thumbnailManagerRef.current) {
+          logger.info({ userId: participant.userId }, 'Starting thumbnail generation for remote screen share');
+          thumbnailManagerRef.current.startThumbnailGeneration(
+            participant.stream!,
+            participant.userId,
+            true,
+            30000
+          );
+        }
+      }
+    });
+
+    const currentUserIds = new Set(remoteScreenShares.map(p => p.userId));
+    streamThumbnails.forEach((_, userId) => {
+      if (!currentUserIds.has(userId)) {
+        setStreamThumbnails(prev => {
+          const newMap = new Map(prev);
+          newMap.delete(userId);
+          return newMap;
+        });
+      }
+    });
+  }, [videoState.activeParticipants, watchingStreams]);
+
+  const handleStartScreenShare = async () => {
+    setPendingAction('screen-share');
+    try {
+      await voiceService.startScreenShare();
+      
+      const localParticipant = videoState.activeParticipants.find(p => p.isLocal);
+      if (localParticipant?.stream && thumbnailManagerRef.current) {
+        screenShareStreamRef.current = localParticipant.stream;
+        thumbnailManagerRef.current.startThumbnailGeneration(
+          localParticipant.stream,
+          currentUserId,
+          true,
+          30000
+        );
+        logger.info('Started thumbnail generation for local screen share');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to start screen share';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleStopScreenShare = async () => {
+    setPendingAction('screen-share-stop');
+    try {
+      await voiceService.stopScreenShare();
+      
+      if (thumbnailManagerRef.current) {
+        thumbnailManagerRef.current.stopThumbnailGeneration();
+        logger.info('Stopped thumbnail generation for local screen share');
+      }
+      screenShareStreamRef.current = null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to stop screen share';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+  const handleJoinVoice = async (channelId: string, options: { enableVideo?: boolean } = {}) => {
+    setPendingAction(`join-${channelId}`);
+    try {
+      await voiceService.joinVoice(channelId, options);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to join voice channel';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleLeaveVoice = async () => {
+    setPendingAction('leave');
+    try {
+      await voiceService.leaveVoice();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to leave voice channel';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleToggleVideo = async () => {
+    setPendingAction('toggle-video');
+    try {
+      if (voiceState.isVideoEnabled) {
+        await voiceService.disableVideo();
+      } else {
+        await voiceService.enableVideo();
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to toggle video';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleToggleMicrophone = async () => {
+    // For now, just leave/rejoin to toggle microphone
+    // In a full implementation, you'd want to mute/unmute the track
+    if (voiceState.isMicrophoneActive && voiceState.activeChannelId) {
+      await handleLeaveVoice();
+    }
+  };
+
+  const handleParticipantDoubleClick = (userId: string, _participant: VideoParticipant) => {
+    setSelectedParticipant((current) => (current === userId ? null : userId));
+  };
+
+  const handleWatchStream = (userId: string) => {
+    setWatchingStreams(prev => {
+      const newSet = new Set(prev);
+      newSet.add(userId);
+      return newSet;
+    });
+    
+    if (thumbnailManagerRef.current) {
+      thumbnailManagerRef.current.addWatcher(currentUserId);
+    }
+    
+    logger.info({ userId, currentUserId }, 'User started watching stream');
+  };
+
+  const handleStopWatching = (userId: string) => {
+    setWatchingStreams(prev => {
+      const newSet = new Set(prev);
+      newSet.delete(userId);
+      return newSet;
+    });
+    
+    if (thumbnailManagerRef.current) {
+      thumbnailManagerRef.current.removeWatcher(currentUserId);
+    }
+    
+    logger.info({ userId, currentUserId }, 'User stopped watching stream');
+  };
+
+  const getConnectionQualityColor = (): string => {
+    switch (voiceState.connectionQuality) {
+      case 'excellent': return '#28a745';
+      case 'good': return '#ffc107';
+      case 'poor': return '#fd7e14';
+      case 'disconnected': return '#dc3545';
+      default: return '#6c757d';
+    }
+  };
+
+  const voiceChannels = channels.filter(channel => channel.type === 'voice');
+
+  const containerStyle: React.CSSProperties = {
+    padding: '20px',
+    backgroundColor: '#f8f9fa',
+    borderRadius: '8px',
+    border: '1px solid #dee2e6'
+  };
+
+  const headerStyle: React.CSSProperties = {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: '20px',
+    paddingBottom: '10px',
+    borderBottom: '1px solid #e9ecef'
+  };
+
+  const channelGridStyle: React.CSSProperties = {
+    display: 'grid',
+    gap: '16px',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
+    marginBottom: '20px'
+  };
+
+  const channelCardStyle: React.CSSProperties = {
+    backgroundColor: '#fff',
+    borderRadius: '6px',
+    border: '1px solid #e9ecef',
+    padding: '16px'
+  };
+
+  const activeChannelStyle: React.CSSProperties = {
+    ...channelCardStyle,
+    border: '2px solid #007bff',
+    backgroundColor: '#e7f5ff'
+  };
+
+  const statsGridStyle: React.CSSProperties = {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+    gap: '12px',
+    marginTop: '16px'
+  };
+
+  const statCardStyle: React.CSSProperties = {
+    backgroundColor: '#fff',
+    padding: '12px',
+    borderRadius: '4px',
+    border: '1px solid #e9ecef',
+    textAlign: 'center'
+  };
+
+  const controlsStyle: React.CSSProperties = {
+    display: 'flex',
+    gap: '12px',
+    marginBottom: '16px',
+    flexWrap: 'wrap'
+  };
+
+  const toggleButtonStyle: React.CSSProperties = {
+    padding: '6px 12px',
+    border: '1px solid #dee2e6',
+    borderRadius: '4px',
+    backgroundColor: '#fff',
+    cursor: 'pointer',
+    fontSize: '12px'
+  };
+
+  return (
+    <div style={containerStyle}>
+      <div style={headerStyle}>
+        <Text as="h3">Voice Channel Manager</Text>
+        <div style={controlsStyle}>
+          <Button
+            style={{...toggleButtonStyle, color: '#212529', backgroundColor: '#ffffff'}}
+            onClick={() => setShowAdvancedControls(!showAdvancedControls)}
+          >
+            {showAdvancedControls ? 'Hide' : 'Show'} Advanced
+          </Button>
+          <Button
+            style={{...toggleButtonStyle, color: '#212529', backgroundColor: '#ffffff'}}
+            onClick={() => setShowVideoGrid(!showVideoGrid)}
+          >
+            {showVideoGrid ? 'Hide' : 'Show'} Video
+          </Button>
+          <Button
+            style={{...toggleButtonStyle, color: '#212529', backgroundColor: '#ffffff'}}
+            onClick={() => setShowSpeakerAnalysis(!showSpeakerAnalysis)}
+          >
+            {showSpeakerAnalysis ? 'Hide' : 'Show'} Audio Analysis
+          </Button>
+        </div>
+      </div>
+
+      {/* Voice Channels Grid */}
+      <div style={channelGridStyle}>
+        {voiceChannels.map(channel => {
+          const participants = voiceState.channelParticipants[channel.id] || [];
+          const isActive = voiceState.activeChannelId === channel.id;
+          const isPending = pendingAction?.includes(channel.id);
+
+          return (
+            <div
+              key={channel.id}
+              style={isActive ? activeChannelStyle : channelCardStyle}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                <div>
+                  <Text as="h4" style={{ margin: '0 0 4px 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Mic size={16} />
+                    {channel.name}
+                    {isActive && voiceState.selectiveForwardingActive && (
+                      <Text as="span" style={{
+                        fontSize: '10px',
+                        backgroundColor: '#fff3cd',
+                        color: '#856404',
+                        padding: '2px 6px',
+                        borderRadius: '3px',
+                        border: '1px solid #ffeaa7'
+                      }}>
+                        SF Active
+                      </Text>
+                    )}
+                  </Text>
+                  <div style={{ fontSize: '12px', color: '#6c757d' }}>
+                    {participants.length} participant{participants.length !== 1 ? 's' : ''}
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  {isActive ? (
+                    <Button
+                      onClick={handleLeaveVoice}
+                      disabled={isPending}
+                      variant="danger"
+                    >
+                      {isPending ? 'Leaving...' : 'Leave'}
+                    </Button>
+                  ) : (
+                    <>
+                      <Button
+                        onClick={() => handleJoinVoice(channel.id, { enableVideo: false })}
+                        disabled={Boolean(pendingAction)}
+                        variant="success"
+                      >
+                        {isPending ? 'Joining...' : 'Join'}
+                      </Button>
+                      <Button
+                        onClick={() => handleJoinVoice(channel.id, { enableVideo: true })}
+                        disabled={Boolean(pendingAction)}
+                      >
+                        <Video size={14} style={{ marginRight: 4 }} />
+                        Join + Video
+                      </Button>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              {/* Participants List */}
+              <div style={{ marginTop: '12px' }}>
+                {participants.length === 0 ? (
+                  <div style={{ fontSize: '12px', color: '#6c757d', fontStyle: 'italic' }}>
+                    No one is connected yet.
+                  </div>
+                ) : (
+                  participants.map(participant => {
+                    const displayName = participant.pubkey === currentUserId ? 'You' : (getUserProfile?.(participant.pubkey)?.displayName ?? `${participant.pubkey.slice(0, 8)}...`);
+                    return (
+                      <div
+                        key={participant.pubkey}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '8px',
+                          padding: '4px 0',
+                          fontSize: '13px'
+                        }}
+                      >
+                        <div
+                          style={{
+                            width: '6px',
+                            height: '6px',
+                            borderRadius: '50%',
+                            backgroundColor: participant.isLocal ? '#0ca678' : '#748ffc'
+                          }}
+                        />
+                        <Text as="span">
+                          {displayName}
+                        </Text>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Active Voice Controls */}
+      {voiceState.activeChannelId && (
+        <div style={{ backgroundColor: '#fff', padding: '16px', borderRadius: '6px', border: '1px solid #e9ecef', marginBottom: '20px' }}>
+          <Text as="h4" style={{ margin: '0 0 16px 0' }}>Voice Controls</Text>
+          
+          <VoiceControls
+            isMicrophoneActive={voiceState.isMicrophoneActive}
+            isMicrophoneMuted={voiceState.isMicrophoneMuted}
+            isDeafened={voiceState.isDeafened}
+            isVideoEnabled={voiceState.isVideoEnabled}
+            connectionQuality={voiceState.connectionQuality}
+            onToggleMicrophone={handleToggleMicrophone}
+            onToggleVideo={handleToggleVideo}
+            onStartScreenShare={handleStartScreenShare}
+            onStopScreenShare={handleStopScreenShare}
+            onLeaveVoice={handleLeaveVoice}
+            disabled={Boolean(pendingAction)}
+          />
+
+          {/* Connection Quality Indicator */}
+          <div style={{
+            marginTop: '16px',
+            padding: '8px 12px',
+            backgroundColor: '#f8f9fa',
+            borderRadius: '4px',
+            fontSize: '12px'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <Text as="span">Connection Quality:</Text>
+              <Text as="span" style={{ 
+                color: getConnectionQualityColor(),
+                fontWeight: 'bold',
+                textTransform: 'capitalize'
+              }}>
+                {voiceState.connectionQuality}
+              </Text>
+            </div>
+          </div>
+
+          {/* Advanced Stats */}
+          {showAdvancedControls && (
+            <div style={statsGridStyle}>
+              <div style={statCardStyle}>
+                <div style={{ fontWeight: 'bold', color: '#007bff' }}>
+                  {connectionStats.connectedPeers}/{connectionStats.totalPeers}
+                </div>
+                <div style={{ fontSize: '11px', color: '#6c757d' }}>Connected Peers</div>
+              </div>
+              <div style={statCardStyle}>
+                <div style={{ fontWeight: 'bold', color: voiceState.selectiveForwardingActive ? '#fd7e14' : '#28a745' }}>
+                  {voiceState.selectiveForwardingActive ? 'ON' : 'OFF'}
+                </div>
+                <div style={{ fontSize: '11px', color: '#6c757d' }}>Selective Forwarding</div>
+              </div>
+              <div style={statCardStyle}>
+                <div style={{ fontWeight: 'bold', color: '#17a2b8' }}>
+                  {videoState.remoteVideoCount}
+                </div>
+                <div style={{ fontSize: '11px', color: '#6c757d' }}>Video Streams</div>
+              </div>
+              <div style={statCardStyle}>
+                <div style={{ fontWeight: 'bold', color: '#6f42c1' }}>
+                  {activeSpeakers.filter(s => s.isSpeaking).length}
+                </div>
+                <div style={{ fontSize: '11px', color: '#6c757d' }}>Active Speakers</div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Audio Analysis */}
+      {showSpeakerAnalysis && activeSpeakers.length > 0 && (
+        <div style={{ marginBottom: '20px' }}>
+          <SpeakerIndicator speakers={activeSpeakers} maxVisible={8} />
+        </div>
+      )}
+
+      {/* Video Grid */}
+      {showVideoGrid && videoState.activeParticipants.length > 0 && (
+        <div style={{ backgroundColor: '#fff', padding: '16px', borderRadius: '6px', border: '1px solid #e9ecef' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+            <Text as="h4" style={{ margin: 0 }}>
+              Video Participants ({videoState.activeParticipants.length}/{videoState.maxVideos})
+            </Text>
+            {selectedParticipant && (
+              <Button
+                onClick={() => setSelectedParticipant(null)}
+                size="sm"
+                variant="secondary"
+              >
+                Clear Focus
+              </Button>
+            )}
+          </div>
+          
+          <VideoGrid
+            participants={videoState.activeParticipants}
+            speakers={activeSpeakers}
+            maxVideos={videoState.maxVideos}
+            onParticipantDoubleClick={handleParticipantDoubleClick}
+            selectedParticipantId={selectedParticipant}
+            getUserProfile={getUserProfile}
+            streamThumbnails={streamThumbnails}
+            watchingStreams={watchingStreams}
+            onWatchStream={handleWatchStream}
+            onStopWatching={handleStopWatching}
+          />
+          
+          {selectedParticipant && (
+            <div style={{
+              marginTop: '12px',
+              padding: '8px 12px',
+              backgroundColor: '#e7f5ff',
+              borderRadius: '4px',
+              fontSize: '12px',
+              color: '#004085'
+            }}>
+              Focused on participant: {selectedParticipant.slice(0, 16)}...
+            </div>
+          )}
+        </div>
+      )}
+
+      {voiceChannels.length === 0 && (
+        <div style={{
+          textAlign: 'center',
+          padding: '40px',
+          color: '#6c757d',
+          backgroundColor: '#fff',
+          borderRadius: '6px',
+          border: '1px solid #e9ecef'
+        }}>
+          <div style={{ fontSize: '48px', marginBottom: '16px' }}>
+            <Mic size={48} />
+          </div>
+          <Text as="h4">No Voice Channels Available</Text>
+          <Text>Ask an admin to create voice channels to get started with voice chat.</Text>
+        </div>
+      )}
+    </div>
+  );
+};
+```
+
+# === RESULT ===
+import React, { useState, useEffect, useRef } from 'react';
+import { Mic, Video } from 'lucide-react';
+import type { IdentityProfile } from '@mosh/types';
+import { VideoGrid } from './VideoGrid';
+import { VoiceControls, SpeakerIndicator } from './VoiceControls';
+import { WaveVisualizer } from './WaveVisualizer';
+import {
+  type VoiceState, type SpeakerAnalysis, type VideoState, type VideoParticipant,
+} from '@mosh/voice';
+import type { Channel } from '@mosh/types';
+import { Button, Text } from '@mosh/elements';
+import { services } from '@mosh/app/services';
+import { StreamThumbnailManager } from '@mosh/video';
+import getLogger from '@mosh/logger';
+const logger = getLogger('VoiceChannelManager');
+const { voiceService } = services;
+
+interface VoiceChannelManagerProps {
+  channels: Channel[];
+  currentUserId: string;
+  onError?: (error: string) => void;
+  getUserProfile?: (userId: string) => IdentityProfile | null;
+}
+
+interface ConnectionStats {
+  connectedPeers: number;
+  totalPeers: number;
+  avgLatency: number;
+  packetLoss: number;
+}
+
+export const VoiceChannelManager: React.FC<VoiceChannelManagerProps> = ({
+  channels,
+  currentUserId,
+  onError,
+  getUserProfile
+}) => {
+  const [voiceState, setVoiceState] = useState<VoiceState>(() => voiceService.getState());
+  const [activeSpeakers, setActiveSpeakers] = useState<SpeakerAnalysis[]>([]);
+  const [videoState, setVideoState] = useState<VideoState>({ 
+    activeParticipants: [], 
+    localVideo: false, 
+    remoteVideoCount: 0,
+    maxVideos: 6 
+  });
+  
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [showAdvancedControls, setShowAdvancedControls] = useState(false);
+  const [showVideoGrid, setShowVideoGrid] = useState(true);
+  const [showSpeakerAnalysis, setShowSpeakerAnalysis] = useState(true);
+  const [useRealTimeVisualizer, setUseRealTimeVisualizer] = useState(true);
+  const [connectionStats, setConnectionStats] = useState<ConnectionStats>({
+    connectedPeers: 0,
+    totalPeers: 0,
+    avgLatency: 0,
+    packetLoss: 0
+  });
+
+  const [selectedParticipant, setSelectedParticipant] = useState<string | null>(null);
+  const [streamThumbnails, setStreamThumbnails] = useState<Map<string, string>>(new Map());
+  const [watchingStreams, setWatchingStreams] = useState<Set<string>>(new Set());
+  
+  const thumbnailManagerRef = useRef<StreamThumbnailManager | null>(null);
+  const screenShareStreamRef = useRef<MediaStream | null>(null);
+
+  useEffect(() => {
+    const handleVoiceState = (state: VoiceState) => {
+      setVoiceState(state);
+      setActiveSpeakers(state.activeSpeakers);
+      setVideoState(state.videoState);
+      
+      const totalParticipants = Object.values(state.channelParticipants).flat().length;
+      setConnectionStats(prev => ({
+        ...prev,
+        totalPeers: totalParticipants,
+        connectedPeers: totalParticipants
+      }));
+    };
+
+    const handleError = (error: string) => {
+      onError?.(error);
+    };
+
+    const handleActiveSpeakers = (speakers: SpeakerAnalysis[]) => {
+      setActiveSpeakers(speakers);
+    };
+
+    const handleVideoState = (videoState: VideoState) => {
+      setVideoState(videoState);
+    };
+
+    const handleConnectionQuality = (quality: VoiceState['connectionQuality']) => {
+      logger.info({ quality }, 'Connection quality changed:');
+    };
+
+    voiceService.on('stateChanged', handleVoiceState);
+    voiceService.on('error', handleError);
+    voiceService.on('connectionQualityChanged', handleConnectionQuality);
+
+    return () => {
+      voiceService.off('stateChanged', handleVoiceState);
+      voiceService.off('error', handleError);
+      voiceService.off('connectionQualityChanged', handleConnectionQuality);
+    };
+  }, [onError]);
+
+  useEffect(() => {
+    if (!thumbnailManagerRef.current) {
+      thumbnailManagerRef.current = new StreamThumbnailManager();
+      
+      const unsubscribe = thumbnailManagerRef.current.onThumbnail((thumbnail) => {
+        setStreamThumbnails(prev => {
+          const newMap = new Map(prev);
+          newMap.set(thumbnail.userId, thumbnail.dataUrl);
+          return newMap;
+        });
+        
+        logger.debug({ userId: thumbnail.userId }, 'Received thumbnail update');
+      });
+
+      return () => {
+        unsubscribe();
+        thumbnailManagerRef.current?.cleanup();
+        thumbnailManagerRef.current = null;
+      };
+    }
+  }, []);
+
+  useEffect(() => {
+    const remoteScreenShares = videoState.activeParticipants.filter(
+      p => p.hasVideo && !p.isLocal && p.stream
+    );
+
+    remoteScreenShares.forEach(participant => {
+      if (!watchingStreams.has(participant.userId)) {
+        if (!streamThumbnails.has(participant.userId) && thumbnailManagerRef.current) {
+          logger.info({ userId: participant.userId }, 'Starting thumbnail generation for remote screen share');
+          thumbnailManagerRef.current.startThumbnailGeneration(
+            participant.stream!,
+            participant.userId,
+            true,
+            30000
+          );
+        }
+      }
+    });
+
+    const currentUserIds = new Set(remoteScreenShares.map(p => p.userId));
+    streamThumbnails.forEach((_, userId) => {
+      if (!currentUserIds.has(userId)) {
+        setStreamThumbnails(prev => {
+          const newMap = new Map(prev);
+          newMap.delete(userId);
+          return newMap;
+        });
+      }
+    });
+  }, [videoState.activeParticipants, watchingStreams]);
+
+  const handleStartScreenShare = async () => {
+    setPendingAction('screen-share');
+    try {
+      await voiceService.startScreenShare();
+      
+      const localParticipant = videoState.activeParticipants.find(p => p.isLocal);
+      if (localParticipant?.stream && thumbnailManagerRef.current) {
+        screenShareStreamRef.current = localParticipant.stream;
+        thumbnailManagerRef.current.startThumbnailGeneration(
+          localParticipant.stream,
+          currentUserId,
+          true,
+          30000
+        );
+        logger.info('Started thumbnail generation for local screen share');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to start screen share';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleStopScreenShare = async () => {
+    setPendingAction('screen-share-stop');
+    try {
+      await voiceService.stopScreenShare();
+      
+      if (thumbnailManagerRef.current) {
+        thumbnailManagerRef.current.stopThumbnailGeneration();
+        logger.info('Stopped thumbnail generation for local screen share');
+      }
+      screenShareStreamRef.current = null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to stop screen share';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+  const handleJoinVoice = async (channelId: string, options: { enableVideo?: boolean } = {}) => {
+    setPendingAction(`join-${channelId}`);
+    try {
+      await voiceService.joinVoice(channelId, options);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to join voice channel';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleLeaveVoice = async () => {
+    setPendingAction('leave');
+    try {
+      await voiceService.leaveVoice();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to leave voice channel';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleToggleVideo = async () => {
+    setPendingAction('toggle-video');
+    try {
+      if (voiceState.isVideoEnabled) {
+        await voiceService.disableVideo();
+      } else {
+        await voiceService.enableVideo();
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to toggle video';
+      onError?.(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleToggleMicrophone = async () => {
+    // For now, just leave/rejoin to toggle microphone
+    // In a full implementation, you'd want to mute/unmute the track
+    if (voiceState.isMicrophoneActive && voiceState.activeChannelId) {
+      await handleLeaveVoice();
+    }
+  };
+
+  const handleParticipantDoubleClick = (userId: string, _participant: VideoParticipant) => {
+    setSelectedParticipant((current) => (current === userId ? null : userId));
+  };
+
+  const handleWatchStream = (userId: string) => {
+    setWatchingStreams(prev => {
+      const newSet = new Set(prev);
+      newSet.add(userId);
+      return newSet;
+    });
+    
+    if (thumbnailManagerRef.current) {
+      thumbnailManagerRef.current.addWatcher(currentUserId);
+    }
+    
+    logger.info({ userId, currentUserId }, 'User started watching stream');
+  };
+
+  const handleStopWatching = (userId: string) => {
+    setWatchingStreams(prev => {
+      const newSet = new Set(prev);
+      newSet.delete(userId);
+      return newSet;
+    });
+    
+    if (thumbnailManagerRef.current) {
+      thumbnailManagerRef.current.removeWatcher(currentUserId);
+    }
+    
+    logger.info({ userId, currentUserId }, 'User stopped watching stream');
+  };
+
+  const getConnectionQualityColor = (): string => {
+    switch (voiceState.connectionQuality) {
+      case 'excellent': return '#28a745';
+      case 'good': return '#ffc107';
+      case 'poor': return '#fd7e14';
+      case 'disconnected': return '#dc3545';
+      default: return '#6c757d';
+    }
+  };
+
+  const voiceChannels = channels.filter(channel => channel.type === 'voice');
+
+  const containerStyle: React.CSSProperties = {
+    padding: '20px',
+    backgroundColor: '#f8f9fa',
+    borderRadius: '8px',
+    border: '1px solid #dee2e6'
+  };
+
+  const headerStyle: React.CSSProperties = {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: '20px',
+    paddingBottom: '10px',
+    borderBottom: '1px solid #e9ecef'
+  };
+
+  const channelGridStyle: React.CSSProperties = {
+    display: 'grid',
+    gap: '16px',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
+    marginBottom: '20px'
+  };
+
+  const channelCardStyle: React.CSSProperties = {
+    backgroundColor: '#fff',
+    borderRadius: '6px',
+    border: '1px solid #e9ecef',
+    padding: '16px'
+  };
+
+  const activeChannelStyle: React.CSSProperties = {
+    ...channelCardStyle,
+    border: '2px solid #007bff',
+    backgroundColor: '#e7f5ff'
+  };
+
+  const statsGridStyle: React.CSSProperties = {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+    gap: '12px',
+    marginTop: '16px'
+  };
+
+  const statCardStyle: React.CSSProperties = {
+    backgroundColor: '#fff',
+    padding: '12px',
+    borderRadius: '4px',
+    border: '1px solid #e9ecef',
+    textAlign: 'center'
+  };
+
+  const controlsStyle: React.CSSProperties = {
+    display: 'flex',
+    gap: '12px',
+    marginBottom: '16px',
+    flexWrap: 'wrap'
+  };
+
+  const toggleButtonStyle: React.CSSProperties = {
+    padding: '6px 12px',
+    border: '1px solid #dee2e6',
+    borderRadius: '4px',
+    backgroundColor: '#fff',
+    cursor: 'pointer',
+    fontSize: '12px'
+  };
+
+  return (
+    <div style={containerStyle}>
+      <div style={headerStyle}>
+        <Text as="h3">Voice Channel Manager</Text>
+        <div style={controlsStyle}>
+          <Button
+            style={{...toggleButtonStyle, color: '#212529', backgroundColor: '#ffffff'}}
+            onClick={() => setShowAdvancedControls(!showAdvancedControls)}
+          >
+            {showAdvancedControls ? 'Hide' : 'Show'} Advanced
+          </Button>
+          <Button
+            style={{...toggleButtonStyle, color: '#212529', backgroundColor: '#ffffff'}}
+            onClick={() => setShowVideoGrid(!showVideoGrid)}
+          >
+            {showVideoGrid ? 'Hide' : 'Show'} Video
+          </Button>
+          <Button
+            style={{...toggleButtonStyle, color: '#212529', backgroundColor: '#ffffff'}}
+            onClick={() => setShowSpeakerAnalysis(!showSpeakerAnalysis)}
+          >
+            {showSpeakerAnalysis ? 'Hide' : 'Show'} Audio Analysis
+          </Button>
+        </div>
+      </div>
+
+      {/* Voice Channels Grid */}
+      <div style={channelGridStyle}>
+        {voiceChannels.map(channel => {
+          const participants = voiceState.channelParticipants[channel.id] || [];
+          const isActive = voiceState.activeChannelId === channel.id;
+          const isPending = pendingAction?.includes(channel.id);
+
+          return (
+            <div
+              key={channel.id}
+              style={isActive ? activeChannelStyle : channelCardStyle}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                <div>
+                  <Text as="h4" style={{ margin: '0 0 4px 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Mic size={16} />
+                    {channel.name}
+                    {isActive && voiceState.selectiveForwardingActive && (
+                      <Text as="span" style={{
+                        fontSize: '10px',
+                        backgroundColor: '#fff3cd',
+                        color: '#856404',
+                        padding: '2px 6px',
+                        borderRadius: '3px',
+                        border: '1px solid #ffeaa7'
+                      }}>
+                        SF Active
+                      </Text>
+                    )}
+                  </Text>
+                  <div style={{ fontSize: '12px', color: '#6c757d' }}>
+                    {participants.length} participant{participants.length !== 1 ? 's' : ''}
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  {isActive ? (
+                    <Button
+                      onClick={handleLeaveVoice}
+                      disabled={isPending}
+                      variant="danger"
+                    >
+                      {isPending ? 'Leaving...' : 'Leave'}
+                    </Button>
+                  ) : (
+                    <>
+                      <Button
+                        onClick={() => handleJoinVoice(channel.id, { enableVideo: false })}
+                        disabled={Boolean(pendingAction)}
+                        variant="success"
+                      >
+                        {isPending ? 'Joining...' : 'Join'}
+                      </Button>
+                      <Button
+                        onClick={() => handleJoinVoice(channel.id, { enableVideo: true })}
+                        disabled={Boolean(pendingAction)}
+                      >
+                        <Video size={14} style={{ marginRight: 4 }} />
+                        Join + Video
+                      </Button>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              {/* Participants List */}
+              <div style={{ marginTop: '12px' }}>
+                {participants.length === 0 ? (
+                  <div style={{ fontSize: '12px', color: '#6c757d', fontStyle: 'italic' }}>
+                    No one is connected yet.
+                  </div>
+                ) : (
+                  participants.map(participant => {
+                    const displayName = participant.pubkey === currentUserId ? 'You' : (getUserProfile?.(participant.pubkey)?.displayName ?? `${participant.pubkey.slice(0, 8)}...`);
+                    return (
+                      <div
+                        key={participant.pubkey}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '8px',
+                          padding: '4px 0',
+                          fontSize: '13px'
+                        }}
+                      >
+                        <div
+                          style={{
+                            width: '6px',
+                            height: '6px',
+                            borderRadius: '50%',
+                            backgroundColor: participant.isLocal ? '#0ca678' : '#748ffc'
+                          }}
+                        />
+                        <Text as="span">
+                          {displayName}
+                        </Text>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Active Voice Controls */}
+      {voiceState.activeChannelId && (
+        <div style={{ backgroundColor: '#fff', padding: '16px', borderRadius: '6px', border: '1px solid #e9ecef', marginBottom: '20px' }}>
+          <Text as="h4" style={{ margin: '0 0 16px 0' }}>Voice Controls</Text>
+          
+          <VoiceControls
+            isMicrophoneActive={voiceState.isMicrophoneActive}
+            isMicrophoneMuted={voiceState.isMicrophoneMuted}
+            isDeafened={voiceState.isDeafened}
+            isVideoEnabled={voiceState.isVideoEnabled}
+            connectionQuality={voiceState.connectionQuality}
+            onToggleMicrophone={handleToggleMicrophone}
+            onToggleVideo={handleToggleVideo}
+            onStartScreenShare={handleStartScreenShare}
+            onStopScreenShare={handleStopScreenShare}
+            onLeaveVoice={handleLeaveVoice}
+            disabled={Boolean(pendingAction)}
+          />
+
+          {/* Connection Quality Indicator */}
+          <div style={{
+            marginTop: '16px',
+            padding: '8px 12px',
+            backgroundColor: '#f8f9fa',
+            borderRadius: '4px',
+            fontSize: '12px'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <Text as="span">Connection Quality:</Text>
+              <Text as="span" style={{ 
+                color: getConnectionQualityColor(),
+                fontWeight: 'bold',
+                textTransform: 'capitalize'
+              }}>
+                {voiceState.connectionQuality}
+              </Text>
+            </div>
+          </div>
+
+          {/* Advanced Stats */}
+          {showAdvancedControls && (
+            <div style={statsGridStyle}>
+              <div style={statCardStyle}>
+                <div style={{ fontWeight: 'bold', color: '#007bff' }}>
+                  {connectionStats.connectedPeers}/{connectionStats.totalPeers}
+                </div>
+                <div style={{ fontSize: '11px', color: '#6c757d' }}>Connected Peers</div>
+              </div>
+              <div style={statCardStyle}>
+                <div style={{ fontWeight: 'bold', color: voiceState.selectiveForwardingActive ? '#fd7e14' : '#28a745' }}>
+                  {voiceState.selectiveForwardingActive ? 'ON' : 'OFF'}
+                </div>
+                <div style={{ fontSize: '11px', color: '#6c757d' }}>Selective Forwarding</div>
+              </div>
+              <div style={statCardStyle}>
+                <div style={{ fontWeight: 'bold', color: '#17a2b8' }}>
+                  {videoState.remoteVideoCount}
+                </div>
+                <div style={{ fontSize: '11px', color: '#6c757d' }}>Video Streams</div>
+              </div>
+              <div style={statCardStyle}>
+                <div style={{ fontWeight: 'bold', color: '#6f42c1' }}>
+                  {activeSpeakers.filter(s => s.isSpeaking).length}
+                </div>
+                <div style={{ fontSize: '11px', color: '#6c757d' }}>Active Speakers</div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Audio Analysis */}
+      {showSpeakerAnalysis && activeSpeakers.length > 0 && (
+        <div style={{ marginBottom: '20px' }}>
+          <SpeakerIndicator speakers={activeSpeakers} maxVisible={8} />
+        </div>
+      )}
+
+      {/* Video Grid */}
+      {showVideoGrid && videoState.activeParticipants.length > 0 && (
+        <div style={{ backgroundColor: '#fff', padding: '16px', borderRadius: '6px', border: '1px solid #e9ecef' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+            <Text as="h4" style={{ margin: 0 }}>
+              Video Participants ({videoState.activeParticipants.length}/{videoState.maxVideos})
+            </Text>
+            {selectedParticipant && (
+              <Button
+                onClick={() => setSelectedParticipant(null)}
+                size="sm"
+                variant="secondary"
+              >
+                Clear Focus
+              </Button>
+            )}
+          </div>
+          
+          <VideoGrid
+            participants={videoState.activeParticipants}
+            speakers={activeSpeakers}
+            maxVideos={videoState.maxVideos}
+            onParticipantDoubleClick={handleParticipantDoubleClick}
+            selectedParticipantId={selectedParticipant}
+            getUserProfile={getUserProfile}
+            streamThumbnails={streamThumbnails}
+            watchingStreams={watchingStreams}
+            onWatchStream={handleWatchStream}
+            onStopWatching={handleStopWatching}
+          />
+          
+          {selectedParticipant && (
+            <div style={{
+              marginTop: '12px',
+              padding: '8px 12px',
+              backgroundColor: '#e7f5ff',
+              borderRadius: '4px',
+              fontSize: '12px',
+              color: '#004085'
+            }}>
+              Focused on participant: {selectedParticipant.slice(0, 16)}...
+            </div>
+          )}
+        </div>
+      )}
+
+      {voiceChannels.length === 0 && (
+        <div style={{
+          textAlign: 'center',
+          padding: '40px',
+          color: '#6c757d',
+          backgroundColor: '#fff',
+          borderRadius: '6px',
+          border: '1px solid #e9ecef'
+        }}>
+          <div style={{ fontSize: '48px', marginBottom: '16px' }}>
+            <Mic size={48} />
+          </div>
+          <Text as="h4">No Voice Channels Available</Text>
+          <Text>Ask an admin to create voice channels to get started with voice chat.</Text>
+        </div>
+      )}
+    </div>
+  );
+};
