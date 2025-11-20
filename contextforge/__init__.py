@@ -1,7 +1,10 @@
-# contextforge/__init__.py
 from .commit import commit_changes, patch_text, fuzzy_patch_partial
 from .context import build_context
 from .core import parse_markdown_string, plan_and_generate_changes
+from .plan import plan_changes
+from .transform import apply_change_smartly
+from .utils.fs import resolve_filename
+from .utils.text import cleanup_llm_output
 from .errors import (
     CommitError,
     ContextError,
@@ -21,6 +24,10 @@ __all__ = [
     "build_context",
     "parse_markdown_string",
     "plan_and_generate_changes",
+    "plan_changes",             
+    "apply_change_smartly",     
+    "resolve_filename",         
+    "cleanup_llm_output",       
     "extract_blocks_from_text",
     "extract_diffs_from_text",
     "extract_file_info_from_context_and_code",

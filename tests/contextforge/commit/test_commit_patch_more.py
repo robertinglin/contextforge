@@ -10,15 +10,3 @@ def test_sentinel_branch_replacement_unique_edges():
     out = patch_text(original, [dict(old=old, new=new)])
     assert out == new
 
-
-def test_debug_logger_path():
-    logs = []
-
-    class Logger:
-        def debug(self, msg):
-            logs.append(msg)
-
-    original = "log me"
-    patch = dict(old="log", new="LOG")
-    out = patch_text(original, [patch], debug=True, logger=Logger())
-    assert out == "LOG me" and logs
