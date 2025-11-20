@@ -159,20 +159,27 @@ def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
     
     # If the same file path is provided multiple times, use the last one based on start position.
     # This handles cases where a model refines its answer in a single response.
-    # Deduplication only applies to file blocks with file_path - diffs keep all occurrences
-    # since they might target different files or represent different changes
-    latest_file_blocks_by_path = {}
+    # We deduplicate blocks by (file_path, type) tuple. This ensures that:
+    # 1. Two file blocks for 'a.py' -> last one wins (correction).
+    # 2. Two diff blocks for 'a.py' -> last one wins (correction).
+    # 3. One file block 'a.py' and one diff block 'a.py' -> both kept (mixed operations).
+    
+    latest_blocks_by_key = {}
     other_blocks = []
     for block in results:
-        if block["type"] == "file" and block.get("file_path"):
-            fp = block["file_path"]
-            if fp not in latest_file_blocks_by_path or block["start"] > latest_file_blocks_by_path[fp]["start"]:
-                latest_file_blocks_by_path[fp] = block
+        fp = block.get("file_path")
+        b_type = block["type"]
+        
+        # Only deduplicate if we have a file path and it is a file or diff block
+        if fp and b_type in ("file", "diff"):
+            key = (fp, b_type)
+            if key not in latest_blocks_by_key or block["start"] > latest_blocks_by_key[key]["start"]:
+                latest_blocks_by_key[key] = block
         else:
             other_blocks.append(block)
 
     # Combine the deduplicated file blocks with others
-    deduped = other_blocks + list(latest_file_blocks_by_path.values())
+    deduped = other_blocks + list(latest_blocks_by_key.values())
     
     # Sort by start position for stable ordering
     return sorted(deduped, key=lambda b: b["start"])

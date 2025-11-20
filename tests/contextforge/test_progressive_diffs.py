@@ -1,5 +1,3 @@
-
-
 """
 Progressive, end-to-end tests for ContextForge's diff extraction, block extraction,
 fuzzy patching, planning, and commit preparation.
@@ -186,9 +184,11 @@ def test_level_4_simplified_indented_hunks():
     original = "hello\nworld\n"
     patch = textwrap.dedent(
         """
+        --- a/test.txt
+        +++ b/test.txt
         Some commentary above
 
-        @@
+        @@ @@
         - hello
         +HELLO
 
@@ -789,20 +789,29 @@ def test_level_24_plan_and_generate_changes_integration(tmp_path: Any = None):
 
     planned: List[Dict[str, Any]] = []
     for b in blocks:
-        if b["type"] == "diff" and "rename from" in b["code"]:
-            info = meta_mod.detect_rename_from_diff(b["code"])
-            assert info
-            planned.append({"metadata": {"change_type": "rename", **info}, "block": b})
-        elif b["type"] == "diff" and "unused.txt" in b["code"]:
-            deleted = meta_mod.detect_deletion_from_diff(b["code"])
-            assert deleted == "unused.txt"
-            planned.append({"metadata": {"change_type": "delete", "file_path": deleted}, "block": b})
+        if b["type"] == "rename":
+            planned.append({
+                "metadata": {
+                    "change_type": "rename",
+                    "from_path": b["from_path"],
+                    "to_path": b["to_path"]
+                },
+                "block": b
+            })
+        elif b["type"] == "delete":
+            planned.append({
+                "metadata": {
+                    "change_type": "delete",
+                    "file_path": b["file_path"]
+                },
+                "block": b
+            })
         elif b["type"] == "diff":
             planned.append(
                 {
                     "metadata": {
                         "change_type": "diff",
-                        "file_path": "app.py",
+                        "file_path": b.get("file_path") or "app.py",
                     },
                     "block": b,
                 }
