@@ -423,6 +423,13 @@ def _split_noncontiguous_hunks(hunks: list[dict]) -> list[dict]:
     for hunk in hunks:
         lines = hunk["lines"]
         
+        # Do not split hunks that contain deletions.
+        # These are replacement hunks where the relative positioning of additions
+        # around the deletions is important and should be preserved.
+        if any(line and line.startswith("-") for line in lines):
+            split_hunks.append(hunk)
+            continue
+        
         # Check if this hunk has non-contiguous additions
         # Pattern: + lines, then context, then more + lines (no - lines)
         has_additions = False
@@ -567,13 +574,9 @@ def _split_hunk_components(hunk_lines: list[str]) -> tuple[list[str], list[str],
 
 
 def _adaptive_ctx_window(lead_ctx: list[str], tail_ctx: list[str]) -> int:
-    """Pick a context slice size between 3 and 10 based on available context."""
-    total = len(lead_ctx) + len(tail_ctx)
-    if total <= 3:
-        return 3
-    if total >= 20:
-        return 10
-    return max(3, min(10, 3 + (total - 3) * (10 - 3) // (20 - 3)))
+    """Pick a context slice size based on available context."""
+    # Use all available context to ensure precision, falling back to 3 lines minimum
+    return max(len(lead_ctx), len(tail_ctx), 3)
 
 def _locate_insertion_index(
     target: list[str],
