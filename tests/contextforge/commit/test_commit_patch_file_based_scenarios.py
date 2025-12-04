@@ -38,7 +38,13 @@ def test_patch_from_file_scenario(filename):
 
     # Split the content into initial, test, and result sections
     try:
-        initial_raw, remaining = content.split('\n# === TEST ===\n', 1)
+        if content.startswith('# === TEST ==='):
+            initial_raw = ''
+            remaining = content[len('# === TEST ===\n'):]
+            print(remaining)
+            print(remaining.split('\n# === RESULT ===\n', 1))
+        else:
+            initial_raw, remaining = content.split('\n# === TEST ===\n', 1)
         diff_raw, expected_raw = remaining.split('\n# === RESULT ===\n', 1)
     except ValueError:
         pytest.fail(

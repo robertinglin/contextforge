@@ -1,0 +1,1154 @@
+import asyncio
+import concurrent.futures
+import json
+import logging
+import re
+import time
+import os
+import shutil
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, AsyncGenerator, List
+from fastapi import APIRouter, Depends, HTTPException, Response, status, Query
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+# The smart_paster service uses this library for robust patching. We will use the same
+# tiered logic here for consistency and reliability.
+try:
+    from contextforge import patch_text, PatchFailedError
+except ImportError:
+    patch_text = None
+    PatchFailedError = Exception
+from app.models import models
+from app.core.high_perf_db import HighPerfSQLite
+from app.core.db import get_db_connection
+from app.services import (
+    proposals as proposals_service,
+    preferences as preferences_service,
+    tasks as tasks_service,
+    context_builder_service,
+    proposal_generator_service,
+    yolo_service,
+    console_service,
+)
+from app.services.llm_providers.base import LLMProvider
+from app.services import projects as projects_service
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+# Patterns that indicate file changes in LLM output
+# These match common formats used by various LLM providers
+FILE_CHANGE_PATTERNS = [
+    # Markdown code blocks with file paths (e.g., ```python src/file.py or ```typescript:path/to/file.ts)
+    r'```\w*[:\s]+[\w./\\-]+\.\w+',
+    # File path headers (e.g., "// File: src/file.py" or "# File: path/to/file.py")
+    r'(?://|#)\s*[Ff]ile:\s*[\w./\\-]+\.\w+',
+    # Unified diff headers (e.g., "--- a/file.py" or "+++ b/file.py")
+    r'(?:---|\+\+\+)\s+[ab]/[\w./\\-]+\.\w+',
+    # XML-style file tags (e.g., <file path="src/file.py">)
+    r'<file\s+path=["\'][\w./\\-]+\.\w+["\']',
+    # Common LLM file block markers
+    r'\[FILE:\s*[\w./\\-]+\.\w+\]',
+    # Claude/Anthropic style file markers
+    r'<artifact\s+.*?type=["\'](?:application/vnd\.ant\.code|text/[\w-]+)["\']',
+]
+
+
+def _output_has_file_changes(output: str) -> bool:
+    """
+    Check if the output contains patterns that indicate file changes.
+    This is a heuristic check - it doesn't guarantee parseable file changes,
+    but indicates there's likely something to finalize.
+    """
+    if not output:
+        return False
+    for pattern in FILE_CHANGE_PATTERNS:
+        if re.search(pattern, output, re.IGNORECASE | re.MULTILINE):
+            return True
+    return False
+
+
+async def _check_disk_for_file_changes(run_data: Dict[str, Any]) -> bool:
+    """
+    Check if there are modified files on disk in the working directory.
+    Used for providers that prefer files on disk (prefers_files_on_disk=True).
+    
+    Returns True if any files have been modified in the working directory
+    compared to the original project path.
+    """
+    working_dir = run_data.get("working_dir")
+    project_path = run_data.get("project_path")
+    
+    if not working_dir or not project_path:
+        return False
+    
+    if not os.path.exists(working_dir):
+        return False
+    
+    # Check if it's a git worktree
+    is_git_worktree = os.path.exists(os.path.join(working_dir, ".git"))
+    
+    if is_git_worktree:
+        # Use git status to detect changes
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "status", "--porcelain",
+                cwd=working_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            
+            if proc.returncode == 0:
+                # Any output means there are changes
+                output = stdout.decode().strip()
+                return bool(output)
+        except Exception:
+            pass
+    
+    # Fallback: walk directory and compare files
+    try:
+        for root, _, files in os.walk(working_dir):
+            for filename in files:
+                # Skip git-related files
+                if '.git' in root:
+                    continue
+                    
+                temp_file_path = os.path.join(root, filename)
+                try:
+                    relative_path = os.path.relpath(temp_file_path, working_dir).replace(os.sep, '/')
+                except ValueError:
+                    continue
+                
+                original_file_path = os.path.normpath(os.path.join(project_path, relative_path))
+                
+                try:
+                    with open(temp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        modified_content = f.read()
+                    
+                    original_content = ""
+                    if os.path.exists(original_file_path) and os.path.isfile(original_file_path):
+                        with open(original_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            original_content = f.read()
+                    
+                    # Check if content differs (new file or modified)
+                    if original_content.strip() != modified_content.strip():
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    
+    return False
+
+
+def _has_file_changes_sync(run_data: Dict[str, Any], output_text: str) -> bool:
+    """
+    Synchronous check for file changes - checks output text patterns only.
+    For async disk checks, use _check_disk_for_file_changes separately.
+    """
+    return _output_has_file_changes(output_text)
+
+
+@router.post("/generate")
+async def generate_proposal(
+    body: models.GenerateProposalRequest,
+    project_id: str = Query(...),
+    conn: HighPerfSQLite = Depends(get_db_connection),
+):
+    # Validate task belongs to project
+    task = await tasks_service.get_task(body.taskId, conn)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task '{body.taskId}' not found.")
+    if task.projectId != project_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Task '{body.taskId}' does not belong to project '{project_id}'.",
+        )
+
+    # This endpoint now creates a persistent proposal and links it to a task.
+    # The content is still mocked for now.
+    proposal_id = f"prop_{int(time.time())}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    hunk = models.Hunk(
+        id=f"hunk_{int(time.time())}_1",
+        rangeBefore=models.HunkRange(start=10, end=15),
+        rangeAfter=models.HunkRange(start=10, end=18),
+        content="+ // AI-generated improvement\n+ const improved = true;",
+        confidence=88,
+    )
+    file_changed = models.FileChanged(
+        path="src/example.ts", status="modified", hunks=[hunk]
+    )
+
+    new_proposal = models.Proposal(
+        id=proposal_id,
+        taskId=body.taskId,
+        title="Generated solution for task",
+        status="open",
+        summary="This is a generated solution based on the provided context.",
+        filesChanged=[file_changed],
+        createdAt=now,
+        updatedAt=now,
+    )
+
+    created_proposal = await proposals_service.create_proposal(new_proposal, conn)
+    await tasks_service.update_task(
+        body.taskId, {"currentProposalId": proposal_id}, conn
+    )
+    return created_proposal
+
+
+@router.get("", response_model=List[models.Proposal])
+async def get_proposals(
+    task_id: Optional[str] = Query(
+        None, description="The ID of the task to fetch proposals for."
+    ),
+    project_id: str = Query(...),
+    conn: HighPerfSQLite = Depends(get_db_connection),
+):
+    """
+    Lists proposals for a specific task.
+    """
+    if not task_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The 'task_id' query parameter is required.",
+        )
+
+    task = await tasks_service.get_task(task_id, conn)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
+    if task.projectId != project_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Task '{task_id}' does not belong to project '{project_id}'.",
+        )
+
+    return await proposals_service.list_proposals_for_task(task_id, conn)
+
+
+@router.post("/run/{provider_id}", status_code=status.HTTP_202_ACCEPTED)
+async def run_provider_async(
+    provider_id: str,
+    body: models.RunQwenRequest,
+    project_id: str = Query(...),
+    conn: HighPerfSQLite = Depends(get_db_connection),
+):
+    """
+    Starts a background generation process using a configured or built-in LLM provider.
+    """
+    project = await projects_service.get_project(project_id, conn)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not project.serverPath:
+        raise HTTPException(status_code=404, detail="Project path not configured.")
+
+    provider_config = await preferences_service.get_provider(provider_id, conn)
+    provider: LLMProvider
+    provider_name: str
+    max_context_tokens: Optional[int] = None
+
+    if provider_config and provider_config.enabled:
+        provider = proposal_generator_service.get_provider_by_id(
+            provider_id, provider_config
+        )
+        provider_name = provider_config.name
+        # Extract maxContextTokens from provider limits if available
+        if provider_config.limits and provider_config.limits.maxContextTokens:
+            max_context_tokens = provider_config.limits.maxContextTokens
+    else:
+        # Fallback to built-in providers if not found in DB or not enabled.
+        try:
+            provider = proposal_generator_service.get_provider_by_id(provider_id)
+            provider_name = provider_id.capitalize()
+        except (ValueError, FileNotFoundError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"LLM provider '{provider_id}' is not enabled or does not exist.",
+            )
+
+    proposal_id = proposals_service.create_proposal_id()
+    task_id = body.taskId
+    if not task_id:
+        task_create_res = await tasks_service.create_task(
+            {
+                "title": body.title
+                or body.instructions
+                or f"New Task from {provider_name}"
+            },
+            project.id,
+            conn,
+        )
+        task_id = task_create_res["taskId"]
+
+    if not body.files:
+        budget = body.tokenBudget or 1_000_000
+
+        # max_context_tokens is already extracted above from provider_config
+        # This ensures we pass the limit to the context builder
+
+        context_files = await context_builder_service.build_context_for_task(
+            project=project,
+            task_id=task_id,
+            conn=conn,
+            token_budget=budget,
+            max_context_tokens=max_context_tokens,
+        )
+        if not context_files:
+            await tasks_service.update_task(task_id, {"status": "failed"}, conn)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Automatic context builder found no relevant files for the given instructions. Please add files to the scope manually.",
+            )
+        file_paths = [f["path"] for f in context_files]
+        auto_context_body = body.model_copy(update={"files": file_paths})
+        body_with_context = auto_context_body
+    else:
+        body_with_context = body
+
+    if body.interactive:
+        provider_command = await provider.get_cli_command()
+        if not provider_command:
+            raise HTTPException(
+                status_code=400, detail="This provider does not support interactive mode."
+            )
+        # NOTE: No proposal-level title generation here; titles are task-centric.
+        new_proposal_draft = models.Proposal(
+            id=proposal_id,
+            taskId=task_id,
+            title=body.title
+            or body.instructions
+            or f"New Interactive Proposal from {provider_name}",
+            status="draft",
+            generatingProvider=provider_id, # Use body_with_context to save the file list
+            generationRequest=body_with_context.model_dump(mode="json"),
+        )
+        await proposals_service.create_proposal(new_proposal_draft, conn)
+        await tasks_service.update_task(
+            task_id, {"status": "generating", "currentProposalId": proposal_id}, conn
+        )
+        return {"taskId": task_id, "proposalId": proposal_id, "interactive": True}
+
+    # Non-interactive: start proposal generation
+    proposal_generator_service.start_proposal_generation(
+        proposal_id, task_id, body_with_context, project, provider
+    )
+
+    return {"taskId": task_id, "proposalId": proposal_id, "interactive": False}
+
+
+@router.post("/run-yolo", status_code=status.HTTP_202_ACCEPTED)
+async def run_yolo_async(
+    body: models.RunQwenRequest,
+    project_id: str = Query(...),
+    conn: HighPerfSQLite = Depends(get_db_connection),
+):
+    """
+    Starts a "YOLO mode" background process. It gives the same task to all configured providers,
+    waits for them to finish, then uses Qwen to evaluate the best proposal.
+    """
+    project = await projects_service.get_project(project_id, conn)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not project.serverPath:
+        raise HTTPException(status_code=404, detail="Project path not configured.")
+
+    task_id = body.taskId
+    if not task_id:
+        task_create_res = await tasks_service.create_task(
+            {"title": body.title or body.instructions or "New Task from YOLO"},
+            project.id,
+            conn,
+        )
+        task_id = task_create_res["taskId"]
+
+    # YOLO mode always uses automatic context building if no files are provided.
+    if not body.files:
+        budget = body.tokenBudget or 1_000_000
+        
+        # For YOLO mode, we don't apply a hard max_context_tokens limit
+        # since multiple providers with different limits are involved.
+        # Each provider will handle its own limits during generation.
+        context_files = await context_builder_service.build_context_for_task(
+            project=project, task_id=task_id, conn=conn, token_budget=budget
+        )
+        if not context_files:
+            await tasks_service.update_task(task_id, {"status": "failed"}, conn)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Automatic context builder found no relevant files for the given instructions. Please add files to the scope manually.",
+            )
+        file_paths = [f["path"] for f in context_files]
+        body_with_context = body.model_copy(update={"files": file_paths})
+    else:
+        body_with_context = body
+
+    await tasks_service.update_task(task_id, {"status": "generating"}, conn)
+
+    yolo_service.start_yolo_mode_background(task_id, body_with_context, project)
+
+    return {
+        "taskId": task_id,
+        "message": "YOLO mode started. All providers are generating proposals.",
+    }
+
+
+@router.post("/{proposal_id}/finalize-stream", status_code=status.HTTP_200_OK)
+async def finalize_stream(
+    proposal_id: str,
+    project_id: str = Query(...),
+    conn: HighPerfSQLite = Depends(get_db_connection),
+):
+    """
+    Finalizes a proposal from whatever output has been captured so far in the stream.
+    Used when user wants to stop watching the stream but still process the partial results.
+    Handles both text output mode and files-on-disk mode.
+    """
+    import difflib
+    
+    project = await projects_service.get_project(project_id, conn)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    run_data = proposal_generator_service.generation_runs.get(proposal_id)
+    if not run_data:
+        raise HTTPException(status_code=404, detail="Generation run not found")
+    
+    # Get whatever output we have so far
+    raw_output = "".join(run_data.get("output", []))
+    
+    # Check if this provider uses files-on-disk mode
+    prefers_files_on_disk = run_data.get("prefers_files_on_disk", False)
+    working_dir = run_data.get("working_dir")
+    project_path = run_data.get("project_path", project.serverPath)
+    
+    markdown_for_proposal = raw_output
+    
+    # If provider prefers files on disk, generate diffs from the modified files
+    if prefers_files_on_disk and working_dir and os.path.exists(working_dir):
+        markdown_from_files = ""
+        
+        # Check if it's a git worktree
+        is_git_worktree = os.path.exists(os.path.join(working_dir, ".git"))
+        
+        changed_files = []
+        if is_git_worktree:
+            # Use git status to detect changes
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "status", "--porcelain", "-uall",
+                    cwd=working_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                
+                if proc.returncode == 0:
+                    for line in stdout.decode().splitlines():
+                        if len(line) >= 3:
+                            status_code = line[:2]
+                            filename = line[3:].strip()
+                            if status_code.strip():
+                                changed_files.append(filename)
+            except Exception:
+                pass
+        
+        # Fallback or supplement: walk directory
+        if not changed_files:
+            for root, _, files in os.walk(working_dir):
+                for filename in files:
+                    if '.git' in root:
+                        continue
+                    temp_file_path = os.path.join(root, filename)
+                    try:
+                        relative_path = os.path.relpath(temp_file_path, working_dir).replace(os.sep, '/')
+                    except ValueError:
+                        continue
+                    
+                    original_file_path = os.path.normpath(os.path.join(project_path, relative_path))
+                    
+                    try:
+                        with open(temp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            modified_content = f.read()
+                        
+                        original_content = ""
+                        if os.path.exists(original_file_path) and os.path.isfile(original_file_path):
+                            with open(original_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                original_content = f.read()
+                        
+                        if original_content.strip() != modified_content.strip():
+                            changed_files.append(relative_path)
+                    except Exception:
+                        continue
+        
+        # Generate diffs for all changed files
+        for relative_path in changed_files:
+            temp_file_path = os.path.join(working_dir, relative_path)
+            original_file_path = os.path.normpath(os.path.join(project_path, relative_path))
+            
+            try:
+                with open(temp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    modified_content = f.read()
+                
+                original_content = ""
+                if os.path.exists(original_file_path) and os.path.isfile(original_file_path):
+                    with open(original_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        original_content = f.read()
+                
+                diff_lines = difflib.unified_diff(
+                    original_content.splitlines(keepends=True),
+                    modified_content.splitlines(keepends=True),
+                    fromfile=f"a/{relative_path}",
+                    tofile=f"b/{relative_path}",
+                )
+                diff_content = "".join(diff_lines)
+                if diff_content:
+                    markdown_from_files += f"```diff\n{diff_content}```\n\n"
+            except Exception:
+                continue
+        
+        # Combine files-based markdown with any stdout output
+        if markdown_from_files:
+            markdown_for_proposal = markdown_from_files + "\n\n" + raw_output
+    
+    # Check if we have anything to finalize
+    if not markdown_for_proposal.strip():
+        # Also check if there are file changes even without output
+        has_disk_changes = prefers_files_on_disk and await _check_disk_for_file_changes(run_data)
+        if not has_disk_changes:
+            raise HTTPException(status_code=400, detail="No output or file changes captured yet")
+    
+    # Parse and update the proposal
+    task_id = run_data.get("task_id")
+    if not task_id:
+        raise HTTPException(status_code=400, detail="No task associated with this generation")
+    
+    updated_proposal = await proposals_service.update_proposal_from_markdown(
+        proposal_id, task_id, markdown_for_proposal, conn, project.serverPath
+    )
+    await proposals_service.update_proposal(proposal_id, {"rawProviderResponse": markdown_for_proposal, "status": "open"}, conn)
+    await tasks_service.update_task(task_id, {"status": "reviewing"}, conn)
+    
+    return {"message": "Proposal finalized from partial stream.", "taskId": task_id, "proposalId": updated_proposal.id}
+
+# === TEST === 
+File: backend/app/api/proposals.py
+```python
+<<<<
+        if is_git_worktree:
+            # Use git status to detect changes
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "status", "--porcelain",
+                    cwd=working_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+====
+        if is_git_worktree:
+            # Use git status to detect changes
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "status", "--porcelain", "-uall",
+                    cwd=working_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+>>>>
+```
+
+```python
+<<<<
+        # Generate diffs for all changed files
+        for relative_path in changed_files:
+            temp_file_path = os.path.join(working_dir, relative_path)
+            original_file_path = os.path.normpath(os.path.join(project_path, relative_path))
+            
+            try:
+                with open(temp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    modified_content = f.read()
+                
+                original_content = ""
+                if os.path.exists(original_file_path) and os.path.isfile(original_file_path):
+                    with open(original_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        original_content = f.read()
+                
+                diff_lines = difflib.unified_diff(
+                    original_content.splitlines(keepends=True),
+                    modified_content.splitlines(keepends=True),
+                    fromfile=f"a/{relative_path}",
+                    tofile=f"b/{relative_path}",
+                )
+====
+        # Generate diffs for all changed files
+        for relative_path in changed_files:
+            temp_file_path = os.path.join(working_dir, relative_path)
+            original_file_path = os.path.normpath(os.path.join(project_path, relative_path))
+            
+            if os.path.isdir(temp_file_path):
+                continue
+
+            try:
+                modified_content = ""
+                if os.path.exists(temp_file_path) and os.path.isfile(temp_file_path):
+                    with open(temp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        modified_content = f.read()
+                
+                original_content = ""
+                if os.path.exists(original_file_path) and os.path.isfile(original_file_path):
+                    with open(original_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        original_content = f.read()
+                
+                diff_lines = difflib.unified_diff(
+                    original_content.splitlines(keepends=True),
+                    modified_content.splitlines(keepends=True),
+                    fromfile=f"a/{relative_path}",
+                    tofile=f"b/{relative_path}",
+                )
+>>>>
+```
+
+# === RESULT ===
+import asyncio
+import concurrent.futures
+import json
+import logging
+import re
+import time
+import os
+import shutil
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, AsyncGenerator, List
+from fastapi import APIRouter, Depends, HTTPException, Response, status, Query
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+# The smart_paster service uses this library for robust patching. We will use the same
+# tiered logic here for consistency and reliability.
+try:
+    from contextforge import patch_text, PatchFailedError
+except ImportError:
+    patch_text = None
+    PatchFailedError = Exception
+from app.models import models
+from app.core.high_perf_db import HighPerfSQLite
+from app.core.db import get_db_connection
+from app.services import (
+    proposals as proposals_service,
+    preferences as preferences_service,
+    tasks as tasks_service,
+    context_builder_service,
+    proposal_generator_service,
+    yolo_service,
+    console_service,
+)
+from app.services.llm_providers.base import LLMProvider
+from app.services import projects as projects_service
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+# Patterns that indicate file changes in LLM output
+# These match common formats used by various LLM providers
+FILE_CHANGE_PATTERNS = [
+    # Markdown code blocks with file paths (e.g., ```python src/file.py or ```typescript:path/to/file.ts)
+    r'```\w*[:\s]+[\w./\\-]+\.\w+',
+    # File path headers (e.g., "// File: src/file.py" or "# File: path/to/file.py")
+    r'(?://|#)\s*[Ff]ile:\s*[\w./\\-]+\.\w+',
+    # Unified diff headers (e.g., "--- a/file.py" or "+++ b/file.py")
+    r'(?:---|\+\+\+)\s+[ab]/[\w./\\-]+\.\w+',
+    # XML-style file tags (e.g., <file path="src/file.py">)
+    r'<file\s+path=["\'][\w./\\-]+\.\w+["\']',
+    # Common LLM file block markers
+    r'\[FILE:\s*[\w./\\-]+\.\w+\]',
+    # Claude/Anthropic style file markers
+    r'<artifact\s+.*?type=["\'](?:application/vnd\.ant\.code|text/[\w-]+)["\']',
+]
+
+
+def _output_has_file_changes(output: str) -> bool:
+    """
+    Check if the output contains patterns that indicate file changes.
+    This is a heuristic check - it doesn't guarantee parseable file changes,
+    but indicates there's likely something to finalize.
+    """
+    if not output:
+        return False
+    for pattern in FILE_CHANGE_PATTERNS:
+        if re.search(pattern, output, re.IGNORECASE | re.MULTILINE):
+            return True
+    return False
+
+
+async def _check_disk_for_file_changes(run_data: Dict[str, Any]) -> bool:
+    """
+    Check if there are modified files on disk in the working directory.
+    Used for providers that prefer files on disk (prefers_files_on_disk=True).
+    
+    Returns True if any files have been modified in the working directory
+    compared to the original project path.
+    """
+    working_dir = run_data.get("working_dir")
+    project_path = run_data.get("project_path")
+    
+    if not working_dir or not project_path:
+        return False
+    
+    if not os.path.exists(working_dir):
+        return False
+    
+    # Check if it's a git worktree
+    is_git_worktree = os.path.exists(os.path.join(working_dir, ".git"))
+    
+    if is_git_worktree:
+        # Use git status to detect changes
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "status", "--porcelain",
+                cwd=working_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            
+            if proc.returncode == 0:
+                # Any output means there are changes
+                output = stdout.decode().strip()
+                return bool(output)
+        except Exception:
+            pass
+    
+    # Fallback: walk directory and compare files
+    try:
+        for root, _, files in os.walk(working_dir):
+            for filename in files:
+                # Skip git-related files
+                if '.git' in root:
+                    continue
+                    
+                temp_file_path = os.path.join(root, filename)
+                try:
+                    relative_path = os.path.relpath(temp_file_path, working_dir).replace(os.sep, '/')
+                except ValueError:
+                    continue
+                
+                original_file_path = os.path.normpath(os.path.join(project_path, relative_path))
+                
+                try:
+                    with open(temp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        modified_content = f.read()
+                    
+                    original_content = ""
+                    if os.path.exists(original_file_path) and os.path.isfile(original_file_path):
+                        with open(original_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            original_content = f.read()
+                    
+                    # Check if content differs (new file or modified)
+                    if original_content.strip() != modified_content.strip():
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    
+    return False
+
+
+def _has_file_changes_sync(run_data: Dict[str, Any], output_text: str) -> bool:
+    """
+    Synchronous check for file changes - checks output text patterns only.
+    For async disk checks, use _check_disk_for_file_changes separately.
+    """
+    return _output_has_file_changes(output_text)
+
+
+@router.post("/generate")
+async def generate_proposal(
+    body: models.GenerateProposalRequest,
+    project_id: str = Query(...),
+    conn: HighPerfSQLite = Depends(get_db_connection),
+):
+    # Validate task belongs to project
+    task = await tasks_service.get_task(body.taskId, conn)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task '{body.taskId}' not found.")
+    if task.projectId != project_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Task '{body.taskId}' does not belong to project '{project_id}'.",
+        )
+
+    # This endpoint now creates a persistent proposal and links it to a task.
+    # The content is still mocked for now.
+    proposal_id = f"prop_{int(time.time())}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    hunk = models.Hunk(
+        id=f"hunk_{int(time.time())}_1",
+        rangeBefore=models.HunkRange(start=10, end=15),
+        rangeAfter=models.HunkRange(start=10, end=18),
+        content="+ // AI-generated improvement\n+ const improved = true;",
+        confidence=88,
+    )
+    file_changed = models.FileChanged(
+        path="src/example.ts", status="modified", hunks=[hunk]
+    )
+
+    new_proposal = models.Proposal(
+        id=proposal_id,
+        taskId=body.taskId,
+        title="Generated solution for task",
+        status="open",
+        summary="This is a generated solution based on the provided context.",
+        filesChanged=[file_changed],
+        createdAt=now,
+        updatedAt=now,
+    )
+
+    created_proposal = await proposals_service.create_proposal(new_proposal, conn)
+    await tasks_service.update_task(
+        body.taskId, {"currentProposalId": proposal_id}, conn
+    )
+    return created_proposal
+
+
+@router.get("", response_model=List[models.Proposal])
+async def get_proposals(
+    task_id: Optional[str] = Query(
+        None, description="The ID of the task to fetch proposals for."
+    ),
+    project_id: str = Query(...),
+    conn: HighPerfSQLite = Depends(get_db_connection),
+):
+    """
+    Lists proposals for a specific task.
+    """
+    if not task_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The 'task_id' query parameter is required.",
+        )
+
+    task = await tasks_service.get_task(task_id, conn)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
+    if task.projectId != project_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Task '{task_id}' does not belong to project '{project_id}'.",
+        )
+
+    return await proposals_service.list_proposals_for_task(task_id, conn)
+
+
+@router.post("/run/{provider_id}", status_code=status.HTTP_202_ACCEPTED)
+async def run_provider_async(
+    provider_id: str,
+    body: models.RunQwenRequest,
+    project_id: str = Query(...),
+    conn: HighPerfSQLite = Depends(get_db_connection),
+):
+    """
+    Starts a background generation process using a configured or built-in LLM provider.
+    """
+    project = await projects_service.get_project(project_id, conn)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not project.serverPath:
+        raise HTTPException(status_code=404, detail="Project path not configured.")
+
+    provider_config = await preferences_service.get_provider(provider_id, conn)
+    provider: LLMProvider
+    provider_name: str
+    max_context_tokens: Optional[int] = None
+
+    if provider_config and provider_config.enabled:
+        provider = proposal_generator_service.get_provider_by_id(
+            provider_id, provider_config
+        )
+        provider_name = provider_config.name
+        # Extract maxContextTokens from provider limits if available
+        if provider_config.limits and provider_config.limits.maxContextTokens:
+            max_context_tokens = provider_config.limits.maxContextTokens
+    else:
+        # Fallback to built-in providers if not found in DB or not enabled.
+        try:
+            provider = proposal_generator_service.get_provider_by_id(provider_id)
+            provider_name = provider_id.capitalize()
+        except (ValueError, FileNotFoundError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"LLM provider '{provider_id}' is not enabled or does not exist.",
+            )
+
+    proposal_id = proposals_service.create_proposal_id()
+    task_id = body.taskId
+    if not task_id:
+        task_create_res = await tasks_service.create_task(
+            {
+                "title": body.title
+                or body.instructions
+                or f"New Task from {provider_name}"
+            },
+            project.id,
+            conn,
+        )
+        task_id = task_create_res["taskId"]
+
+    if not body.files:
+        budget = body.tokenBudget or 1_000_000
+
+        # max_context_tokens is already extracted above from provider_config
+        # This ensures we pass the limit to the context builder
+
+        context_files = await context_builder_service.build_context_for_task(
+            project=project,
+            task_id=task_id,
+            conn=conn,
+            token_budget=budget,
+            max_context_tokens=max_context_tokens,
+        )
+        if not context_files:
+            await tasks_service.update_task(task_id, {"status": "failed"}, conn)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Automatic context builder found no relevant files for the given instructions. Please add files to the scope manually.",
+            )
+        file_paths = [f["path"] for f in context_files]
+        auto_context_body = body.model_copy(update={"files": file_paths})
+        body_with_context = auto_context_body
+    else:
+        body_with_context = body
+
+    if body.interactive:
+        provider_command = await provider.get_cli_command()
+        if not provider_command:
+            raise HTTPException(
+                status_code=400, detail="This provider does not support interactive mode."
+            )
+        # NOTE: No proposal-level title generation here; titles are task-centric.
+        new_proposal_draft = models.Proposal(
+            id=proposal_id,
+            taskId=task_id,
+            title=body.title
+            or body.instructions
+            or f"New Interactive Proposal from {provider_name}",
+            status="draft",
+            generatingProvider=provider_id, # Use body_with_context to save the file list
+            generationRequest=body_with_context.model_dump(mode="json"),
+        )
+        await proposals_service.create_proposal(new_proposal_draft, conn)
+        await tasks_service.update_task(
+            task_id, {"status": "generating", "currentProposalId": proposal_id}, conn
+        )
+        return {"taskId": task_id, "proposalId": proposal_id, "interactive": True}
+
+    # Non-interactive: start proposal generation
+    proposal_generator_service.start_proposal_generation(
+        proposal_id, task_id, body_with_context, project, provider
+    )
+
+    return {"taskId": task_id, "proposalId": proposal_id, "interactive": False}
+
+
+@router.post("/run-yolo", status_code=status.HTTP_202_ACCEPTED)
+async def run_yolo_async(
+    body: models.RunQwenRequest,
+    project_id: str = Query(...),
+    conn: HighPerfSQLite = Depends(get_db_connection),
+):
+    """
+    Starts a "YOLO mode" background process. It gives the same task to all configured providers,
+    waits for them to finish, then uses Qwen to evaluate the best proposal.
+    """
+    project = await projects_service.get_project(project_id, conn)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not project.serverPath:
+        raise HTTPException(status_code=404, detail="Project path not configured.")
+
+    task_id = body.taskId
+    if not task_id:
+        task_create_res = await tasks_service.create_task(
+            {"title": body.title or body.instructions or "New Task from YOLO"},
+            project.id,
+            conn,
+        )
+        task_id = task_create_res["taskId"]
+
+    # YOLO mode always uses automatic context building if no files are provided.
+    if not body.files:
+        budget = body.tokenBudget or 1_000_000
+        
+        # For YOLO mode, we don't apply a hard max_context_tokens limit
+        # since multiple providers with different limits are involved.
+        # Each provider will handle its own limits during generation.
+        context_files = await context_builder_service.build_context_for_task(
+            project=project, task_id=task_id, conn=conn, token_budget=budget
+        )
+        if not context_files:
+            await tasks_service.update_task(task_id, {"status": "failed"}, conn)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Automatic context builder found no relevant files for the given instructions. Please add files to the scope manually.",
+            )
+        file_paths = [f["path"] for f in context_files]
+        body_with_context = body.model_copy(update={"files": file_paths})
+    else:
+        body_with_context = body
+
+    await tasks_service.update_task(task_id, {"status": "generating"}, conn)
+
+    yolo_service.start_yolo_mode_background(task_id, body_with_context, project)
+
+    return {
+        "taskId": task_id,
+        "message": "YOLO mode started. All providers are generating proposals.",
+    }
+
+
+@router.post("/{proposal_id}/finalize-stream", status_code=status.HTTP_200_OK)
+async def finalize_stream(
+    proposal_id: str,
+    project_id: str = Query(...),
+    conn: HighPerfSQLite = Depends(get_db_connection),
+):
+    """
+    Finalizes a proposal from whatever output has been captured so far in the stream.
+    Used when user wants to stop watching the stream but still process the partial results.
+    Handles both text output mode and files-on-disk mode.
+    """
+    import difflib
+    
+    project = await projects_service.get_project(project_id, conn)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    run_data = proposal_generator_service.generation_runs.get(proposal_id)
+    if not run_data:
+        raise HTTPException(status_code=404, detail="Generation run not found")
+    
+    # Get whatever output we have so far
+    raw_output = "".join(run_data.get("output", []))
+    
+    # Check if this provider uses files-on-disk mode
+    prefers_files_on_disk = run_data.get("prefers_files_on_disk", False)
+    working_dir = run_data.get("working_dir")
+    project_path = run_data.get("project_path", project.serverPath)
+    
+    markdown_for_proposal = raw_output
+    
+    # If provider prefers files on disk, generate diffs from the modified files
+    if prefers_files_on_disk and working_dir and os.path.exists(working_dir):
+        markdown_from_files = ""
+        
+        # Check if it's a git worktree
+        is_git_worktree = os.path.exists(os.path.join(working_dir, ".git"))
+        
+        changed_files = []
+        if is_git_worktree:
+            # Use git status to detect changes
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "status", "--porcelain",
+                    cwd=working_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                
+                if proc.returncode == 0:
+                    for line in stdout.decode().splitlines():
+                        if len(line) >= 3:
+                            status_code = line[:2]
+                            filename = line[3:].strip()
+                            if status_code.strip():
+                                changed_files.append(filename)
+            except Exception:
+                pass
+        
+        # Fallback or supplement: walk directory
+        if not changed_files:
+            for root, _, files in os.walk(working_dir):
+                for filename in files:
+                    if '.git' in root:
+                        continue
+                    temp_file_path = os.path.join(root, filename)
+                    try:
+                        relative_path = os.path.relpath(temp_file_path, working_dir).replace(os.sep, '/')
+                    except ValueError:
+                        continue
+                    
+                    original_file_path = os.path.normpath(os.path.join(project_path, relative_path))
+                    
+                    try:
+                        with open(temp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            modified_content = f.read()
+                        
+                        original_content = ""
+                        if os.path.exists(original_file_path) and os.path.isfile(original_file_path):
+                            with open(original_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                original_content = f.read()
+                        
+                        if original_content.strip() != modified_content.strip():
+                            changed_files.append(relative_path)
+                    except Exception:
+                        continue
+        
+        # Generate diffs for all changed files
+        for relative_path in changed_files:
+            temp_file_path = os.path.join(working_dir, relative_path)
+            original_file_path = os.path.normpath(os.path.join(project_path, relative_path))
+            
+            if os.path.isdir(temp_file_path):
+                continue
+
+            try:
+                modified_content = ""
+                if os.path.exists(temp_file_path) and os.path.isfile(temp_file_path):
+                    with open(temp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        modified_content = f.read()
+                
+                original_content = ""
+                if os.path.exists(original_file_path) and os.path.isfile(original_file_path):
+                    with open(original_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        original_content = f.read()
+                
+                diff_lines = difflib.unified_diff(
+                    original_content.splitlines(keepends=True),
+                    modified_content.splitlines(keepends=True),
+                    fromfile=f"a/{relative_path}",
+                    tofile=f"b/{relative_path}",
+                )
+                diff_content = "".join(diff_lines)
+                if diff_content:
+                    markdown_from_files += f"```diff\n{diff_content}```\n\n"
+            except Exception:
+                continue
+        
+        # Combine files-based markdown with any stdout output
+        if markdown_from_files:
+            markdown_for_proposal = markdown_from_files + "\n\n" + raw_output
+    
+    # Check if we have anything to finalize
+    if not markdown_for_proposal.strip():
+        # Also check if there are file changes even without output
+        has_disk_changes = prefers_files_on_disk and await _check_disk_for_file_changes(run_data)
+        if not has_disk_changes:
+            raise HTTPException(status_code=400, detail="No output or file changes captured yet")
+    
+    # Parse and update the proposal
+    task_id = run_data.get("task_id")
+    if not task_id:
+        raise HTTPException(status_code=400, detail="No task associated with this generation")
+    
+    updated_proposal = await proposals_service.update_proposal_from_markdown(
+        proposal_id, task_id, markdown_for_proposal, conn, project.serverPath
+    )
+    await proposals_service.update_proposal(proposal_id, {"rawProviderResponse": markdown_for_proposal, "status": "open"}, conn)
+    await tasks_service.update_task(task_id, {"status": "reviewing"}, conn)
+    
+    return {"message": "Proposal finalized from partial stream.", "taskId": task_id, "proposalId": updated_proposal.id}

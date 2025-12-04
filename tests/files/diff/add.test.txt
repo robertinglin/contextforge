@@ -1,0 +1,11 @@
+# === TEST ===
+
+```diff
+--- a/src/test.txt
++++ b/src/test.txt
+@@ @@
++Added to empty file
+```
+
+# === RESULT ===
+Added to empty file

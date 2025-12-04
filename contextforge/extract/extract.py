@@ -143,11 +143,40 @@ def extract_all_blocks_from_text(markdown_content: str) -> list[dict[str, object
             code = text[content_start:content_end]
 
             parts = info_string.split()
-            lang = parts[0].lower() if parts and "=" not in parts[0] else ""
+            lang = ""
             file_path_hint = ""
+
+            # Parse the first token which may be in format "language:filepath"
+            if parts and "=" not in parts[0]:
+                first_token = parts[0]
+                # Check for language:filepath format (e.g., "javascript:hello.js" or "js:C:\path\file.js")
+                # We need to handle Windows paths like "js:C:\path" where the colon after drive letter is not a separator
+                colon_idx = first_token.find(":")
+                if colon_idx > 0:
+                    # Check if this looks like a Windows absolute path (single letter before colon)
+                    # e.g., "C:\path" - in this case the whole thing is a path, not lang:path
+                    if colon_idx == 1 and first_token[0].isalpha():
+                        # This is a Windows path like "C:\...", treat whole token as path
+                        file_path_hint = first_token
+                    else:
+                        # Check if there's content after the colon that looks like a path
+                        potential_lang = first_token[:colon_idx]
+                        potential_path = first_token[colon_idx + 1 :]
+                        if potential_path:
+                            # This is language:filepath format
+                            lang = potential_lang.lower()
+                            file_path_hint = potential_path
+                        else:
+                            # Just a language with trailing colon, strip it
+                            lang = potential_lang.lower()
+                else:
+                    lang = first_token.lower()
+
+            # Also check for explicit file= attribute
             for part in parts:
                 if part.startswith("file="):
                     file_path_hint = part.split("=", 1)[1].strip("'\"")
+                    break
 
             if not file_path_hint:
                 context_lines = text[: m.start()].splitlines()[-2:]
@@ -168,3 +197,4 @@ def extract_all_blocks_from_text(markdown_content: str) -> list[dict[str, object
         cursor = next_search_start
 
     return blocks
+

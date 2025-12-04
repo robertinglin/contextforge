@@ -300,11 +300,103 @@ def test_plan_and_generate_changes_handles_indented_diff(tmp_path):
               </header>}
    ```
    """
-   # Remove leading/trailing diff block lines and dedent
+    # Remove leading/trailing diff block lines and dedent
     dedented_diff = textwrap.dedent(indented_diff).splitlines()
-    dedented_diff = "\n".join(dedented_diff[1:-1]) # strip ```diff and ```
+    dedented_diff = "\n".join(dedented_diff[1:-1])  # strip ```diff and ```
 
     result = list(cf_extract_blocks(dedented_diff))
     print(result)
     assert len(result) == 1
     assert result[0]["code"] == dedented_diff
+
+
+def test_language_colon_filepath_format() -> None:
+    """Test that language:filepath format in fence info string is parsed correctly."""
+    # Test basic javascript:hello.js format
+    s1 = """```javascript:hello.js
+export const helloWorld = () => {
+  console.log("Hello, World!");
+};
+```"""
+    blocks1 = cf_extract_blocks(s1)
+    files1 = [b for b in blocks1 if b.get("type") == "file"]
+    _assert(len(files1) == 1, f"expected 1 file block, got {len(files1)}")
+    _assert(files1[0]["language"] == "javascript", f"unexpected language: {files1[0]['language']}")
+    _assert(files1[0]["file_path"] == "hello.js", f"unexpected file_path: {files1[0]['file_path']}")
+    _assert('console.log("Hello, World!")' in files1[0]["code"], "code content missing")
+
+
+def test_language_colon_filepath_with_windows_path() -> None:
+    """Test that language:filepath format works with Windows absolute paths."""
+    s = r"""```js:C:\workspace\test\test.js
+import { helloWorld } from './hello.js';
+
+export const Test = 'This is a test file';
+
+// Example usage
+helloWorld();
+```"""
+    blocks = cf_extract_blocks(s)
+    files = [b for b in blocks if b.get("type") == "file"]
+    _assert(len(files) == 1, f"expected 1 file block, got {len(files)}")
+    _assert(files[0]["language"] == "js", f"unexpected language: {files[0]['language']}")
+    _assert(
+        files[0]["file_path"] == r"C:\workspace\test\test.js",
+        f"unexpected file_path: {files[0]['file_path']}",
+    )
+    _assert("helloWorld" in files[0]["code"], "code content missing")
+
+
+def test_language_colon_filepath_with_unix_path() -> None:
+    """Test that language:filepath format works with Unix paths."""
+    s = """```python:/home/user/project/main.py
+def main():
+    print("Hello")
+
+if __name__ == "__main__":
+    main()
+```"""
+    blocks = cf_extract_blocks(s)
+    files = [b for b in blocks if b.get("type") == "file"]
+    _assert(len(files) == 1, f"expected 1 file block, got {len(files)}")
+    _assert(files[0]["language"] == "python", f"unexpected language: {files[0]['language']}")
+    _assert(
+        files[0]["file_path"] == "/home/user/project/main.py",
+        f"unexpected file_path: {files[0]['file_path']}",
+    )
+
+
+def test_language_colon_filepath_relative_path() -> None:
+    """Test that language:filepath format works with relative paths."""
+    s = """```tsx:src/components/Button.tsx
+export const Button = () => <button>Click me</button>;
+```"""
+    blocks = cf_extract_blocks(s)
+    files = [b for b in blocks if b.get("type") == "file"]
+    _assert(len(files) == 1, f"expected 1 file block, got {len(files)}")
+    _assert(files[0]["language"] == "tsx", f"unexpected language: {files[0]['language']}")
+    _assert(
+        files[0]["file_path"] == "src/components/Button.tsx",
+        f"unexpected file_path: {files[0]['file_path']}",
+    )
+
+
+def test_plain_language_still_works() -> None:
+    """Test that plain language without colon still works."""
+    s = """```python
+print("hello")
+```"""
+    blocks = cf_extract_blocks(s)
+    _assert(len(blocks) == 1, f"expected 1 block, got {len(blocks)}")
+    _assert(blocks[0]["language"] == "python", f"unexpected language: {blocks[0]['language']}")
+
+
+def test_language_with_trailing_colon() -> None:
+    """Test that a language with trailing colon but no path is handled."""
+    s = """```python:
+print("hello")
+```"""
+    blocks = cf_extract_blocks(s)
+    _assert(len(blocks) == 1, f"expected 1 block, got {len(blocks)}")
+    _assert(blocks[0]["language"] == "python", f"unexpected language: {blocks[0]['language']}")
+
