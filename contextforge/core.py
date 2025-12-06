@@ -143,12 +143,27 @@ def plan_and_generate_changes(planned_changes: List[Dict], codebase_dir: str) ->
         new_content = None
 
         # Treat 'full_replacement' as an alias for a plain file replacement.
-        if change_type in ("file", "full_replacement"):
-            if _contains_truncation_marker(block["code"]):
+        if change_type in ("file", "full_replacement", "search_replace"):
+            # Special handling for SEARCH/REPLACE blocks
+            if block.get("is_search_replace") or change_type == "search_replace":
+                try:
+                    old_sr = block.get("old_content", "")
+                    new_sr = block.get("new_content", "")
+                    # Use patch_text with structured patch format
+                    new_content = patch_text(
+                        original_content,
+                        [{"old": old_sr, "new": new_sr}]
+                    )
+                except PatchFailedError as e:
+                    logger.error(f"  - ERROR: SEARCH/REPLACE failed for {file_path}: {e}")
+                    new_content = None
+            elif _contains_truncation_marker(block["code"]):
                 logger.warning(
                     "  - WARNING: Truncation markers detected. LLM-based merging is not part of this function. Treating as a full replacement."
                 )
-            new_content = block["code"]
+                new_content = block["code"]
+            else:
+                new_content = block["code"]
         elif change_type == "diff":
             try:
                 if patch_fromstring is not None:

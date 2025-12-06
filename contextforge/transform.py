@@ -59,9 +59,22 @@ def apply_change_smartly(
     
     new_content = None
     
-    # === Strategy: Full Replacement ===
-    if change_type == 'full_replacement':
-        if _contains_truncation_marker(block['code']):
+    # === Strategy: Full Replacement OR Search/Replace ===
+    if change_type == 'full_replacement' or change_type == 'search_replace':
+        # Special handling for SEARCH/REPLACE blocks
+        if change_type == 'search_replace' or (block.get('is_search_replace')):
+            _log("  - Applying SEARCH/REPLACE transformation.")
+            try:
+                # removed inner import that was causing UnboundLocalError
+                old_sr = block.get('old_content', '')
+                new_sr = block.get('new_content', '')
+                new_content = patch_text(original_content, [{"old": old_sr, "new": new_sr}])
+                _log("  ✔ SEARCH/REPLACE successful.")
+            except Exception as e:
+                _log(f"  ✘ SEARCH/REPLACE failed: {e}")
+                new_content = None
+        
+        elif _contains_truncation_marker(block['code']):
             _log("  - Detected truncation markers.")
             if not original_content:
                 _log("  - WARNING: No original file to merge with. Using replacement as-is.")

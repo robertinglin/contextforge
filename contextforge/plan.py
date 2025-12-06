@@ -35,9 +35,17 @@ def plan_changes(
 
     for i, block in enumerate(change_blocks):
         metadata = None
+        # 0. Check for SEARCH/REPLACE blocks (highest priority)
+        # Note: extract_blocks_from_text sets type='file' but adds is_search_replace=True
+        if block.get("is_search_replace"):
+            metadata = {
+                "file_path": block.get("file_path"),
+                "change_type": "search_replace"
+            }
+            _log(f"  Recognized SEARCH/REPLACE block for '{metadata.get('file_path', 'N/A')}'")
         
         # 1. Check for Synthetic Blocks (from multi-file diffs)
-        if block.get("is_synthetic"):
+        elif block.get("is_synthetic"):
             metadata = block["synthetic_info"]
             _log(f"  Recognized pre-classified block for '{metadata.get('file_path', 'N/A')}'")
 

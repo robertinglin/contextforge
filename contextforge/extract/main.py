@@ -10,6 +10,68 @@ from .metadata import (detect_deletion_from_diff, detect_rename_from_diff,
 from ..utils.parsing import _try_parse_comment_header
 
 
+def _extract_search_replace_blocks(text: str) -> List[Dict[str, Any]]:
+    """
+    Extract SEARCH/REPLACE blocks from markdown-style fenced code.
+    
+    Format:
+        ```language
+        <<<<<<< SEARCH
+        old content
+        =======
+        new content
+        >>>>>>> REPLACE
+        ```
+    
+    Returns list of dicts with: file_path, old, new, language, start, end
+    """
+    results = []
+    
+    # Pattern to match SEARCH/REPLACE blocks
+    pattern = re.compile(
+        r'```(\w+)\s*\n'  # Opening fence with language
+        r'<<<<<<< SEARCH\s*\n'  # SEARCH marker
+        r'(.*?)'  # Old content (SEARCH block) - non-greedy
+        r'\n=======\s*\n'  # Separator
+        r'(.*?)'  # New content (REPLACE block) - non-greedy  
+        r'\n>>>>>>> REPLACE\s*\n'  # REPLACE marker
+        r'```',  # Closing fence
+        re.DOTALL | re.MULTILINE
+    )
+    
+    for match in pattern.finditer(text):
+        start, end = match.span()
+        language = match.group(1)
+        old_content = match.group(2)
+        new_content = match.group(3)
+        
+        # Try to extract file path from context before the block
+        context_before = text[:start]
+        lines_before = context_before.split('\n')
+        file_path = None
+        
+        # Check last few lines for a file path hint
+        for line in reversed(lines_before[-5:]):
+            line = line.strip()
+            # Match file paths like "src/file.ts" or just "file.ts"
+            if line and not line.startswith('```'):
+                path_match = re.search(r'([\w\-./\\]+\.\w+)', line)
+                if path_match:
+                    file_path = path_match.group(1).replace('\\', '/')
+                    break
+        
+        results.append({
+            "file_path": file_path,
+            "old": old_content,
+            "new": new_content,
+            "language": language,
+            "start": start,
+            "end": end,
+        })
+    
+    return results
+
+
 
 def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
     """
@@ -35,14 +97,47 @@ def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
       - Only explicit ```diff fences are treated as diffs (for stable ordering).
       - Adjacent and nested fences are handled by the underlying extractors.
     """
-    # Step 1: Extract all fenced code blocks
+    # Step 0: Extract SEARCH/REPLACE blocks (they take priority)
+    search_replace_blocks = _extract_search_replace_blocks(markdown_content)
+    
+    # Step 1: Extract all fenced code blocks (generic)
     all_blocks = extract_all_blocks_from_text(markdown_content)
         
     # Step 2: Extract custom patch blocks (*** Begin Patch / *** End Patch)
     custom_patch_blocks = _extract_custom_patch_blocks(markdown_content)
+
+    # Filter generic blocks to exclude those that overlap with priority blocks
+    priority_blocks = search_replace_blocks + custom_patch_blocks
+    consumed_ranges = [(b["start"], b["end"]) for b in priority_blocks]
+
+    filtered_all_blocks = []
+    for blk in all_blocks:
+        b_start, b_end = blk["start"], blk["end"]
+        is_consumed = False
+        for r_start, r_end in consumed_ranges:
+            # Check for significant overlap/containment
+            if max(b_start, r_start) < min(b_end, r_end):
+                is_consumed = True
+                break
+        if not is_consumed:
+            filtered_all_blocks.append(blk)
     
     # Step 3: Process and classify each block
     results: List[Dict[str, Any]] = []
+    
+    # Process SEARCH/REPLACE blocks first (convert to file type with special marker)
+    for sr_block in search_replace_blocks:
+        results.append({
+            "type": "file",  # Treat as file replacement
+            "language": sr_block["language"],
+            "start": sr_block["start"],
+            "end": sr_block["end"],
+            "code": "",  # Code will be generated via patch
+            "file_path": sr_block.get("file_path"),
+            "is_search_replace": True,  # Special marker
+            "old_content": sr_block["old"],
+            "new_content": sr_block["new"],
+        })
     
     # Process custom patch blocks first
     for blk in custom_patch_blocks:
@@ -56,8 +151,8 @@ def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
             "context": blk.get("context"),
         })
     
-    # Process regular fenced blocks
-    for blk in all_blocks:
+    # Process regular fenced blocks (filtered)
+    for blk in filtered_all_blocks:
         language = blk.get("language", "plain")
         code = blk.get("code", "")
         context = blk.get("context", "")
@@ -183,41 +278,3 @@ def extract_blocks_from_text(markdown_content: str) -> List[Dict[str, Any]]:
     
     # Sort by start position for stable ordering
     return sorted(deduped, key=lambda b: b["start"])
-
-
-if __name__ == "__main__":
-    test = """
-Of course. It's a common issue for single-page applications where `index.html` gets cached by the browser, preventing new frontend builds from being loaded.
-
-To solve this, we can instruct browsers to never cache the `index.html` file by adding a `Cache-Control` header to the HTTP response when it's served. I'll modify your FastAPI backend to include this header for `index.html`.
-
-Here are the changes for `backend/app/main.py`:
-
-```diff
---- a/backend/app/main.py
-+++ b/backend/app/main.py
-@@ -201,7 +201,7 @@
-     if not os.path.exists(index_path):
-         raise HTTPException(status_code=404, detail="Frontend application not found. Please run 'npm run build'.")
-     
--    return FileResponse(index_path)
-+    return FileResponse(index_path, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
- 
- @app.get("/{full_path:path}", tags=["Frontend"])
- async def serve_frontend_catch_all(request: Request, full_path: str):
-@@ -218,4 +218,4 @@
-     if not os.path.exists(index_path):
-         raise HTTPException(status_code=404, detail="Frontend application not found. Please run 'npm run build'.")
-     
--    return FileResponse(index_path)
-+    return FileResponse(index_path, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
-
-```
-
-I've updated the two routes that serve your `index.html` to include headers that prevent caching. This ensures that your users will always get the latest version of the frontend after you deploy a new build. Other static assets (like hashed JS and CSS files) will still be cached by the browser, as they should be.
-
-    """
-    
-    result = extract_blocks_from_text(test)
-    
-    pprint.pprint(result)

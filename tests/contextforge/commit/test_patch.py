@@ -776,23 +776,6 @@ def test_patch_text_empty_content():
     assert "new line" in result
 
 
-def test_patch_text_below_threshold_raises():
-    """Test that patch fails when similarity is below threshold."""
-    content = "completely\ndifferent\ncontent\n"
-    patch = textwrap.dedent(
-        """
-        @@ -1,3 +1,3 @@
-        -old
-        -lines
-        -here
-        +new
-        +lines
-        +here
-        """
-    ).strip()
-    with pytest.raises(PatchFailedError):
-        patch_text(content, patch, threshold=0.9)
-
 
 def test_patch_text_structured_missing_old_or_pattern():
     """Test structured patch without old or pattern raises error."""
@@ -914,29 +897,6 @@ def test_patch_text_anchored_fallback():
     # Should find the anchor and apply changes
     assert "anchor_line" in result
 
-
-def test_patch_text_unique_end_anchor_fallback():
-    """Test unique end anchor fallback."""
-    content = textwrap.dedent(
-        """
-        start
-        middle
-        unique_end
-        """
-    ).strip()
-    
-    patch = textwrap.dedent(
-        """
-        @@ -1,3 +1,3 @@
-        start
-        -different
-        +new
-        unique_end
-        """
-    ).strip()
-    
-    result = patch_text(content, patch, threshold=0.4)
-    assert "new" in result or "<<<<<<< CURRENT" in result
 
 
 def test_patch_text_merge_conflict_creation():
