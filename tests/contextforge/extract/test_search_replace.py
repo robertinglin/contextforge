@@ -1,4 +1,3 @@
-# tests/contextforge/extract/test_search_replace.py
 import textwrap
 import pytest
 
@@ -11,7 +10,7 @@ def test_extract_basic_search_replace_block():
     """Test extraction of a basic SEARCH/REPLACE block."""
     content = textwrap.dedent("""
         Here's the change for src/file.ts:
-        
+
         ```typescript
         <<<<<<< SEARCH
         const old = 1;
@@ -20,12 +19,12 @@ def test_extract_basic_search_replace_block():
         >>>>>>> REPLACE
         ```
     """)
-    
+
     blocks = extract_blocks_from_text(content)
-    
+
     assert len(blocks) == 1
     block = blocks[0]
-    
+
     assert block["type"] == "file"
     assert block["language"] == "typescript"
     assert block["is_search_replace"] is True
@@ -53,12 +52,12 @@ def test_extract_search_replace_with_multiline_content():
         >>>>>>> REPLACE
         ```
     """)
-    
+
     blocks = extract_blocks_from_text(content)
-    
+
     assert len(blocks) == 1
     block = blocks[0]
-    
+
     assert block["type"] == "file"
     assert block["is_search_replace"] is True
     assert "export interface FileTreeNode" in block["old_content"]
@@ -118,28 +117,28 @@ def test_extract_search_replace_complex_example():
         >>>>>>> REPLACE
         ```
     """)
-    
+
     blocks = extract_blocks_from_text(content)
-    
+
     assert len(blocks) == 1
     block = blocks[0]
-    
+
     assert block["type"] == "file"
     assert block["is_search_replace"] is True
     assert block["language"] == "typescript"
     assert block["file_path"] == "src_v2/types/index.ts"
-    
+
     # Check old content
     assert "export interface FileTreeNode" in block["old_content"]
     assert "export interface FileTreeData" in block["old_content"]
-    
-    # The original file has duplicates but they are not adjacent. 
+
+    # The original file has duplicates but they are not adjacent.
     # Just verify they exist in the extracted block.
     assert block["old_content"].count("token_count?: number;") == 2
-    
+
     assert "selection_state?" not in block["old_content"]
     assert "selected_token_count?" not in block["old_content"]
-    
+
     # Check new content
     assert "export interface FileTreeNode" in block["new_content"]
     assert "export interface FileTreeData" in block["new_content"]
@@ -159,7 +158,7 @@ def test_plan_changes_recognizes_search_replace(tmp_path):
         >>>>>>> REPLACE
         ```
     """)
-    
+
     # Ensure the file exists so plan_changes doesn't force 'full_replacement'
     p = tmp_path / "src" / "app.ts"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -167,10 +166,10 @@ def test_plan_changes_recognizes_search_replace(tmp_path):
 
     blocks = extract_blocks_from_text(content)
     plans = plan_changes(blocks, str(tmp_path))
-    
+
     assert len(plans) == 1
     plan = plans[0]
-    
+
     # Standardize path separators for assertion
     assert plan["metadata"]["file_path"].replace("\\", "/") == "src/app.ts"
     assert plan["metadata"]["change_type"] == "search_replace"
@@ -182,24 +181,24 @@ def test_apply_change_smartly_with_search_replace(tmp_path):
     # Create a file with original content
     test_file = tmp_path / "app.ts"
     test_file.write_text("const x = 1;\nconst y = 2;\n")
-    
+
     # Create a SEARCH/REPLACE plan
     plan = {
         "metadata": {
             "file_path": "app.ts",
-            "change_type": "full_replacement"  # SEARCH/REPLACE is treated as full_replacement
+            "change_type": "full_replacement",  # SEARCH/REPLACE is treated as full_replacement
         },
         "block": {
             "is_search_replace": True,
             "old_content": "const x = 1;",
             "new_content": "const x = 10;",
             "code": "",
-            "block_id": 1
-        }
+            "block_id": 1,
+        },
     }
-    
+
     result, logs = apply_change_smartly(plan, str(tmp_path))
-    
+
     assert result is not None
     assert "const x = 10;" in result["new_content"]
     assert "const y = 2;" in result["new_content"]  # Unchanged line preserved
@@ -217,7 +216,7 @@ def test_multiple_search_replace_blocks():
         const a = 2;
         >>>>>>> REPLACE
         ```
-        
+
         Second change for src/b.ts:
         ```typescript
         <<<<<<< SEARCH
@@ -227,9 +226,9 @@ def test_multiple_search_replace_blocks():
         >>>>>>> REPLACE
         ```
     """)
-    
+
     blocks = extract_blocks_from_text(content)
-    
+
     assert len(blocks) == 2
     assert all(b["type"] == "file" for b in blocks)
     assert all(b["is_search_replace"] for b in blocks)
@@ -252,112 +251,171 @@ def test_search_replace_without_file_path():
         >>>>>>> REPLACE
         ```
     """)
-    
+
     blocks = extract_blocks_from_text(content)
-    
+
     assert len(blocks) == 1
     block = blocks[0]
-    
+
     assert block["type"] == "file"
     assert block["is_search_replace"] is True
     assert block["file_path"] is None  # No path hint found
     assert block["old_content"] == "x = 1"
     assert block["new_content"] == "x = 2"
-    
 
 
-def test_extract_chevron_block_basic():
-    """Test extraction of a basic chevron-style block (<<<<, ====, >>>>)."""
+def test_multiple_search_replace_blocks_in_same_fence():
+    """Test extraction of multiple SEARCH/REPLACE blocks within the same fenced code block."""
     content = textwrap.dedent("""
-        Here are the changes:
-        
+        src_v2/components/workspace/ContextPanel.tsx
         ```tsx
-        // src/components/Example.tsx
-        
-        <<<<
-        const old = 1;
-        ====
-        const old = 2;
-        >>>>
+        <<<<<<< SEARCH
+        const x = 1;
+        const y = 2;
+        =======
+        const x = 10;
+        const y = 20;
+        >>>>>>> REPLACE
+        <<<<<<< SEARCH
+        function doSomething() {
+          console.log("old");
+        }
+        =======
+        function doSomething() {
+          console.log("new");
+        }
+        >>>>>>> REPLACE
+        <<<<<<< SEARCH
+        export default App;
+        =======
+        export default ContextPanel;
+        >>>>>>> REPLACE
         ```
     """)
-    
+
     blocks = extract_blocks_from_text(content)
-    
-    assert len(blocks) == 1
-    block = blocks[0]
-    
-    assert block["type"] == "file"
-    assert block["language"] == "tsx"
-    assert block["is_search_replace"] is True
-    assert block["old_content"] == "const old = 1;"
-    assert block["new_content"] == "const old = 2;"
-    assert block["file_path"] == "src/components/Example.tsx"
+
+    # Should extract 3 separate SEARCH/REPLACE blocks from the same fence
+    assert len(blocks) == 3
+
+    # All blocks should have the same file path
+    for block in blocks:
+        assert block["type"] == "file"
+        assert block["is_search_replace"] is True
+        assert block["language"] == "tsx"
+        assert block["file_path"] == "src_v2/components/workspace/ContextPanel.tsx"
+
+    # Check content of each block
+    assert blocks[0]["old_content"] == "const x = 1;\nconst y = 2;"
+    assert blocks[0]["new_content"] == "const x = 10;\nconst y = 20;"
+
+    assert "function doSomething()" in blocks[1]["old_content"]
+    assert '"old"' in blocks[1]["old_content"]
+    assert '"new"' in blocks[1]["new_content"]
+
+    assert blocks[2]["old_content"] == "export default App;"
+    assert blocks[2]["new_content"] == "export default ContextPanel;"
 
 
-def test_extract_chevron_block_with_deletion():
-    """Test chevron block where new content is empty (deletion)."""
+def test_multiple_search_replace_blocks_realistic_example():
+    """Test the exact pattern from user's example with multiple blocks in same fence."""
     content = textwrap.dedent("""
+        src_v2/components/workspace/ContextPanel.tsx
         ```tsx
-        // src/components/Panel.tsx
-        
-        // Remove the block
-        <<<<
-        {/* Old content to remove */}
-        <div className="old-stuff">
-          Remove this
-        </div>
-        ====
-        >>>>
+        <<<<<<< SEARCH
+          const { 
+            items: conversationItems, 
+            clearItems: clearConversationItems,
+            getTotalTokenCount: getContextTokenCount 
+          } = useConversationContextStore();
+        =======
+          const { 
+            items: conversationItems, 
+            clearItems: clearConversationItems,
+            getTotalTokenCount: getContextTokenCount 
+          } = useConversationContextStore();
+
+          // New wrapper function added
+          const onGenerateProposal = useCallback(() => {
+            onGenerate();
+          }, [onGenerate]);
+        >>>>>>> REPLACE
+        <<<<<<< SEARCH
+            // Ctrl/Cmd + Enter to generate
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+              e.preventDefault();
+              if (!isGenerating && instructions.trim()) {
+                onGenerate();
+              }
+            }
+        =======
+            // Ctrl/Cmd + Enter to generate
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+              e.preventDefault();
+              if (!isGenerating && instructions.trim()) {
+                onGenerateProposal();
+              }
+            }
+        >>>>>>> REPLACE
         ```
     """)
-    
-    blocks = extract_blocks_from_text(content)
-    
-    assert len(blocks) == 1
-    block = blocks[0]
-    
-    assert block["type"] == "file"
-    assert block["is_search_replace"] is True
-    assert "Old content to remove" in block["old_content"]
-    assert block["new_content"] == ""
-    assert block["file_path"] == "src/components/Panel.tsx"
 
-
-def test_extract_multiple_chevron_blocks_same_file():
-    """Test multiple chevron blocks in the same fence."""
-    content = textwrap.dedent("""
-        ```tsx
-        // src/components/ContextPanel.tsx
-        
-        // Modify the first block
-        <<<<
-        {enableAutoContext && (filteredSuggestions.length > 0) && (
-        ====
-        {enableAutoContext && isOpen && (filteredSuggestions.length > 0) && (
-        >>>>
-        
-        // Remove the second block
-        <<<<
-        {/* Dependency Suggestions */}
-        <div className="dependency-block">
-          Content here
-        </div>
-        ====
-        >>>>
-        ```
-    """)
-    
     blocks = extract_blocks_from_text(content)
-    
+
     assert len(blocks) == 2
-    assert all(b["type"] == "file" for b in blocks)
-    assert all(b["is_search_replace"] for b in blocks)
-    assert all(b["file_path"] == "src/components/ContextPanel.tsx" for b in blocks)
-    
-    # First block is a modification
-    assert "isOpen" in blocks[0]["new_content"]
-    
-    # Second block is a deletion
-    assert blocks[1]["new_content"] == ""
-    assert "Dependency Suggestions" in blocks[1]["old_content"]
+
+    for block in blocks:
+        assert block["type"] == "file"
+        assert block["is_search_replace"] is True
+        assert block["file_path"] == "src_v2/components/workspace/ContextPanel.tsx"
+
+    # First block adds the wrapper function
+    assert "useConversationContextStore()" in blocks[0]["old_content"]
+    assert "onGenerateProposal" in blocks[0]["new_content"]
+    assert "onGenerateProposal" not in blocks[0]["old_content"]
+
+    # Second block changes onGenerate to onGenerateProposal
+    assert "onGenerate();" in blocks[1]["old_content"]
+    assert "onGenerateProposal();" in blocks[1]["new_content"]
+
+
+def test_multiple_files_with_multiple_search_replace_blocks():
+    """Test extraction from multiple files, each with multiple SEARCH/REPLACE blocks."""
+    content = textwrap.dedent("""
+        src/file1.ts
+        ```typescript
+        <<<<<<< SEARCH
+        const a = 1;
+        =======
+        const a = 10;
+        >>>>>>> REPLACE
+        <<<<<<< SEARCH
+        const b = 2;
+        =======
+        const b = 20;
+        >>>>>>> REPLACE
+        ```
+
+        src/file2.ts
+        ```typescript
+        <<<<<<< SEARCH
+        const c = 3;
+        =======
+        const c = 30;
+        >>>>>>> REPLACE
+        ```
+    """)
+
+    blocks = extract_blocks_from_text(content)
+
+    assert len(blocks) == 3
+
+    # First two blocks from file1
+    assert blocks[0]["file_path"] == "src/file1.ts"
+    assert blocks[0]["old_content"] == "const a = 1;"
+    assert blocks[1]["file_path"] == "src/file1.ts"
+    assert blocks[1]["old_content"] == "const b = 2;"
+
+    # Third block from file2
+    assert blocks[2]["file_path"] == "src/file2.ts"
+    assert blocks[2]["old_content"] == "const c = 3;"
