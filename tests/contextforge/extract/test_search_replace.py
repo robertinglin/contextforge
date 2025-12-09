@@ -419,3 +419,144 @@ def test_multiple_files_with_multiple_search_replace_blocks():
     # Third block from file2
     assert blocks[2]["file_path"] == "src/file2.ts"
     assert blocks[2]["old_content"] == "const c = 3;"
+
+
+def test_file_prefix_format():
+    """Test extraction with 'File: path/to/file.ext' format."""
+    content = textwrap.dedent("""
+        File: V2/app/services/llm.py
+        ```python
+        <<<<<<< SEARCH
+        queue = asyncio.Queue()
+        =======
+        queue = asyncio.Queue()
+        proposal_ref = {"id": None}
+        >>>>>>> REPLACE
+        ```
+    """)
+
+    blocks = extract_blocks_from_text(content)
+
+    assert len(blocks) == 1
+    block = blocks[0]
+
+    assert block["type"] == "file"
+    assert block["is_search_replace"] is True
+    assert block["file_path"] == "V2/app/services/llm.py"
+    assert block["language"] == "python"
+    assert "queue = asyncio.Queue()" in block["old_content"]
+    assert "proposal_ref" in block["new_content"]
+
+
+def test_language_filepath_format():
+    """Test extraction with 'language:filepath' fence format."""
+    content = textwrap.dedent("""
+        ```python:src/utils/helpers.py
+        <<<<<<< SEARCH
+        def old_func():
+            pass
+        =======
+        def new_func():
+            return True
+        >>>>>>> REPLACE
+        ```
+    """)
+
+    blocks = extract_blocks_from_text(content)
+
+    assert len(blocks) == 1
+    block = blocks[0]
+
+    assert block["type"] == "file"
+    assert block["is_search_replace"] is True
+    assert block["file_path"] == "src/utils/helpers.py"
+    assert block["language"] == "python"
+    assert "def old_func():" in block["old_content"]
+    assert "def new_func():" in block["new_content"]
+
+
+def test_chevron_with_file_prefix():
+    """Test chevron-style blocks with 'File: path' format."""
+    content = textwrap.dedent("""
+        File: V2/app/services/llm.py
+        ```python
+        <<<<
+        queue = asyncio.Queue()
+        ====
+        queue = asyncio.Queue()
+        proposal_ref = {"id": None}
+        >>>>
+        ```
+    """)
+
+    blocks = extract_blocks_from_text(content)
+
+    assert len(blocks) == 1
+    block = blocks[0]
+
+    assert block["type"] == "file"
+    assert block["is_search_replace"] is True
+    assert block["file_path"] == "V2/app/services/llm.py"
+    assert "queue = asyncio.Queue()" in block["old_content"]
+    assert "proposal_ref" in block["new_content"]
+
+
+def test_chevron_with_language_filepath():
+    """Test chevron-style blocks with 'language:filepath' format."""
+    content = textwrap.dedent("""
+        ```tsx:src_v2/components/workspace/WorkspacePage.tsx
+        <<<<
+        } else if (msg.type === 'chunk') {
+        ====
+        } else if (msg.type === 'error') {
+          toast.error(msg.message);
+        } else if (msg.type === 'chunk') {
+        >>>>
+        ```
+    """)
+
+    blocks = extract_blocks_from_text(content)
+
+    assert len(blocks) == 1
+    block = blocks[0]
+
+    assert block["type"] == "file"
+    assert block["is_search_replace"] is True
+    assert block["file_path"] == "src_v2/components/workspace/WorkspacePage.tsx"
+    assert block["language"] == "tsx"
+
+
+def test_multiple_chevron_blocks_with_file_prefix():
+    """Test multiple chevron blocks for different files with File: prefix."""
+    content = textwrap.dedent("""
+        File: V2/app/services/llm.py
+        ```python
+        <<<<
+        queue = asyncio.Queue()
+        ====
+        queue = asyncio.Queue()
+        proposal_ref = {"id": None}
+        >>>>
+        ```
+
+        File: src_v2/components/workspace/WorkspacePage.tsx
+        ```tsx
+        <<<<
+        } else if (msg.type === 'chunk') {
+        ====
+        } else if (msg.type === 'error') {
+          toast.error(msg.message);
+        } else if (msg.type === 'chunk') {
+        >>>>
+        ```
+    """)
+
+    blocks = extract_blocks_from_text(content)
+
+    assert len(blocks) == 2
+
+    assert blocks[0]["file_path"] == "V2/app/services/llm.py"
+    assert blocks[0]["language"] == "python"
+
+    assert blocks[1]["file_path"] == "src_v2/components/workspace/WorkspacePage.tsx"
+    assert blocks[1]["language"] == "tsx"

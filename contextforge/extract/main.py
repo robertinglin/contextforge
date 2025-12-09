@@ -3,7 +3,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from .diffs import _looks_like_diff, _extract_custom_patch_blocks, _split_multi_file_diff
-from .extract import extract_all_blocks_from_text
+from .extract import extract_all_blocks_from_text, _extract_path_hint_from_lines
 from .metadata import (
     detect_deletion_from_diff,
     detect_rename_from_diff,
@@ -12,11 +12,75 @@ from .metadata import (
 from ..utils.parsing import _try_parse_comment_header
 
 
+def _parse_fence_info_string(info_string: str) -> tuple[str, Optional[str]]:
+    """
+    Parse a fence info string to extract language and optional file path.
+
+    Supports formats:
+    - "python" -> ("python", None)
+    - "python:path/to/file.py" -> ("python", "path/to/file.py")
+    - "tsx:src/components/App.tsx" -> ("tsx", "src/components/App.tsx")
+
+    Returns (language, file_path) tuple.
+    """
+    if not info_string:
+        return ("plain", None)
+
+    parts = info_string.split()
+    if not parts:
+        return ("plain", None)
+
+    first_token = parts[0]
+
+    # Check for language:filepath format
+    colon_idx = first_token.find(":")
+    if colon_idx > 0:
+        # Check if this looks like a Windows absolute path (single letter before colon)
+        if colon_idx == 1 and first_token[0].isalpha():
+            # This is a Windows path like "C:\...", no language
+            return ("plain", first_token.replace("\\", "/"))
+
+        potential_lang = first_token[:colon_idx]
+        potential_path = first_token[colon_idx + 1:]
+        if potential_path:
+            return (potential_lang.lower(), potential_path.replace("\\", "/"))
+        else:
+            return (potential_lang.lower(), None)
+
+    return (first_token.lower(), None)
+
+
+def _extract_file_path_from_context(text: str, fence_start: int) -> Optional[str]:
+    """
+    Extract file path from context before a fence.
+
+    Looks for patterns like:
+    - "File: path/to/file.ext"
+    - "path/to/file.ext" (standalone path on its own line)
+    - Any line containing a file path
+    """
+    context_before = text[:fence_start]
+    lines_before = context_before.split("\n")[-5:]
+
+    for line in reversed(lines_before):
+        line = line.strip()
+        if not line or line.startswith("```"):
+            continue
+
+        # Try "File: path/to/file.ext" format
+        file_prefix_match = re.match(r"^[Ff]ile:\s*(\S+\.\w+)", line)
+        if file_prefix_match:
+            return file_prefix_match.group(1).replace("\\", "/")
+
+    # Fall back to the generic path hint extraction
+    return _extract_path_hint_from_lines(lines_before)
+
+
 def _extract_search_replace_blocks(text: str) -> List[Dict[str, Any]]:
     """
     Extract SEARCH/REPLACE blocks from markdown-style fenced code.
 
-    Supports two formats:
+    Supports formats:
 
     1. Single block per fence:
         ```language
@@ -42,13 +106,29 @@ def _extract_search_replace_blocks(text: str) -> List[Dict[str, Any]]:
         >>>>>>> REPLACE
         ```
 
+    3. Language:filepath format:
+        ```python:path/to/file.py
+        <<<<<<< SEARCH
+        ...
+        >>>>>>> REPLACE
+        ```
+
+    4. File: prefix format:
+        File: path/to/file.py
+        ```python
+        <<<<<<< SEARCH
+        ...
+        >>>>>>> REPLACE
+        ```
+
     Returns list of dicts with: file_path, old, new, language, start, end
     """
     results = []
 
     # Pattern to find fenced code blocks (standard markdown fence)
+    # Capture the full info string (not just \w*) to support language:filepath
     fence_pattern = re.compile(
-        r"```(\w*)\s*\n"  # Opening fence with optional language (group 1)
+        r"```([^\n]*)\n"  # Opening fence with info string (group 1)
         r"(.*?)"  # Content inside fence (group 2)
         r"\n```(?:\s*$|\n|$)",  # Closing fence
         re.DOTALL,
@@ -74,27 +154,14 @@ def _extract_search_replace_blocks(text: str) -> List[Dict[str, Any]]:
             continue
 
         fence_start, fence_end = fence_match.span()
-        language = fence_match.group(1) or "plain"
 
-        # Extract file path from context before the fence
-        file_path = None
-        context_before = text[:fence_start]
-        lines_before = context_before.split("\n")
+        # Parse language and potential file path from info string
+        info_string = fence_match.group(1).strip()
+        language, file_path = _parse_fence_info_string(info_string)
 
-        # Check last few lines for a file path hint
-        for line in reversed(lines_before[-5:]):
-            line = line.strip()
-            if line and not line.startswith("```"):
-                # First try to match a standalone file path (whole line is a path)
-                path_match = re.match(r"^([\w\-./\\]+\.\w+)$", line)
-                if path_match:
-                    file_path = path_match.group(1).replace("\\", "/")
-                    break
-                # Then try to extract a file path from the line
-                path_match = re.search(r"([\w\-./\\]+\.\w+)", line)
-                if path_match:
-                    file_path = path_match.group(1).replace("\\", "/")
-                    break
+        # If no file path from info string, check context before the fence
+        if not file_path:
+            file_path = _extract_file_path_from_context(text, fence_start)
 
         # Extract each SEARCH/REPLACE pair from this fence
         for sr_match in sr_matches:
@@ -119,11 +186,40 @@ def _extract_chevron_blocks(text: str) -> List[Dict[str, Any]]:
     """
     Extract SEARCH/REPLACE blocks using chevron syntax (<<<<, ====, >>>>).
 
-    Supports format:
+    Supports formats:
+
+    1. Comment-style path inside fence:
         ```language
         // path/to/file.ext
+        <<<<
+        old content
+        ====
+        new content
+        >>>>
+        ```
 
-        // optional comment
+    2. Language:filepath format:
+        ```python:path/to/file.py
+        <<<<
+        old content
+        ====
+        new content
+        >>>>
+        ```
+
+    3. File: prefix format:
+        File: path/to/file.py
+        ```python
+        <<<<
+        old content
+        ====
+        new content
+        >>>>
+        ```
+
+    4. Path on preceding line:
+        path/to/file.ext
+        ```language
         <<<<
         old content
         ====
@@ -136,8 +232,9 @@ def _extract_chevron_blocks(text: str) -> List[Dict[str, Any]]:
     results = []
 
     # Pattern to find fenced code blocks (standard markdown fence)
+    # Capture the full info string (not just \w*) to support language:filepath
     fence_pattern = re.compile(
-        r"```(\w*)\s*\n"  # Opening fence with optional language (group 1)
+        r"```([^\n]*)\n"  # Opening fence with info string (group 1)
         r"(.*?)"  # Content inside fence (group 2)
         r"\n```(?:\s*$|\n|$)",  # Closing fence
         re.DOTALL,
@@ -163,14 +260,20 @@ def _extract_chevron_blocks(text: str) -> List[Dict[str, Any]]:
             continue
 
         fence_start, fence_end = fence_match.span()
-        language = fence_match.group(1) or "plain"
 
-        # Extract file path from comment at the top of the fence content
-        # Look for patterns like "// path/to/file.ext" or "# path/to/file.ext"
-        file_path = None
-        path_match = re.match(r"^\s*(?://|#)\s*(\S+\.\w+)", fence_content)
-        if path_match:
-            file_path = path_match.group(1).replace("\\", "/")
+        # Parse language and potential file path from info string
+        info_string = fence_match.group(1).strip()
+        language, file_path = _parse_fence_info_string(info_string)
+
+        # If no file path from info string, check comment at top of fence content
+        if not file_path:
+            path_match = re.match(r"^\s*(?://|#)\s*(\S+\.\w+)", fence_content)
+            if path_match:
+                file_path = path_match.group(1).replace("\\", "/")
+
+        # If still no file path, check context before the fence
+        if not file_path:
+            file_path = _extract_file_path_from_context(text, fence_start)
 
         # Extract each chevron pair from this fence
         for chevron_match in chevron_matches:
