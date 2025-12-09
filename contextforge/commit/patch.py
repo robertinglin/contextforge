@@ -18,6 +18,50 @@ __all__ = ["patch_text", "fuzzy_patch_partial"]
 # ---------- core helpers ----------
 
 
+def _find_best_match_window(
+    target_lines: list[str],
+    search_lines: list[str],
+    threshold: float = 0.6,
+) -> tuple[int, int, float] | None:
+    """
+    Find the best fuzzy match for search_lines within target_lines.
+
+    Uses line-by-line similarity with whitespace normalization to find
+    where the search block approximately matches in the target.
+
+    Returns (start_idx, end_idx, similarity) or None if no match above threshold.
+    """
+    if not search_lines or not target_lines:
+        return None
+
+    m = len(search_lines)
+    n = len(target_lines)
+
+    if m > n:
+        return None
+
+    # Normalize lines for comparison (strip whitespace)
+    search_normalized = [line.strip() for line in search_lines]
+    target_normalized = [line.strip() for line in target_lines]
+
+    best_idx = -1
+    best_ratio = -1.0
+
+    # Slide window over target
+    for i in range(n - m + 1):
+        window = target_normalized[i : i + m]
+        ratio = difflib.SequenceMatcher(None, search_normalized, window, autojunk=False).ratio()
+
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_idx = i
+
+    if best_ratio >= threshold:
+        return (best_idx, best_idx + m, best_ratio)
+
+    return None
+
+
 
 def _compose_from_to(hunk_lines: list[str]) -> tuple[list[str], list[str]]:
     """Build 'from' (everything except '+') and 'to' (everything except '-') blocks."""
@@ -1399,8 +1443,54 @@ def patch_text(
             if old in text:
                 log.debug(f"[{i}] exact replace of old block")
                 text = text.replace(old, new, 1)
+                continue
+
+            # Fuzzy matching fallback: find approximate location using line similarity
+            log.debug(f"[{i}] exact match failed, trying fuzzy match...")
+
+            # Detect line ending
+            if "\r\n" in text:
+                eol = "\r\n"
+            elif "\r" in text:
+                eol = "\r"
             else:
-                raise PatchFailedError("old block not found for structured patch")
+                eol = "\n"
+
+            target_lines = text.split(eol)
+            search_lines = old.splitlines()
+            new_lines = new.splitlines()
+
+            match = _find_best_match_window(target_lines, search_lines, threshold=0.6)
+
+            if match:
+                start_idx, end_idx, ratio = match
+                log.debug(f"[{i}] fuzzy match found at lines {start_idx}-{end_idx} (ratio={ratio:.3f})")
+
+                # Get the actual matched lines from the file to preserve indentation
+                matched_lines = target_lines[start_idx:end_idx]
+
+                # Determine indentation adjustment
+                # Compare the first non-empty line of search vs matched to find indent diff
+                search_indent = ""
+                for line in search_lines:
+                    if line.strip():
+                        search_indent = _leading_ws(line)
+                        break
+
+                matched_indent = ""
+                for line in matched_lines:
+                    if line.strip():
+                        matched_indent = _leading_ws(line)
+                        break
+
+                # Re-indent the new content to match the file's indentation
+                adjusted_new_lines = _reindent_relative(new_lines, search_lines[0] if search_lines else "", matched_lines[0] if matched_lines else "")
+
+                # Replace the matched section
+                target_lines = target_lines[:start_idx] + adjusted_new_lines + target_lines[end_idx:]
+                text = eol.join(target_lines)
+            else:
+                raise PatchFailedError("old block not found for structured patch (fuzzy match also failed)")
         return text
 
     if not patch.strip():
