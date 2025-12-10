@@ -50,15 +50,76 @@ def _parse_fence_info_string(info_string: str) -> tuple[str, Optional[str]]:
     return (first_token.lower(), None)
 
 
-def _extract_file_path_from_context(text: str, fence_start: int) -> Optional[str]:
+def _find_file_header_scopes(text: str) -> List[Dict[str, Any]]:
+    """
+    Find all "File: path/to/file.ext" headers and determine their scope.
+
+    A File: header applies to all subsequent fenced code blocks until:
+    - Another File: header is encountered
+    - A non-fence, non-whitespace, non-code-block line is encountered
+      (except for the File: line itself)
+
+    Returns list of dicts with: file_path, start, end (character positions)
+    """
+    scopes = []
+
+    # Pattern to match "File: path/to/file.ext" on its own line
+    file_header_pattern = re.compile(
+        r"^[Ff]ile:\s*(\S+\.\w+)\s*$",
+        re.MULTILINE
+    )
+
+    # Find all File: headers
+    headers = list(file_header_pattern.finditer(text))
+
+    for i, header_match in enumerate(headers):
+        file_path = header_match.group(1).replace("\\", "/")
+        scope_start = header_match.start()
+
+        # Determine scope end: either next File: header or end of text
+        if i + 1 < len(headers):
+            scope_end = headers[i + 1].start()
+        else:
+            scope_end = len(text)
+
+        scopes.append({
+            "file_path": file_path,
+            "start": scope_start,
+            "end": scope_end,
+        })
+
+    return scopes
+
+
+def _get_file_path_from_scopes(
+    scopes: List[Dict[str, Any]], fence_start: int
+) -> Optional[str]:
+    """
+    Get file path from scopes if the fence falls within a File: header scope.
+    """
+    for scope in scopes:
+        if scope["start"] <= fence_start < scope["end"]:
+            return scope["file_path"]
+    return None
+
+
+def _extract_file_path_from_context(
+    text: str, fence_start: int, file_header_scopes: Optional[List[Dict[str, Any]]] = None
+) -> Optional[str]:
     """
     Extract file path from context before a fence.
 
     Looks for patterns like:
-    - "File: path/to/file.ext"
+    - "File: path/to/file.ext" (including multi-fence scope via file_header_scopes)
     - "path/to/file.ext" (standalone path on its own line)
     - Any line containing a file path
     """
+    # First check if we're within a File: header scope
+    if file_header_scopes:
+        scope_path = _get_file_path_from_scopes(file_header_scopes, fence_start)
+        if scope_path:
+            return scope_path
+
     context_before = text[:fence_start]
     lines_before = context_before.split("\n")[-5:]
 
@@ -121,9 +182,31 @@ def _extract_search_replace_blocks(text: str) -> List[Dict[str, Any]]:
         >>>>>>> REPLACE
         ```
 
+    5. File: header with multiple separate fences:
+        File: path/to/file.py
+
+        ```language
+        <<<<<<< SEARCH
+        old content 1
+        =======
+        new content 1
+        >>>>>>> REPLACE
+        ```
+
+        ```language
+        <<<<<<< SEARCH
+        old content 2
+        =======
+        new content 2
+        >>>>>>> REPLACE
+        ```
+
     Returns list of dicts with: file_path, old, new, language, start, end
     """
     results = []
+
+    # Pre-scan for File: headers and their scopes
+    file_header_scopes = _find_file_header_scopes(text)
 
     # Pattern to find fenced code blocks (standard markdown fence)
     # Capture the full info string (not just \w*) to support language:filepath
@@ -160,8 +243,9 @@ def _extract_search_replace_blocks(text: str) -> List[Dict[str, Any]]:
         language, file_path = _parse_fence_info_string(info_string)
 
         # If no file path from info string, check context before the fence
+        # (now includes multi-fence File: header scope support)
         if not file_path:
-            file_path = _extract_file_path_from_context(text, fence_start)
+            file_path = _extract_file_path_from_context(text, fence_start, file_header_scopes)
 
         # Extract each SEARCH/REPLACE pair from this fence
         for sr_match in sr_matches:
@@ -227,9 +311,31 @@ def _extract_chevron_blocks(text: str) -> List[Dict[str, Any]]:
         >>>>
         ```
 
+    5. File: header with multiple separate fences:
+        File: path/to/file.py
+
+        ```language
+        <<<<
+        old content 1
+        ====
+        new content 1
+        >>>>
+        ```
+
+        ```language
+        <<<<
+        old content 2
+        ====
+        new content 2
+        >>>>
+        ```
+
     Returns list of dicts with: file_path, old, new, language, start, end
     """
     results = []
+
+    # Pre-scan for File: headers and their scopes
+    file_header_scopes = _find_file_header_scopes(text)
 
     # Pattern to find fenced code blocks (standard markdown fence)
     # Capture the full info string (not just \w*) to support language:filepath
@@ -272,8 +378,9 @@ def _extract_chevron_blocks(text: str) -> List[Dict[str, Any]]:
                 file_path = path_match.group(1).replace("\\", "/")
 
         # If still no file path, check context before the fence
+        # (now includes multi-fence File: header scope support)
         if not file_path:
-            file_path = _extract_file_path_from_context(text, fence_start)
+            file_path = _extract_file_path_from_context(text, fence_start, file_header_scopes)
 
         # Extract each chevron pair from this fence
         for chevron_match in chevron_matches:

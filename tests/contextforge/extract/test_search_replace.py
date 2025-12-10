@@ -560,3 +560,281 @@ def test_multiple_chevron_blocks_with_file_prefix():
 
     assert blocks[1]["file_path"] == "src_v2/components/workspace/WorkspacePage.tsx"
     assert blocks[1]["language"] == "tsx"
+
+
+def test_file_header_with_multiple_separate_fences_search_replace():
+    """Test File: header applying to multiple separate SEARCH/REPLACE fences."""
+    content = textwrap.dedent("""
+        File: src_v2/components/workspace/ContextPanel.tsx
+
+        ```tsx
+        <<<<<<< SEARCH
+          const handleGenerateButtonTouchEnd = useCallback((e: React.TouchEvent) => {
+            if (longPressTimer) {
+              e.preventDefault();
+              clearTimeout(longPressTimer);
+              setLongPressTimer(null);
+
+              const touch = e.changedTouches[0];
+              if (touchStartPos) {
+                const dx = Math.abs(touch.clientX - touchStartPos.x);
+                const dy = Math.abs(touch.clientY - touchStartPos.y);
+
+                if (dx < 10 && dy < 10) {
+                   if (!isGenerating && instructions.trim()) {
+                     handleGenerateWithContext();
+                   }
+                }
+              }
+            }
+            setTouchStartPos(null);
+          }, [longPressTimer, touchStartPos, isGenerating, instructions, handleGenerateWithContext]);
+        =======
+          const handleGenerateButtonTouchEnd = useCallback((e: React.TouchEvent) => {
+            if (longPressTimer) {
+              e.preventDefault();
+              clearTimeout(longPressTimer);
+              setLongPressTimer(null);
+
+              const touch = e.changedTouches[0];
+              if (touchStartPos) {
+                const dx = Math.abs(touch.clientX - touchStartPos.x);
+                const dy = Math.abs(touch.clientY - touchStartPos.y);
+
+                if (dx < 10 && dy < 10) {
+                   if (instructions.trim() && filesForClipboard.length > 0) {
+                     handleGenerateWithContext();
+                   }
+                }
+              }
+            }
+            setTouchStartPos(null);
+          }, [longPressTimer, touchStartPos, instructions, filesForClipboard, handleGenerateWithContext]);
+        >>>>>>> REPLACE
+        ```
+
+        ```tsx
+        <<<<<<< SEARCH
+                  <Button
+                    onClick={handleGenerateWithContext}
+                    disabled={isGenerating || !instructions.trim()}
+                    className="flex-1"
+                  >
+                    {isGenerating ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        Generating...
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="mr-2 h-4 w-4" />
+                        {selectedModelName}
+                      </>
+                    )}
+                  </Button>
+        =======
+                  <Button
+                    onClick={handleGenerateWithContext}
+                    disabled={!instructions.trim() || filesForClipboard.length === 0}
+                    className="flex-1"
+                  >
+                    <Sparkles className="mr-2 h-4 w-4" />
+                    {selectedModelName}
+                  </Button>
+        >>>>>>> REPLACE
+        ```
+    """)
+
+    blocks = extract_blocks_from_text(content)
+
+    # Should extract 2 blocks, both with the same file path
+    assert len(blocks) == 2
+
+    for block in blocks:
+        assert block["type"] == "file"
+        assert block["is_search_replace"] is True
+        assert block["language"] == "tsx"
+        assert block["file_path"] == "src_v2/components/workspace/ContextPanel.tsx"
+
+    # First block modifies handleGenerateButtonTouchEnd
+    assert "handleGenerateButtonTouchEnd" in blocks[0]["old_content"]
+    assert "isGenerating && instructions.trim()" in blocks[0]["old_content"]
+    assert "filesForClipboard.length > 0" in blocks[0]["new_content"]
+
+    # Second block modifies the Button
+    assert "disabled={isGenerating || !instructions.trim()}" in blocks[1]["old_content"]
+    assert "disabled={!instructions.trim() || filesForClipboard.length === 0}" in blocks[1]["new_content"]
+
+
+def test_file_header_with_multiple_separate_fences_chevron():
+    """Test File: header applying to multiple separate chevron-style fences."""
+    content = textwrap.dedent("""
+        File: src/utils/helpers.py
+
+        ```python
+        <<<<
+        def old_func():
+            pass
+        ====
+        def new_func():
+            return True
+        >>>>
+        ```
+
+        ```python
+        <<<<
+        class OldClass:
+            pass
+        ====
+        class NewClass:
+            def __init__(self):
+                self.value = 42
+        >>>>
+        ```
+    """)
+
+    blocks = extract_blocks_from_text(content)
+
+    assert len(blocks) == 2
+
+    for block in blocks:
+        assert block["type"] == "file"
+        assert block["is_search_replace"] is True
+        assert block["language"] == "python"
+        assert block["file_path"] == "src/utils/helpers.py"
+
+    assert "def old_func():" in blocks[0]["old_content"]
+    assert "def new_func():" in blocks[0]["new_content"]
+
+    assert "class OldClass:" in blocks[1]["old_content"]
+    assert "class NewClass:" in blocks[1]["new_content"]
+
+
+def test_multiple_file_headers_with_multiple_fences():
+    """Test multiple File: headers, each with multiple fences."""
+    content = textwrap.dedent("""
+        File: src/file1.ts
+
+        ```typescript
+        <<<<<<< SEARCH
+        const a = 1;
+        =======
+        const a = 10;
+        >>>>>>> REPLACE
+        ```
+
+        ```typescript
+        <<<<<<< SEARCH
+        const b = 2;
+        =======
+        const b = 20;
+        >>>>>>> REPLACE
+        ```
+
+        File: src/file2.ts
+
+        ```typescript
+        <<<<<<< SEARCH
+        const c = 3;
+        =======
+        const c = 30;
+        >>>>>>> REPLACE
+        ```
+
+        ```typescript
+        <<<<<<< SEARCH
+        const d = 4;
+        =======
+        const d = 40;
+        >>>>>>> REPLACE
+        ```
+    """)
+
+    blocks = extract_blocks_from_text(content)
+
+    assert len(blocks) == 4
+
+    # First two blocks from file1
+    assert blocks[0]["file_path"] == "src/file1.ts"
+    assert blocks[0]["old_content"] == "const a = 1;"
+    assert blocks[1]["file_path"] == "src/file1.ts"
+    assert blocks[1]["old_content"] == "const b = 2;"
+
+    # Last two blocks from file2
+    assert blocks[2]["file_path"] == "src/file2.ts"
+    assert blocks[2]["old_content"] == "const c = 3;"
+    assert blocks[3]["file_path"] == "src/file2.ts"
+    assert blocks[3]["old_content"] == "const d = 4;"
+
+
+def test_file_header_scope_ends_at_next_file_header():
+    """Test that a File: header scope ends when the next File: header starts."""
+    content = textwrap.dedent("""
+        File: src/first.ts
+
+        ```typescript
+        <<<<<<< SEARCH
+        const first = 1;
+        =======
+        const first = 10;
+        >>>>>>> REPLACE
+        ```
+
+        File: src/second.ts
+
+        ```typescript
+        <<<<<<< SEARCH
+        const second = 2;
+        =======
+        const second = 20;
+        >>>>>>> REPLACE
+        ```
+    """)
+
+    blocks = extract_blocks_from_text(content)
+
+    assert len(blocks) == 2
+    assert blocks[0]["file_path"] == "src/first.ts"
+    assert blocks[1]["file_path"] == "src/second.ts"
+
+
+def test_mixed_file_header_formats():
+    """Test mixing File: header format with other path formats."""
+    content = textwrap.dedent("""
+        File: src/file1.ts
+
+        ```typescript
+        <<<<<<< SEARCH
+        const a = 1;
+        =======
+        const a = 10;
+        >>>>>>> REPLACE
+        ```
+
+        ```typescript
+        <<<<<<< SEARCH
+        const b = 2;
+        =======
+        const b = 20;
+        >>>>>>> REPLACE
+        ```
+
+        ```typescript:src/file2.ts
+        <<<<<<< SEARCH
+        const c = 3;
+        =======
+        const c = 30;
+        >>>>>>> REPLACE
+        ```
+    """)
+
+    blocks = extract_blocks_from_text(content)
+
+    assert len(blocks) == 3
+
+    # First two from File: header
+    assert blocks[0]["file_path"] == "src/file1.ts"
+    assert blocks[1]["file_path"] == "src/file1.ts"
+
+    # Third from language:filepath format (takes precedence)
+    assert blocks[2]["file_path"] == "src/file2.ts"
