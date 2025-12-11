@@ -1,0 +1,3124 @@
+import { useState, useEffect, useCallback } from 'react';
+import { 
+  Loader2, 
+  Plus, 
+  Trash2, 
+  Pencil,
+  Eye, 
+  EyeOff, 
+  Save,
+  Smartphone,
+  TestTube2,
+  FileCode,
+  Shield,
+  RefreshCw,
+  Cpu,
+  Terminal,
+  HardDrive,
+  Check,
+} from 'lucide-react';
+import { Button } from '../components/ui/button';
+import { Input } from '../components/ui/input';
+import { Label } from '../components/ui/label';
+import { Switch } from '../components/ui/switch';
+import { Card, CardContent, CardHeader, CardTitle, CardFooter, CardDescription } from '../components/ui/card';
+import { ScrollArea } from '../components/ui/scroll-area';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "../components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../components/ui/select";
+import { RadioGroup, RadioGroupItem } from "../components/ui/radio-group";
+import { useSettings, ProviderConfig, ValidatorConfig, ModelConfig } from '../hooks/useSettings';
+import { http } from '../lib/http';
+import { toast } from 'sonner';
+
+export default function SettingsPage() {
+  const { 
+    providers, 
+    validators, 
+    models,
+    loading, 
+    updateProvider, 
+    deleteProvider, 
+    updateValidators, 
+    refresh,
+    refreshModels,
+    addOpencodeModel,
+    addOpenAICompatibleModel,
+    toggleModel,
+    deleteModel,
+    updateModel,
+  } = useSettings();
+  const [theme, setTheme] = useState<'light' | 'dark' | 'system'>(
+    (localStorage.getItem('theme') as any) || 'system'
+  );
+
+  const handleThemeChange = (newTheme: 'light' | 'dark' | 'system') => {
+    setTheme(newTheme);
+    localStorage.setItem('theme', newTheme);
+
+    if (newTheme === 'dark' || (newTheme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  };
+
+
+  return (
+    <div className="flex flex-col h-full bg-background">
+      <header className="flex items-center justify-between p-6 border-b flex-shrink-0">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight">Settings</h1>
+          <p className="text-muted-foreground">Manage global application configuration.</p>
+        </div>
+      </header>
+
+      <ScrollArea className="flex-1">
+        <div className="p-6 pb-20 max-w-4xl mx-auto space-y-8">
+
+          {/* Appearance Section */}
+          <section className="space-y-4">
+            <div>
+              <h2 className="text-lg font-semibold">Appearance</h2>
+              <p className="text-sm text-muted-foreground">Customize the look and feel.</p>
+            </div>
+            <Card>
+              <CardContent className="pt-6">
+                <div className="flex items-center justify-between">
+                  <div className="space-y-1">
+                    <Label>Theme</Label>
+                    <div className="text-sm text-muted-foreground">
+                      Select your preferred interface theme.
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button 
+                      variant={theme === 'light' ? 'default' : 'outline'} 
+                      size="sm" 
+                      onClick={() => handleThemeChange('light')}
+                    >
+                      Light
+                    </Button>
+                    <Button 
+                      variant={theme === 'dark' ? 'default' : 'outline'} 
+                      size="sm" 
+                      onClick={() => handleThemeChange('dark')}
+                    >
+                      Dark
+                    </Button>
+                    <Button 
+                      variant={theme === 'system' ? 'default' : 'outline'} 
+                      size="sm" 
+                      onClick={() => handleThemeChange('system')}
+                    >
+                      System
+                    </Button>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          </section>
+
+          {/* LLM Providers */}
+          <section className="space-y-4 scroll-mt-20">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">LLM Providers</h2>
+                <p className="text-sm text-muted-foreground">Configure AI models for code generation.</p>
+              </div>
+              <AddProviderDialog onAdd={refresh} />
+            </div>
+
+            <div className="grid gap-4">
+              {loading && providers.length === 0 ? (
+                <div className="flex items-center justify-center p-8 border rounded-lg border-dashed">
+                  <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+                </div>
+              ) : providers.length === 0 ? (
+                <div className="text-center p-8 border rounded-lg border-dashed text-muted-foreground">
+                  No providers configured. Add one to get started.
+                </div>
+              ) : (
+                providers.map(provider => (
+                  <ProviderCard 
+                    key={provider.providerId} 
+                    provider={provider} 
+                    onUpdate={updateProvider}
+                    onDelete={deleteProvider}
+                  />
+                ))
+              )}
+            </div>
+          </section>
+
+          {/* Mobile Access */}
+          <section className="space-y-4 scroll-mt-20">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">Mobile Access</h2>
+                <p className="text-sm text-muted-foreground">Connect mobile devices via P2P for remote editing.</p>
+              </div>
+            </div>
+            <MobilePairingCard />
+          </section>
+
+          {/* Validators */}
+          <section className="space-y-4 scroll-mt-20">
+            <div>
+              <h2 className="text-lg font-semibold">Validators</h2>
+              <p className="text-sm text-muted-foreground">Configure lint, typecheck, and test behaviors.</p>
+            </div>
+            <ValidatorSettingsCard validators={validators} onUpdate={updateValidators} />
+          </section>
+
+          {/* OpenCode Models */}
+          <section className="space-y-4 scroll-mt-20">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">OpenCode Models</h2>
+                <p className="text-sm text-muted-foreground">
+                  Add models from the OpenCode CLI. These use your existing OpenCode authentication.
+                </p>
+              </div>
+            </div>
+            <OpencodeModelsCard 
+              configuredModels={models.filter(m => m.provider.startsWith('opencode-'))}
+              onAddModel={addOpencodeModel}
+              onToggleModel={toggleModel}
+              onDeleteModel={deleteModel}
+              onRefresh={refreshModels}
+              onUpdateModel={updateModel}
+            />
+          </section>
+
+          {/* OpenAI Compatible Models */}
+          <section className="space-y-4 scroll-mt-20">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">OpenAI Compatible Models</h2>
+                <p className="text-sm text-muted-foreground">
+                  Add custom OpenAI-compatible models using environment variable API keys.
+                </p>
+              </div>
+              <AddOpenAICompatibleModelDialog onAdd={addOpenAICompatibleModel} onRefresh={refreshModels} />
+            </div>
+            <ConfiguredModelsCard 
+              models={models.filter(m => !m.provider.startsWith('opencode-'))}
+              onToggleModel={toggleModel}
+              onDeleteModel={deleteModel}
+              onUpdateModel={updateModel}
+            />
+          </section>
+        </div>
+      </ScrollArea>
+    </div>
+  );
+}
+
+function ProviderCard({ 
+  provider, 
+  onUpdate, 
+  onDelete 
+}: { 
+  provider: ProviderConfig; 
+  onUpdate: (id: string, cfg: Partial<ProviderConfig>) => Promise<void>; 
+  onDelete: (id: string) => Promise<void>;
+}) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [apiKey, setApiKey] = useState('');
+  const [baseUrl, setBaseUrl] = useState(provider.baseUrl || '');
+  const [isSaving, setIsSaving] = useState(false);
+  const [showApiKey, setShowApiKey] = useState(false);
+
+  const handleSave = async () => {
+    setIsSaving(true);
+    try {
+      await onUpdate(provider.providerId, {
+        apiKey: apiKey || undefined, // Only send if changed/provided
+        baseUrl: baseUrl || undefined,
+      });
+      setIsEditing(false);
+      setApiKey(''); // Clear local state
+      toast.success(`${provider.providerId} updated`);
+    } catch (e) {
+      toast.error('Failed to update provider');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleToggle = async (enabled: boolean) => {
+    try {
+      await onUpdate(provider.providerId, { enabled });
+      toast.success(enabled ? 'Provider enabled' : 'Provider disabled');
+    } catch (e) {
+      toast.error('Failed to toggle provider');
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-base font-medium flex items-center gap-2">
+            <span className="capitalize">{provider.providerId}</span>
+            {provider.name && <span className="text-muted-foreground font-normal text-sm">({provider.name})</span>}
+          </CardTitle>
+          <div className="flex items-center gap-2">
+            <Switch 
+              checked={provider.enabled} 
+              onCheckedChange={handleToggle}
+            />
+            {!isEditing && (
+              <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground" onClick={() => setIsEditing(true)}>
+                <Save className="h-4 w-4" />
+              </Button>
+            )}
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              className="h-8 w-8 text-muted-foreground hover:text-destructive"
+              onClick={() => {
+                if(confirm('Are you sure you want to delete this configuration?')) {
+                  onDelete(provider.providerId);
+                }
+              }}
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+
+      {isEditing ? (
+        <CardContent className="space-y-4">
+          <div className="grid gap-2">
+            <Label>API Key</Label>
+            <div className="relative">
+              <Input 
+                type={showApiKey ? "text" : "password"} 
+                placeholder={provider.apiKey ? "********" : "Enter API Key"}
+                value={apiKey}
+                onChange={e => setApiKey(e.target.value)}
+                className="pr-10"
+              />
+              <button 
+                type="button"
+                onClick={() => setShowApiKey(!showApiKey)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              >
+                {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </button>
+            </div>
+            <p className="text-[0.8rem] text-muted-foreground">Leave blank to keep existing key.</p>
+          </div>
+          <div className="grid gap-2">
+            <Label>Base URL (Optional)</Label>
+            <Input 
+              placeholder="https://api.example.com/v1" 
+              value={baseUrl}
+              onChange={e => setBaseUrl(e.target.value)}
+            />
+          </div>
+        </CardContent>
+      ) : (
+        <CardContent className="py-2 text-sm text-muted-foreground">
+          <div className="flex gap-4">
+            <div className="flex flex-col">
+              <span className="text-xs uppercase font-semibold text-muted-foreground/70">Status</span>
+              <span className={provider.enabled ? "text-green-600 dark:text-green-400" : "text-muted-foreground"}>
+                {provider.enabled ? "Enabled" : "Disabled"}
+              </span>
+            </div>
+            {provider.baseUrl && (
+              <div className="flex flex-col">
+                <span className="text-xs uppercase font-semibold text-muted-foreground/70">Base URL</span>
+                <span className="truncate max-w-[200px]">{provider.baseUrl}</span>
+              </div>
+            )}
+          </div>
+        </CardContent>
+      )}
+
+      {isEditing && (
+        <CardFooter className="flex justify-end gap-2 bg-muted/20 pt-4">
+          <Button variant="ghost" size="sm" onClick={() => setIsEditing(false)} disabled={isSaving}>
+            Cancel
+          </Button>
+          <Button size="sm" onClick={handleSave} disabled={isSaving}>
+            {isSaving && <Loader2 className="mr-2 h-3 w-3 animate-spin" />}
+            Save Changes
+          </Button>
+        </CardFooter>
+      )}
+    </Card>
+  );
+}
+
+function ValidatorSettingsCard({ 
+  validators, 
+  onUpdate 
+}: { 
+  validators: ValidatorConfig; 
+  onUpdate: (updates: Partial<ValidatorConfig>) => Promise<void>;
+}) {
+  const handleLintToggle = async (enabled: boolean) => {
+    try {
+      await onUpdate({ lint: { ...validators.lint, enabled } });
+    } catch {
+      toast.error('Failed to update lint settings');
+    }
+  };
+
+  const handleLintRuleset = async (ruleset: 'recommended' | 'strict' | 'custom') => {
+    try {
+      await onUpdate({ lint: { ...validators.lint, ruleset } });
+    } catch {
+      toast.error('Failed to update lint ruleset');
+    }
+  };
+
+  const handleTypecheckToggle = async (enabled: boolean) => {
+    try {
+      await onUpdate({ typecheck: { ...validators.typecheck, enabled } });
+    } catch {
+      toast.error('Failed to update typecheck settings');
+    }
+  };
+
+  const handleTestsToggle = async (enabled: boolean) => {
+    try {
+      await onUpdate({ tests: { ...validators.tests, enabled } });
+    } catch {
+      toast.error('Failed to update tests settings');
+    }
+  };
+
+  const handleTestsMode = async (mode: 'all' | 'impacted') => {
+    try {
+      await onUpdate({ tests: { ...validators.tests, mode } });
+    } catch {
+      toast.error('Failed to update tests mode');
+    }
+  };
+
+  const handleFastIteration = async (fastIteration: boolean) => {
+    try {
+      await onUpdate({ fastIteration });
+    } catch {
+      toast.error('Failed to update fast iteration setting');
+    }
+  };
+
+  return (
+    <Card>
+      <CardContent className="pt-6 space-y-6">
+        {/* Fast Iteration Toggle */}
+        <div className="flex items-center justify-between rounded-lg border p-3 shadow-sm">
+          <div className="space-y-0.5">
+            <Label htmlFor="fast-iteration" className="text-base font-medium">
+              Fast Iteration
+            </Label>
+            <p className="text-xs text-muted-foreground">
+              Skip full validation if syntax is correct.
+            </p>
+          </div>
+          <Switch
+            id="fast-iteration"
+            checked={validators.fastIteration ?? false}
+            onCheckedChange={handleFastIteration}
+          />
+        </div>
+
+        {/* Lint Settings */}
+        <div className="space-y-4">
+          <div className="flex items-center space-x-3">
+            <Switch
+              id="lint-enabled"
+              checked={validators.lint.enabled}
+              onCheckedChange={handleLintToggle}
+            />
+            <div className="flex items-center gap-2">
+              <Shield className="h-4 w-4 text-blue-500" />
+              <Label htmlFor="lint-enabled" className="text-base font-medium">
+                Lint
+              </Label>
+            </div>
+          </div>
+          {validators.lint.enabled && (
+            <div className="pl-8 space-y-2">
+              <Label className="text-sm text-muted-foreground">Ruleset</Label>
+              <RadioGroup
+                value={validators.lint.ruleset}
+                onValueChange={(value) => handleLintRuleset(value as 'recommended' | 'strict' | 'custom')}
+                className="flex flex-col gap-2"
+              >
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="recommended" id="lint-recommended" />
+                  <Label htmlFor="lint-recommended" className="font-normal">Recommended</Label>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="strict" id="lint-strict" />
+                  <Label htmlFor="lint-strict" className="font-normal">Strict</Label>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="custom" id="lint-custom" />
+                  <Label htmlFor="lint-custom" className="font-normal">Custom</Label>
+                </div>
+              </RadioGroup>
+            </div>
+          )}
+        </div>
+
+        {/* Typecheck Settings */}
+        <div className="space-y-2">
+          <div className="flex items-center space-x-3">
+            <Switch
+              id="typecheck-enabled"
+              checked={validators.typecheck.enabled}
+              onCheckedChange={handleTypecheckToggle}
+            />
+            <div className="flex items-center gap-2">
+              <FileCode className="h-4 w-4 text-purple-500" />
+              <Label htmlFor="typecheck-enabled" className="text-base font-medium">
+                Typecheck
+              </Label>
+            </div>
+          </div>
+        </div>
+
+        {/* Tests Settings */}
+        <div className="space-y-4">
+          <div className="flex items-center space-x-3">
+            <Switch
+              id="tests-enabled"
+              checked={validators.tests.enabled}
+              onCheckedChange={handleTestsToggle}
+            />
+            <div className="flex items-center gap-2">
+              <TestTube2 className="h-4 w-4 text-green-500" />
+              <Label htmlFor="tests-enabled" className="text-base font-medium">
+                Tests
+              </Label>
+            </div>
+          </div>
+          {validators.tests.enabled && (
+            <div className="pl-8 space-y-2">
+              <Label className="text-sm text-muted-foreground">Mode</Label>
+              <RadioGroup
+                value={validators.tests.mode}
+                onValueChange={(value) => handleTestsMode(value as 'all' | 'impacted')}
+                className="flex flex-col gap-2"
+              >
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="impacted" id="tests-impacted" />
+                  <Label htmlFor="tests-impacted" className="font-normal">Impacted only</Label>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="all" id="tests-all" />
+                  <Label htmlFor="tests-all" className="font-normal">All tests</Label>
+                </div>
+              </RadioGroup>
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ==================== OpenCode Models Components ====================
+
+function OpencodeModelsCard({
+  configuredModels,
+  onAddModel,
+  onToggleModel,
+  onDeleteModel,
+  onRefresh,
+  onUpdateModel,
+}: {
+  configuredModels: ModelConfig[];
+  onAddModel: (provider: string, model: string, nickname?: string, cmdRunner?: boolean, writeFilesToDisk?: boolean, shell?: string) => Promise<void>;
+  onToggleModel: (modelId: string, enabled: boolean) => Promise<void>;
+  onDeleteModel: (modelId: string) => Promise<void>;
+  onRefresh: () => void;
+  onUpdateModel: (modelId: string, updates: Partial<ModelConfig>) => Promise<void>;
+}) {
+  const [availableModels, setAvailableModels] = useState<Record<string, string[]>>({});
+  const [isLoadingModels, setIsLoadingModels] = useState(false);
+  const [addingModel, setAddingModel] = useState<string | null>(null);
+  const [editingModel, setEditingModel] = useState<ModelConfig | null>(null);
+
+  const fetchAvailableModels = useCallback(async () => {
+    setIsLoadingModels(true);
+    try {
+      const models = await http<Record<string, string[]>>('/api/models-config/opencode-available', { sendProjectId: false });
+      setAvailableModels(models);
+    } catch (error: any) {
+      toast.error("Failed to fetch OpenCode models", { description: error.message });
+      setAvailableModels({});
+    } finally {
+      setIsLoadingModels(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchAvailableModels();
+  }, [fetchAvailableModels]);
+
+  const handleAddModel = async (provider: string, model: string) => {
+    const fullModelId = `opencode-${provider}:${model}`;
+    setAddingModel(fullModelId);
+    try {
+      await onAddModel(provider, model);
+      toast.success(`Added ${provider}/${model}`);
+    } catch (error: any) {
+      toast.error("Failed to add model", { description: error.message });
+    } finally {
+      setAddingModel(null);
+    }
+  };
+
+  const isModelConfigured = (provider: string, model: string) => {
+    return configuredModels.some(m => m.provider === `opencode-${provider}` && m.model === `${provider}/${model}`);
+  };
+
+  return (
+    <>
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-base font-medium flex items-center gap-2">
+              <Cpu className="h-5 w-5" />
+              Available OpenCode Models
+            </CardTitle>
+            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={fetchAvailableModels} disabled={isLoadingModels}>
+              {isLoadingModels ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            </Button>
+          </div>
+          <CardDescription>
+            Models available via the <code className="text-xs bg-muted px-1 py-0.5 rounded">opencode models</code> command.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {Object.keys(availableModels).length > 0 ? (
+            <div className="space-y-4">
+              {Object.entries(availableModels).map(([provider, models]) => (
+                <div key={provider} className="space-y-2">
+                  <h4 className="text-sm font-medium capitalize">{provider}</h4>
+                  <div className="grid gap-2">
+                    {models.map(model => {
+                      const configured = isModelConfigured(provider, model);
+                      const fullId = `opencode-${provider}:${provider}/${model}`;
+                      const configuredModel = configuredModels.find(m => m.id === fullId);
+
+                      return (
+                        <div key={model} className="flex items-center justify-between py-2 px-3 bg-muted/30 rounded-md">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-mono">{model}</span>
+                            {configured && (
+                              <span className="text-xs text-green-600 dark:text-green-400 flex items-center gap-1">
+                                <Check className="h-3 w-3" /> Added
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {configured && configuredModel ? (
+                              <>
+                                <Switch
+                                  checked={configuredModel.enabled}
+                                  onCheckedChange={(enabled) => onToggleModel(configuredModel.id, enabled)}
+                                />
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-7 w-7 text-muted-foreground"
+                                  onClick={() => setEditingModel(configuredModel)}
+                                >
+                                  <Pencil className="h-3.5 w-3.5" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-7 w-7 text-muted-foreground hover:text-destructive"
+                                  onClick={() => {
+                                    if (confirm(`Remove ${model}?`)) {
+                                      onDeleteModel(configuredModel.id);
+                                    }
+                                  }}
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </Button>
+                              </>
+                            ) : (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-7"
+                                onClick={() => handleAddModel(provider, model)}
+                                disabled={addingModel === fullId}
+                              >
+                                {addingModel === fullId ? (
+                                  <Loader2 className="h-3 w-3 animate-spin" />
+                                ) : (
+                                  <>
+                                    <Plus className="h-3 w-3 mr-1" /> Add
+                                  </>
+                                )}
+                              </Button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-center py-8 text-muted-foreground">
+              {isLoadingModels ? (
+                <div className="flex items-center justify-center gap-2">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  <span>Loading models...</span>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <p>No OpenCode models found.</p>
+                  <p className="text-xs">Make sure the OpenCode CLI is installed and authenticated.</p>
+                </div>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {editingModel && (
+        <EditModelDialog 
+          model={editingModel} 
+          open={!!editingModel} 
+          onOpenChange={(open) => !open && setEditingModel(null)} 
+          onSave={onUpdateModel}
+        />
+      )}
+    </>
+  );
+}
+
+// ==================== OpenAI Compatible Models Components ====================
+
+function ConfiguredModelsCard({
+  models,
+  onToggleModel,
+  onDeleteModel,
+  onUpdateModel,
+}: {
+  models: ModelConfig[];
+  onToggleModel: (modelId: string, enabled: boolean) => Promise<void>;
+  onDeleteModel: (modelId: string) => Promise<void>;
+  onUpdateModel: (modelId: string, updates: Partial<ModelConfig>) => Promise<void>;
+}) {
+  const [editingModel, setEditingModel] = useState<ModelConfig | null>(null);
+
+  if (models.length === 0) {
+    return (
+      <Card>
+        <CardContent className="py-8">
+          <div className="text-center text-muted-foreground">
+            <p>No OpenAI-compatible models configured.</p>
+            <p className="text-xs mt-1">Add one using the button above.</p>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <>
+      <Card>
+        <CardContent className="pt-6">
+          <div className="space-y-3">
+            {models.map(model => (
+              <div key={model.id} className="flex items-center justify-between py-2 px-3 bg-muted/30 rounded-md">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium text-sm truncate">{model.nickname}</span>
+                    <span className="text-xs text-muted-foreground font-mono">{model.provider}/{model.model}</span>
+                  </div>
+                  <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
+                    {model.envApiKeyName && (
+                      <span className="flex items-center gap-1">
+                        <code className="bg-muted px-1 py-0.5 rounded">${model.envApiKeyName}</code>
+                      </span>
+                    )}
+                    {model.baseUrl && (
+                      <span className="flex items-center gap-1 truncate max-w-[200px]">
+                        {model.baseUrl}
+                      </span>
+                    )}
+                    {model.cmdRunner && (
+                      <span className="flex items-center gap-1">
+                        <Terminal className="h-3 w-3" /> Can run commands
+                      </span>
+                    )}
+                    {model.writeFilesToDisk && (
+                      <span className="flex items-center gap-1">
+                        <HardDrive className="h-3 w-3" /> Direct file writes
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Switch
+                    checked={model.enabled}
+                    onCheckedChange={(enabled) => onToggleModel(model.id, enabled)}
+                  />
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 text-muted-foreground"
+                    onClick={() => setEditingModel(model)}
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 text-muted-foreground hover:text-destructive"
+                    onClick={() => {
+                      if (confirm(`Remove ${model.nickname}?`)) {
+                        onDeleteModel(model.id);
+                      }
+                    }}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+
+      {editingModel && (
+        <EditModelDialog 
+          model={editingModel} 
+          open={!!editingModel} 
+          onOpenChange={(open) => !open && setEditingModel(null)} 
+          onSave={onUpdateModel}
+        />
+      )}
+    </>
+  );
+}
+
+function EditModelDialog({
+  model,
+  open,
+  onOpenChange,
+  onSave,
+}: {
+  model: ModelConfig;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSave: (id: string, updates: Partial<ModelConfig>) => Promise<void>;
+}) {
+  const [nickname, setNickname] = useState(model.nickname);
+  const [cmdRunner, setCmdRunner] = useState(model.cmdRunner);
+  const [writeFilesToDisk, setWriteFilesToDisk] = useState(model.writeFilesToDisk);
+  const [envApiKeyName, setEnvApiKeyName] = useState(model.envApiKeyName || '');
+  const [shell, setShell] = useState(model.shell || '');
+  const [baseUrl, setBaseUrl] = useState(model.baseUrl || '');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Update state when model changes (e.g. if dialog is reused or model prop updates)
+  useEffect(() => {
+    setNickname(model.nickname);
+    setShell(model.shell || '');
+    setCmdRunner(model.cmdRunner);
+    setWriteFilesToDisk(model.writeFilesToDisk);
+    setEnvApiKeyName(model.envApiKeyName || '');
+    setBaseUrl(model.baseUrl || '');
+  }, [model]);
+
+  const isOpencode = model.provider.startsWith('opencode-');
+
+  const handleSave = async () => {
+    setIsSubmitting(true);
+    try {
+      const updates: Partial<ModelConfig> = {
+        nickname,
+        cmdRunner,
+        shell: shell === 'auto' ? undefined : shell,
+        writeFilesToDisk,
+      };
+
+      if (!isOpencode) {
+        updates.envApiKeyName = envApiKeyName;
+        updates.baseUrl = baseUrl || undefined;
+      }
+
+      await onSave(model.id, updates);
+      onOpenChange(false);
+      toast.success('Model updated');
+    } catch (e: any) {
+      toast.error('Failed to update model', { description: e.message });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Edit Model</DialogTitle>
+          <DialogDescription>
+            Update configuration for {model.nickname}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4 py-4">
+          <div className="grid gap-2">
+            <Label>Nickname</Label>
+            <Input 
+              value={nickname} 
+              onChange={e => setNickname(e.target.value)} 
+            />
+          </div>
+
+          <div className="grid gap-2">
+            <Label>Shell Preference</Label>
+            <Select value={shell} onValueChange={setShell}>
+              <SelectTrigger>
+                <SelectValue placeholder="Select shell..." />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">Default (CMD)</SelectItem>
+                <SelectItem value="gitbash">Git Bash</SelectItem>
+                <SelectItem value="powershell">PowerShell</SelectItem>
+                <SelectItem value="wsl">WSL</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-[0.8rem] text-muted-foreground">
+              Preferred shell for running commands (Windows).
+            </p>
+          </div>
+
+          {!isOpencode && (
+            <>
+              <div className="grid gap-2">
+                <Label>API Key Environment Variable</Label>
+                <Input 
+                  value={envApiKeyName} 
+                  onChange={e => setEnvApiKeyName(e.target.value)} 
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label>Base URL</Label>
+                <Input 
+                  value={baseUrl} 
+                  onChange={e => setBaseUrl(e.target.value)}
+                  placeholder="Leave empty for default"
+                />
+              </div>
+            </>
+          )}
+
+          <div className="space-y-3 pt-2 border-t">
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <Label className="text-sm">Command Runner</Label>
+                <p className="text-xs text-muted-foreground">Model can execute shell commands</p>
+              </div>
+              <Switch 
+                checked={cmdRunner} 
+                onCheckedChange={setCmdRunner} 
+              />
+            </div>
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <Label className="text-sm">Direct File Writes</Label>
+                <p className="text-xs text-muted-foreground">Model writes files directly instead of diffs</p>
+              </div>
+              <Switch 
+                checked={writeFilesToDisk} 
+                onCheckedChange={setWriteFilesToDisk} 
+              />
+            </div>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
+          <Button onClick={handleSave} disabled={isSubmitting}>
+            {isSubmitting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+            Save Changes
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function AddOpenAICompatibleModelDialog({
+  onAdd,
+  onRefresh,
+}: {
+  onAdd: (provider: string, model: string, envApiKeyName: string, baseUrl?: string, nickname?: string, cmdRunner?: boolean, writeFilesToDisk?: boolean, shell?: string) => Promise<void>;
+  onRefresh: () => void;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [provider, setProvider] = useState('openai');
+  const [model, setModel] = useState('');
+  const [envApiKeyName, setEnvApiKeyName] = useState('OPENAI_API_KEY');
+  const [baseUrl, setBaseUrl] = useState('');
+  const [nickname, setNickname] = useState('');
+  const [cmdRunner, setCmdRunner] = useState(false);
+  const [shell, setShell] = useState('auto');
+  const [writeFilesToDisk, setWriteFilesToDisk] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const handleSubmit = async () => {
+    if (!provider || !model || !envApiKeyName) {
+      toast.error('Please fill in all required fields');
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      await onAdd(
+        provider,
+        model,
+        envApiKeyName,
+        baseUrl || undefined,
+        nickname || undefined,
+        cmdRunner,
+        writeFilesToDisk,
+        shell === 'auto' ? undefined : shell
+      );
+      toast.success('Model added');
+      onRefresh();
+      setIsOpen(false);
+      // Reset form
+      setProvider('openai');
+      setModel('');
+      setEnvApiKeyName('OPENAI_API_KEY');
+      setBaseUrl('');
+      setShell('auto');
+      setNickname('');
+      setCmdRunner(false);
+      setWriteFilesToDisk(false);
+    } catch (e: any) {
+      toast.error('Failed to add model', { description: e.message });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open={isOpen} onOpenChange={setIsOpen}>
+      <DialogTrigger asChild>
+        <Button size="sm">
+          <Plus className="h-4 w-4 mr-2" /> Add Model
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Add OpenAI Compatible Model</DialogTitle>
+          <DialogDescription>
+            Configure a model that uses an OpenAI-compatible API with an environment variable for authentication.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4 py-4">
+          <div className="grid gap-2">
+            <Label>Provider / Base URL *</Label>
+            <Input 
+              placeholder="e.g., openai, together, or https://api.example.com/v1" 
+              value={provider} 
+              onChange={e => setProvider(e.target.value)} 
+            />
+            <p className="text-xs text-muted-foreground">
+              Enter a provider name (e.g., "openai") or a full URL for custom endpoints.
+            </p>
+          </div>
+          <div className="grid gap-2">
+            <Label>Model *</Label>
+            <Input 
+              placeholder="e.g., gpt-4-turbo, mixtral-8x7b" 
+              value={model} 
+              onChange={e => setModel(e.target.value)} 
+            />
+          </div>
+          <div className="grid gap-2">
+            <Label>API Key Environment Variable *</Label>
+            <Input 
+              placeholder="e.g., OPENAI_API_KEY" 
+              value={envApiKeyName} 
+              onChange={e => setEnvApiKeyName(e.target.value)} 
+            />
+            <p className="text-xs text-muted-foreground">
+              The name of the environment variable containing the API key.
+            </p>
+          </div>
+          <div className="grid gap-2">
+            <Label>Base URL (optional)</Label>
+            <Input 
+              placeholder="e.g., https://api.openai.com/v1" 
+              value={baseUrl} 
+              onChange={e => setBaseUrl(e.target.value)} 
+            />
+            <p className="text-xs text-muted-foreground">
+              Override the default API endpoint. Leave empty for standard providers.
+            </p>
+          </div>
+          <div className="grid gap-2">
+            <Label>Nickname (optional)</Label>
+            <Input 
+              placeholder="e.g., GPT-4 Turbo" 
+              value={nickname} 
+              onChange={e => setNickname(e.target.value)} 
+            />
+          </div>
+          <div className="grid gap-2">
+            <Label>Shell Preference</Label>
+            <Select value={shell} onValueChange={setShell}>
+              <SelectTrigger>
+                <SelectValue placeholder="Select shell..." />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">Default (CMD)</SelectItem>
+                <SelectItem value="gitbash">Git Bash</SelectItem>
+                <SelectItem value="powershell">PowerShell</SelectItem>
+                <SelectItem value="wsl">WSL</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-[0.8rem] text-muted-foreground">
+              Preferred shell for running commands (Windows).
+            </p>
+          </div>
+          <div className="space-y-3 pt-2 border-t">
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <Label htmlFor="cmd-runner" className="text-sm">Command Runner</Label>
+                <p className="text-xs text-muted-foreground">Model can execute shell commands</p>
+              </div>
+              <Switch 
+                id="cmd-runner"
+                checked={cmdRunner} 
+                onCheckedChange={setCmdRunner} 
+              />
+            </div>
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <Label htmlFor="write-files" className="text-sm">Direct File Writes</Label>
+                <p className="text-xs text-muted-foreground">Model writes files directly instead of diffs</p>
+              </div>
+              <Switch 
+                id="write-files"
+                checked={writeFilesToDisk} 
+                onCheckedChange={setWriteFilesToDisk} 
+              />
+            </div>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => setIsOpen(false)}>Cancel</Button>
+          <Button onClick={handleSubmit} disabled={isSubmitting || !provider || !model || !envApiKeyName}>
+            {isSubmitting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+            Add Model
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function AddProviderDialog({ onAdd }: { onAdd: () => void }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [providerId, setProviderId] = useState('openai');
+  const [customId, setCustomId] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const handleSubmit = async () => {
+    const id = providerId === 'custom' ? customId : providerId;
+    if (!id) return;
+
+    setIsSubmitting(true);
+    try {
+      await http(`/api/settings/providers/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          providerId: id,
+          apiKey: apiKey,
+          enabled: true
+        }),
+        sendProjectId: false
+      });
+      toast.success('Provider added');
+      onAdd();
+      setIsOpen(false);
+      setApiKey('');
+      setCustomId('');
+    } catch (e) {
+      toast.error('Failed to add provider');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open={isOpen} onOpenChange={setIsOpen}>
+      <DialogTrigger asChild>
+        <Button size="sm">
+          <Plus className="h-4 w-4 mr-2" /> Add Provider
+        </Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Add LLM Provider</DialogTitle>
+          <DialogDescription>Configure a new provider for code generation.</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4 py-4">
+          <div className="grid gap-2">
+            <Label>Provider Type</Label>
+            <Select value={providerId} onValueChange={setProviderId}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="openai">OpenAI</SelectItem>
+                <SelectItem value="anthropic">Anthropic</SelectItem>
+                <SelectItem value="gemini">Google Gemini</SelectItem>
+                <SelectItem value="groq">Groq</SelectItem>
+                <SelectItem value="ollama">Ollama (Local)</SelectItem>
+                <SelectItem value="custom">Custom / Other</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          {providerId === 'custom' && (
+            <div className="grid gap-2">
+              <Label>Provider ID</Label>
+              <Input 
+                placeholder="e.g. mistral" 
+                value={customId} 
+                onChange={e => setCustomId(e.target.value)} 
+              />
+            </div>
+          )}
+
+          <div className="grid gap-2">
+            <Label>API Key</Label>
+            <Input 
+              type="password" 
+              placeholder="sk-..." 
+              value={apiKey} 
+              onChange={e => setApiKey(e.target.value)} 
+            />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => setIsOpen(false)}>Cancel</Button>
+          <Button onClick={handleSubmit} disabled={isSubmitting}>
+            {isSubmitting ? 'Adding...' : 'Add Provider'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function MobilePairingCard() {
+  const [otp, setOtp] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [expiry, setExpiry] = useState<Date | null>(null);
+
+  const generateCode = async () => {
+    setLoading(true);
+    try {
+      const res = await http<{ otp: string; expires_at: string }>('/api/auth/initiate-pairing', {
+        method: 'POST',
+        sendProjectId: false
+      });
+      setOtp(res.otp);
+      setExpiry(new Date(res.expires_at));
+    } catch (e) {
+      toast.error('Failed to generate pairing code');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base font-medium flex items-center gap-2">
+          <Smartphone className="h-5 w-5" />
+          Pair New Device
+        </CardTitle>
+        <CardDescription>
+          Generate a 6-character code to connect your mobile device.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {otp ? (
+          <div className="flex flex-col items-center justify-center p-6 bg-muted/30 rounded-lg border-2 border-dashed animate-in fade-in zoom-in-95 duration-200">
+            <div className="text-sm text-muted-foreground mb-2">Enter this code on your mobile device</div>
+            <div className="text-5xl font-mono font-bold tracking-[0.5em] text-primary mb-4 select-all">
+              {otp}
+            </div>
+            {expiry && (
+              <div className="text-xs text-muted-foreground">
+                Expires at {expiry.toLocaleTimeString()}
+              </div>
+            )}
+            <Button variant="outline" size="sm" className="mt-6" onClick={() => setOtp(null)}>
+              Done
+            </Button>
+          </div>
+        ) : (
+          <div className="flex items-center justify-between">
+            <p className="text-sm text-muted-foreground">
+              Click to generate a one-time pairing code.
+            </p>
+            <Button onClick={generateCode} disabled={loading}>
+              {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Plus className="mr-2 h-4 w-4" />}
+              Generate Code
+            </Button>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+# === TEST ===
+To address both issues, I will update `src_v2/pages/SettingsPage.tsx`.
+
+1.  **Add `PairedDevicesList` Component**: This component will fetch and display the list of paired devices from `/api/auth/paired-devices`. It will also include functionality to revoke devices.
+2.  **Restrict Access**: I will check `authService.isLocalhost()` and only render the "Mobile Access" section (both the pairing card and the device list) if the user is accessing the application from localhost.
+
+```diff
+--- src_v2/pages/SettingsPage.tsx
++++ src_v2/pages/SettingsPage.tsx
+@@ -2,6 +2,7 @@
+ import { 
+   Loader2, 
+   Plus, 
+   Trash2, 
++  Ban,
+   Pencil,
+   Eye, 
+   EyeOff, 
+   Save,
+   Smartphone,
+   TestTube2,
+   FileCode,
+   Shield,
+   RefreshCw,
+   Cpu,
+   Terminal,
+   HardDrive,
+   Check,
++  Laptop,
++  Clock,
+ } from 'lucide-react';
+ import { Button } from '../components/ui/button';
+ import { Input } from '../components/ui/input';
+ import { Label } from '../components/ui/label';
+ import { Switch } from '../components/ui/switch';
+ import { Card, CardContent, CardHeader, CardTitle, CardFooter, CardDescription } from '../components/ui/card';
+ import { ScrollArea } from '../components/ui/scroll-area';
+ import {
+   Dialog,
+   DialogContent,
+   DialogDescription,
+   DialogFooter,
+   DialogHeader,
+   DialogTitle,
+   DialogTrigger,
+ } from "../components/ui/dialog";
+ import {
+   Select,
+   SelectContent,
+   SelectItem,
+   SelectTrigger,
+   SelectValue,
+ } from "../components/ui/select";
+ import { RadioGroup, RadioGroupItem } from "../components/ui/radio-group";
+ import { useSettings, ProviderConfig, ValidatorConfig, ModelConfig } from '../hooks/useSettings';
+ import { http } from '../lib/http';
+ import { toast } from 'sonner';
++import { authService, PairedDevice } from '../lib/auth';
+ 
+ export default function SettingsPage() {
+   const { 
+     providers, 
+     validators, 
+     models,
+     loading, 
+     updateProvider, 
+     deleteProvider, 
+     updateValidators, 
+     refresh,
+     refreshModels,
+     addOpencodeModel,
+     addOpenAICompatibleModel,
+     toggleModel,
+     deleteModel,
+     updateModel,
+   } = useSettings();
+   const [theme, setTheme] = useState<'light' | 'dark' | 'system'>(
+     (localStorage.getItem('theme') as any) || 'system'
+   );
++  
++  // Check if we are on localhost to enable pairing features
++  const isLocalhost = authService.isLocalhost();
+ 
+   const handleThemeChange = (newTheme: 'light' | 'dark' | 'system') => {
+     setTheme(newTheme);
+     localStorage.setItem('theme', newTheme);
+ 
+     if (newTheme === 'dark' || (newTheme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+       document.documentElement.classList.add('dark');
+     } else {
+       document.documentElement.classList.remove('dark');
+     }
+   };
+ 
+ 
+   return (
+     <div className="flex flex-col h-full bg-background">
+       <header className="flex items-center justify-between p-6 border-b flex-shrink-0">
+         <div>
+           <h1 className="text-2xl font-bold tracking-tight">Settings</h1>
+           <p className="text-muted-foreground">Manage global application configuration.</p>
+         </div>
+       </header>
+ 
+       <ScrollArea className="flex-1">
+         <div className="p-6 pb-20 max-w-4xl mx-auto space-y-8">
+ 
+           {/* Appearance Section */}
+           <section className="space-y-4">
+             <div>
+               <h2 className="text-lg font-semibold">Appearance</h2>
+               <p className="text-sm text-muted-foreground">Customize the look and feel.</p>
+             </div>
+             <Card>
+               <CardContent className="pt-6">
+                 <div className="flex items-center justify-between">
+                   <div className="space-y-1">
+                     <Label>Theme</Label>
+                     <div className="text-sm text-muted-foreground">
+                       Select your preferred interface theme.
+                     </div>
+                   </div>
+                   <div className="flex gap-2">
+                     <Button 
+                       variant={theme === 'light' ? 'default' : 'outline'} 
+                       size="sm" 
+                       onClick={() => handleThemeChange('light')}
+                     >
+                       Light
+                     </Button>
+                     <Button 
+                       variant={theme === 'dark' ? 'default' : 'outline'} 
+                       size="sm" 
+                       onClick={() => handleThemeChange('dark')}
+                     >
+                       Dark
+                     </Button>
+                     <Button 
+                       variant={theme === 'system' ? 'default' : 'outline'} 
+                       size="sm" 
+                       onClick={() => handleThemeChange('system')}
+                     >
+                       System
+                     </Button>
+                   </div>
+                 </div>
+               </CardContent>
+             </Card>
+           </section>
+ 
+           {/* LLM Providers */}
+           <section className="space-y-4 scroll-mt-20">
+             <div className="flex items-center justify-between">
+               <div>
+                 <h2 className="text-lg font-semibold">LLM Providers</h2>
+                 <p className="text-sm text-muted-foreground">Configure AI models for code generation.</p>
+               </div>
+               <AddProviderDialog onAdd={refresh} />
+             </div>
+ 
+             <div className="grid gap-4">
+               {loading && providers.length === 0 ? (
+                 <div className="flex items-center justify-center p-8 border rounded-lg border-dashed">
+                   <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+                 </div>
+               ) : providers.length === 0 ? (
+                 <div className="text-center p-8 border rounded-lg border-dashed text-muted-foreground">
+                   No providers configured. Add one to get started.
+                 </div>
+               ) : (
+                 providers.map(provider => (
+                   <ProviderCard 
+                     key={provider.providerId} 
+                     provider={provider} 
+                     onUpdate={updateProvider}
+                     onDelete={deleteProvider}
+                   />
+                 ))
+               )}
+             </div>
+           </section>
+ 
+           {/* Mobile Access */}
+-          <section className="space-y-4 scroll-mt-20">
+-            <div className="flex items-center justify-between">
+-              <div>
+-                <h2 className="text-lg font-semibold">Mobile Access</h2>
+-                <p className="text-sm text-muted-foreground">Connect mobile devices via P2P for remote editing.</p>
++          {isLocalhost && (
++            <section className="space-y-4 scroll-mt-20">
++              <div className="flex items-center justify-between">
++                <div>
++                  <h2 className="text-lg font-semibold">Mobile Access</h2>
++                  <p className="text-sm text-muted-foreground">Connect mobile devices via P2P for remote editing.</p>
++                </div>
+               </div>
+-            </div>
+-            <MobilePairingCard />
+-          </section>
++              <div className="grid gap-4">
++                <MobilePairingCard />
++                <PairedDevicesList />
++              </div>
++            </section>
++          )}
+ 
+           {/* Validators */}
+           <section className="space-y-4 scroll-mt-20">
+             <div>
+               <h2 className="text-lg font-semibold">Validators</h2>
+               <p className="text-sm text-muted-foreground">Configure lint, typecheck, and test behaviors.</p>
+             </div>
+             <ValidatorSettingsCard validators={validators} onUpdate={updateValidators} />
+           </section>
+ 
+           {/* OpenCode Models */}
+           <section className="space-y-4 scroll-mt-20">
+             <div className="flex items-center justify-between">
+               <div>
+                 <h2 className="text-lg font-semibold">OpenCode Models</h2>
+                 <p className="text-sm text-muted-foreground">
+                   Add models from the OpenCode CLI. These use your existing OpenCode authentication.
+                 </p>
+               </div>
+             </div>
+             <OpencodeModelsCard 
+               configuredModels={models.filter(m => m.provider.startsWith('opencode-'))}
+               onAddModel={addOpencodeModel}
+               onToggleModel={toggleModel}
+               onDeleteModel={deleteModel}
+               onRefresh={refreshModels}
+               onUpdateModel={updateModel}
+             />
+           </section>
+ 
+           {/* OpenAI Compatible Models */}
+           <section className="space-y-4 scroll-mt-20">
+             <div className="flex items-center justify-between">
+               <div>
+                 <h2 className="text-lg font-semibold">OpenAI Compatible Models</h2>
+                 <p className="text-sm text-muted-foreground">
+                   Add custom OpenAI-compatible models using environment variable API keys.
+                 </p>
+               </div>
+               <AddOpenAICompatibleModelDialog onAdd={addOpenAICompatibleModel} onRefresh={refreshModels} />
+             </div>
+             <ConfiguredModelsCard 
+               models={models.filter(m => !m.provider.startsWith('opencode-'))}
+               onToggleModel={toggleModel}
+               onDeleteModel={deleteModel}
+               onUpdateModel={updateModel}
+             />
+           </section>
+         </div>
+       </ScrollArea>
+     </div>
+   );
+ }
+ 
+ function ProviderCard({ 
+   provider, 
+   onUpdate, 
+   onDelete 
+ }: { 
+   provider: ProviderConfig; 
+   onUpdate: (id: string, cfg: Partial<ProviderConfig>) => Promise<void>; 
+   onDelete: (id: string) => Promise<void>;
+ }) {
+@@ -770,3 +771,76 @@
+     </Card>
+   );
+ }
++
++function PairedDevicesList() {
++  const [devices, setDevices] = useState<PairedDevice[]>([]);
++  const [loading, setLoading] = useState(true);
++
++  const fetchDevices = useCallback(async () => {
++    try {
++      const data = await http<PairedDevice[]>('/api/auth/paired-devices', { sendProjectId: false });
++      setDevices(data);
++    } catch (e) {
++      // Silent fail
++    } finally {
++      setLoading(false);
++    }
++  }, []);
++
++  useEffect(() => {
++    fetchDevices();
++  }, [fetchDevices]);
++
++  const revokeDevice = async (id: string) => {
++    if (!confirm('Are you sure you want to revoke this device? It will be disconnected immediately.')) return;
++    
++    try {
++      await http('/api/auth/revoke-device', {
++        method: 'POST',
++        body: JSON.stringify({ device_id: id }),
++        sendProjectId: false
++      });
++      toast.success('Device revoked');
++      fetchDevices();
++    } catch (e) {
++      toast.error('Failed to revoke device');
++    }
++  };
++
++  if (loading && devices.length === 0) return null;
++  if (!loading && devices.length === 0) return null;
++
++  return (
++    <Card>
++      <CardHeader className="pb-3">
++        <div className="flex items-center justify-between">
++          <CardTitle className="text-base font-medium flex items-center gap-2">
++            <Laptop className="h-5 w-5" />
++            Paired Devices
++          </CardTitle>
++          <Button variant="ghost" size="icon" className="h-8 w-8" onClick={fetchDevices}>
++            <RefreshCw className="h-4 w-4" />
++          </Button>
++        </div>
++      </CardHeader>
++      <CardContent className="space-y-3">
++        {devices.map(device => (
++          <div key={device.id} className="flex items-center justify-between p-3 bg-muted/30 rounded-md border">
++            <div className="space-y-1">
++              <div className="flex items-center gap-2 font-medium">
++                <Smartphone className="h-4 w-4 text-muted-foreground" />
++                {device.name}
++              </div>
++              <div className="flex items-center gap-3 text-xs text-muted-foreground">
++                <span className="flex items-center gap-1">
++                  <Clock className="h-3 w-3" /> Paired {new Date(device.pairedAt).toLocaleDateString()}
++                </span>
++              </div>
++            </div>
++            <Button variant="ghost" size="sm" className="h-8 text-destructive hover:text-destructive hover:bg-destructive/10" onClick={() => revokeDevice(device.id)}>
++              <Ban className="h-4 w-4 mr-2" /> Revoke
++            </Button>
++          </div>
++        ))}
++      </CardContent>
++    </Card>
++  );
++}
+```
+
+# === RESULT ===
+import { useState, useEffect, useCallback } from 'react';
+import { 
+  Loader2, 
+  Plus, 
+  Trash2, 
+  Ban,
+  Pencil,
+  Eye, 
+  EyeOff, 
+  Save,
+  Smartphone,
+  TestTube2,
+  FileCode,
+  Shield,
+  RefreshCw,
+  Cpu,
+  Terminal,
+  HardDrive,
+  Check,
+  Laptop,
+  Clock,
+} from 'lucide-react';
+import { Button } from '../components/ui/button';
+import { Input } from '../components/ui/input';
+import { Label } from '../components/ui/label';
+import { Switch } from '../components/ui/switch';
+import { Card, CardContent, CardHeader, CardTitle, CardFooter, CardDescription } from '../components/ui/card';
+import { ScrollArea } from '../components/ui/scroll-area';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "../components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../components/ui/select";
+import { RadioGroup, RadioGroupItem } from "../components/ui/radio-group";
+import { useSettings, ProviderConfig, ValidatorConfig, ModelConfig } from '../hooks/useSettings';
+import { http } from '../lib/http';
+import { toast } from 'sonner';
+import { authService, PairedDevice } from '../lib/auth';
+
+export default function SettingsPage() {
+  const { 
+    providers, 
+    validators, 
+    models,
+    loading, 
+    updateProvider, 
+    deleteProvider, 
+    updateValidators, 
+    refresh,
+    refreshModels,
+    addOpencodeModel,
+    addOpenAICompatibleModel,
+    toggleModel,
+    deleteModel,
+    updateModel,
+  } = useSettings();
+  const [theme, setTheme] = useState<'light' | 'dark' | 'system'>(
+    (localStorage.getItem('theme') as any) || 'system'
+  );
+  
+  // Check if we are on localhost to enable pairing features
+  const isLocalhost = authService.isLocalhost();
+
+  const handleThemeChange = (newTheme: 'light' | 'dark' | 'system') => {
+    setTheme(newTheme);
+    localStorage.setItem('theme', newTheme);
+
+    if (newTheme === 'dark' || (newTheme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  };
+
+
+  return (
+    <div className="flex flex-col h-full bg-background">
+      <header className="flex items-center justify-between p-6 border-b flex-shrink-0">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight">Settings</h1>
+          <p className="text-muted-foreground">Manage global application configuration.</p>
+        </div>
+      </header>
+
+      <ScrollArea className="flex-1">
+        <div className="p-6 pb-20 max-w-4xl mx-auto space-y-8">
+
+          {/* Appearance Section */}
+          <section className="space-y-4">
+            <div>
+              <h2 className="text-lg font-semibold">Appearance</h2>
+              <p className="text-sm text-muted-foreground">Customize the look and feel.</p>
+            </div>
+            <Card>
+              <CardContent className="pt-6">
+                <div className="flex items-center justify-between">
+                  <div className="space-y-1">
+                    <Label>Theme</Label>
+                    <div className="text-sm text-muted-foreground">
+                      Select your preferred interface theme.
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button 
+                      variant={theme === 'light' ? 'default' : 'outline'} 
+                      size="sm" 
+                      onClick={() => handleThemeChange('light')}
+                    >
+                      Light
+                    </Button>
+                    <Button 
+                      variant={theme === 'dark' ? 'default' : 'outline'} 
+                      size="sm" 
+                      onClick={() => handleThemeChange('dark')}
+                    >
+                      Dark
+                    </Button>
+                    <Button 
+                      variant={theme === 'system' ? 'default' : 'outline'} 
+                      size="sm" 
+                      onClick={() => handleThemeChange('system')}
+                    >
+                      System
+                    </Button>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          </section>
+
+          {/* LLM Providers */}
+          <section className="space-y-4 scroll-mt-20">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">LLM Providers</h2>
+                <p className="text-sm text-muted-foreground">Configure AI models for code generation.</p>
+              </div>
+              <AddProviderDialog onAdd={refresh} />
+            </div>
+
+            <div className="grid gap-4">
+              {loading && providers.length === 0 ? (
+                <div className="flex items-center justify-center p-8 border rounded-lg border-dashed">
+                  <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+                </div>
+              ) : providers.length === 0 ? (
+                <div className="text-center p-8 border rounded-lg border-dashed text-muted-foreground">
+                  No providers configured. Add one to get started.
+                </div>
+              ) : (
+                providers.map(provider => (
+                  <ProviderCard 
+                    key={provider.providerId} 
+                    provider={provider} 
+                    onUpdate={updateProvider}
+                    onDelete={deleteProvider}
+                  />
+                ))
+              )}
+            </div>
+          </section>
+
+          {/* Mobile Access */}
+          {isLocalhost && (
+            <section className="space-y-4 scroll-mt-20">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h2 className="text-lg font-semibold">Mobile Access</h2>
+                  <p className="text-sm text-muted-foreground">Connect mobile devices via P2P for remote editing.</p>
+                </div>
+              </div>
+              <div className="grid gap-4">
+                <MobilePairingCard />
+                <PairedDevicesList />
+              </div>
+            </section>
+          )}
+
+          {/* Validators */}
+          <section className="space-y-4 scroll-mt-20">
+            <div>
+              <h2 className="text-lg font-semibold">Validators</h2>
+              <p className="text-sm text-muted-foreground">Configure lint, typecheck, and test behaviors.</p>
+            </div>
+            <ValidatorSettingsCard validators={validators} onUpdate={updateValidators} />
+          </section>
+
+          {/* OpenCode Models */}
+          <section className="space-y-4 scroll-mt-20">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">OpenCode Models</h2>
+                <p className="text-sm text-muted-foreground">
+                  Add models from the OpenCode CLI. These use your existing OpenCode authentication.
+                </p>
+              </div>
+            </div>
+            <OpencodeModelsCard 
+              configuredModels={models.filter(m => m.provider.startsWith('opencode-'))}
+              onAddModel={addOpencodeModel}
+              onToggleModel={toggleModel}
+              onDeleteModel={deleteModel}
+              onRefresh={refreshModels}
+              onUpdateModel={updateModel}
+            />
+          </section>
+
+          {/* OpenAI Compatible Models */}
+          <section className="space-y-4 scroll-mt-20">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">OpenAI Compatible Models</h2>
+                <p className="text-sm text-muted-foreground">
+                  Add custom OpenAI-compatible models using environment variable API keys.
+                </p>
+              </div>
+              <AddOpenAICompatibleModelDialog onAdd={addOpenAICompatibleModel} onRefresh={refreshModels} />
+            </div>
+            <ConfiguredModelsCard 
+              models={models.filter(m => !m.provider.startsWith('opencode-'))}
+              onToggleModel={toggleModel}
+              onDeleteModel={deleteModel}
+              onUpdateModel={updateModel}
+            />
+          </section>
+        </div>
+      </ScrollArea>
+    </div>
+  );
+}
+
+function ProviderCard({ 
+  provider, 
+  onUpdate, 
+  onDelete 
+}: { 
+  provider: ProviderConfig; 
+  onUpdate: (id: string, cfg: Partial<ProviderConfig>) => Promise<void>; 
+  onDelete: (id: string) => Promise<void>;
+}) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [apiKey, setApiKey] = useState('');
+  const [baseUrl, setBaseUrl] = useState(provider.baseUrl || '');
+  const [isSaving, setIsSaving] = useState(false);
+  const [showApiKey, setShowApiKey] = useState(false);
+
+  const handleSave = async () => {
+    setIsSaving(true);
+    try {
+      await onUpdate(provider.providerId, {
+        apiKey: apiKey || undefined, // Only send if changed/provided
+        baseUrl: baseUrl || undefined,
+      });
+      setIsEditing(false);
+      setApiKey(''); // Clear local state
+      toast.success(`${provider.providerId} updated`);
+    } catch (e) {
+      toast.error('Failed to update provider');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleToggle = async (enabled: boolean) => {
+    try {
+      await onUpdate(provider.providerId, { enabled });
+      toast.success(enabled ? 'Provider enabled' : 'Provider disabled');
+    } catch (e) {
+      toast.error('Failed to toggle provider');
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-base font-medium flex items-center gap-2">
+            <span className="capitalize">{provider.providerId}</span>
+            {provider.name && <span className="text-muted-foreground font-normal text-sm">({provider.name})</span>}
+          </CardTitle>
+          <div className="flex items-center gap-2">
+            <Switch 
+              checked={provider.enabled} 
+              onCheckedChange={handleToggle}
+            />
+            {!isEditing && (
+              <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground" onClick={() => setIsEditing(true)}>
+                <Save className="h-4 w-4" />
+              </Button>
+            )}
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              className="h-8 w-8 text-muted-foreground hover:text-destructive"
+              onClick={() => {
+                if(confirm('Are you sure you want to delete this configuration?')) {
+                  onDelete(provider.providerId);
+                }
+              }}
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+
+      {isEditing ? (
+        <CardContent className="space-y-4">
+          <div className="grid gap-2">
+            <Label>API Key</Label>
+            <div className="relative">
+              <Input 
+                type={showApiKey ? "text" : "password"} 
+                placeholder={provider.apiKey ? "********" : "Enter API Key"}
+                value={apiKey}
+                onChange={e => setApiKey(e.target.value)}
+                className="pr-10"
+              />
+              <button 
+                type="button"
+                onClick={() => setShowApiKey(!showApiKey)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              >
+                {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </button>
+            </div>
+            <p className="text-[0.8rem] text-muted-foreground">Leave blank to keep existing key.</p>
+          </div>
+          <div className="grid gap-2">
+            <Label>Base URL (Optional)</Label>
+            <Input 
+              placeholder="https://api.example.com/v1" 
+              value={baseUrl}
+              onChange={e => setBaseUrl(e.target.value)}
+            />
+          </div>
+        </CardContent>
+      ) : (
+        <CardContent className="py-2 text-sm text-muted-foreground">
+          <div className="flex gap-4">
+            <div className="flex flex-col">
+              <span className="text-xs uppercase font-semibold text-muted-foreground/70">Status</span>
+              <span className={provider.enabled ? "text-green-600 dark:text-green-400" : "text-muted-foreground"}>
+                {provider.enabled ? "Enabled" : "Disabled"}
+              </span>
+            </div>
+            {provider.baseUrl && (
+              <div className="flex flex-col">
+                <span className="text-xs uppercase font-semibold text-muted-foreground/70">Base URL</span>
+                <span className="truncate max-w-[200px]">{provider.baseUrl}</span>
+              </div>
+            )}
+          </div>
+        </CardContent>
+      )}
+
+      {isEditing && (
+        <CardFooter className="flex justify-end gap-2 bg-muted/20 pt-4">
+          <Button variant="ghost" size="sm" onClick={() => setIsEditing(false)} disabled={isSaving}>
+            Cancel
+          </Button>
+          <Button size="sm" onClick={handleSave} disabled={isSaving}>
+            {isSaving && <Loader2 className="mr-2 h-3 w-3 animate-spin" />}
+            Save Changes
+          </Button>
+        </CardFooter>
+      )}
+    </Card>
+  );
+}
+
+function ValidatorSettingsCard({ 
+  validators, 
+  onUpdate 
+}: { 
+  validators: ValidatorConfig; 
+  onUpdate: (updates: Partial<ValidatorConfig>) => Promise<void>;
+}) {
+  const handleLintToggle = async (enabled: boolean) => {
+    try {
+      await onUpdate({ lint: { ...validators.lint, enabled } });
+    } catch {
+      toast.error('Failed to update lint settings');
+    }
+  };
+
+  const handleLintRuleset = async (ruleset: 'recommended' | 'strict' | 'custom') => {
+    try {
+      await onUpdate({ lint: { ...validators.lint, ruleset } });
+    } catch {
+      toast.error('Failed to update lint ruleset');
+    }
+  };
+
+  const handleTypecheckToggle = async (enabled: boolean) => {
+    try {
+      await onUpdate({ typecheck: { ...validators.typecheck, enabled } });
+    } catch {
+      toast.error('Failed to update typecheck settings');
+    }
+  };
+
+  const handleTestsToggle = async (enabled: boolean) => {
+    try {
+      await onUpdate({ tests: { ...validators.tests, enabled } });
+    } catch {
+      toast.error('Failed to update tests settings');
+    }
+  };
+
+  const handleTestsMode = async (mode: 'all' | 'impacted') => {
+    try {
+      await onUpdate({ tests: { ...validators.tests, mode } });
+    } catch {
+      toast.error('Failed to update tests mode');
+    }
+  };
+
+  const handleFastIteration = async (fastIteration: boolean) => {
+    try {
+      await onUpdate({ fastIteration });
+    } catch {
+      toast.error('Failed to update fast iteration setting');
+    }
+  };
+
+  return (
+    <Card>
+      <CardContent className="pt-6 space-y-6">
+        {/* Fast Iteration Toggle */}
+        <div className="flex items-center justify-between rounded-lg border p-3 shadow-sm">
+          <div className="space-y-0.5">
+            <Label htmlFor="fast-iteration" className="text-base font-medium">
+              Fast Iteration
+            </Label>
+            <p className="text-xs text-muted-foreground">
+              Skip full validation if syntax is correct.
+            </p>
+          </div>
+          <Switch
+            id="fast-iteration"
+            checked={validators.fastIteration ?? false}
+            onCheckedChange={handleFastIteration}
+          />
+        </div>
+
+        {/* Lint Settings */}
+        <div className="space-y-4">
+          <div className="flex items-center space-x-3">
+            <Switch
+              id="lint-enabled"
+              checked={validators.lint.enabled}
+              onCheckedChange={handleLintToggle}
+            />
+            <div className="flex items-center gap-2">
+              <Shield className="h-4 w-4 text-blue-500" />
+              <Label htmlFor="lint-enabled" className="text-base font-medium">
+                Lint
+              </Label>
+            </div>
+          </div>
+          {validators.lint.enabled && (
+            <div className="pl-8 space-y-2">
+              <Label className="text-sm text-muted-foreground">Ruleset</Label>
+              <RadioGroup
+                value={validators.lint.ruleset}
+                onValueChange={(value) => handleLintRuleset(value as 'recommended' | 'strict' | 'custom')}
+                className="flex flex-col gap-2"
+              >
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="recommended" id="lint-recommended" />
+                  <Label htmlFor="lint-recommended" className="font-normal">Recommended</Label>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="strict" id="lint-strict" />
+                  <Label htmlFor="lint-strict" className="font-normal">Strict</Label>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="custom" id="lint-custom" />
+                  <Label htmlFor="lint-custom" className="font-normal">Custom</Label>
+                </div>
+              </RadioGroup>
+            </div>
+          )}
+        </div>
+
+        {/* Typecheck Settings */}
+        <div className="space-y-2">
+          <div className="flex items-center space-x-3">
+            <Switch
+              id="typecheck-enabled"
+              checked={validators.typecheck.enabled}
+              onCheckedChange={handleTypecheckToggle}
+            />
+            <div className="flex items-center gap-2">
+              <FileCode className="h-4 w-4 text-purple-500" />
+              <Label htmlFor="typecheck-enabled" className="text-base font-medium">
+                Typecheck
+              </Label>
+            </div>
+          </div>
+        </div>
+
+        {/* Tests Settings */}
+        <div className="space-y-4">
+          <div className="flex items-center space-x-3">
+            <Switch
+              id="tests-enabled"
+              checked={validators.tests.enabled}
+              onCheckedChange={handleTestsToggle}
+            />
+            <div className="flex items-center gap-2">
+              <TestTube2 className="h-4 w-4 text-green-500" />
+              <Label htmlFor="tests-enabled" className="text-base font-medium">
+                Tests
+              </Label>
+            </div>
+          </div>
+          {validators.tests.enabled && (
+            <div className="pl-8 space-y-2">
+              <Label className="text-sm text-muted-foreground">Mode</Label>
+              <RadioGroup
+                value={validators.tests.mode}
+                onValueChange={(value) => handleTestsMode(value as 'all' | 'impacted')}
+                className="flex flex-col gap-2"
+              >
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="impacted" id="tests-impacted" />
+                  <Label htmlFor="tests-impacted" className="font-normal">Impacted only</Label>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="all" id="tests-all" />
+                  <Label htmlFor="tests-all" className="font-normal">All tests</Label>
+                </div>
+              </RadioGroup>
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ==================== OpenCode Models Components ====================
+
+function OpencodeModelsCard({
+  configuredModels,
+  onAddModel,
+  onToggleModel,
+  onDeleteModel,
+  onRefresh,
+  onUpdateModel,
+}: {
+  configuredModels: ModelConfig[];
+  onAddModel: (provider: string, model: string, nickname?: string, cmdRunner?: boolean, writeFilesToDisk?: boolean, shell?: string) => Promise<void>;
+  onToggleModel: (modelId: string, enabled: boolean) => Promise<void>;
+  onDeleteModel: (modelId: string) => Promise<void>;
+  onRefresh: () => void;
+  onUpdateModel: (modelId: string, updates: Partial<ModelConfig>) => Promise<void>;
+}) {
+  const [availableModels, setAvailableModels] = useState<Record<string, string[]>>({});
+  const [isLoadingModels, setIsLoadingModels] = useState(false);
+  const [addingModel, setAddingModel] = useState<string | null>(null);
+  const [editingModel, setEditingModel] = useState<ModelConfig | null>(null);
+
+  const fetchAvailableModels = useCallback(async () => {
+    setIsLoadingModels(true);
+    try {
+      const models = await http<Record<string, string[]>>('/api/models-config/opencode-available', { sendProjectId: false });
+      setAvailableModels(models);
+    } catch (error: any) {
+      toast.error("Failed to fetch OpenCode models", { description: error.message });
+      setAvailableModels({});
+    } finally {
+      setIsLoadingModels(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchAvailableModels();
+  }, [fetchAvailableModels]);
+
+  const handleAddModel = async (provider: string, model: string) => {
+    const fullModelId = `opencode-${provider}:${model}`;
+    setAddingModel(fullModelId);
+    try {
+      await onAddModel(provider, model);
+      toast.success(`Added ${provider}/${model}`);
+    } catch (error: any) {
+      toast.error("Failed to add model", { description: error.message });
+    } finally {
+      setAddingModel(null);
+    }
+  };
+
+  const isModelConfigured = (provider: string, model: string) => {
+    return configuredModels.some(m => m.provider === `opencode-${provider}` && m.model === `${provider}/${model}`);
+  };
+
+  return (
+    <>
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-base font-medium flex items-center gap-2">
+              <Cpu className="h-5 w-5" />
+              Available OpenCode Models
+            </CardTitle>
+            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={fetchAvailableModels} disabled={isLoadingModels}>
+              {isLoadingModels ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            </Button>
+          </div>
+          <CardDescription>
+            Models available via the <code className="text-xs bg-muted px-1 py-0.5 rounded">opencode models</code> command.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {Object.keys(availableModels).length > 0 ? (
+            <div className="space-y-4">
+              {Object.entries(availableModels).map(([provider, models]) => (
+                <div key={provider} className="space-y-2">
+                  <h4 className="text-sm font-medium capitalize">{provider}</h4>
+                  <div className="grid gap-2">
+                    {models.map(model => {
+                      const configured = isModelConfigured(provider, model);
+                      const fullId = `opencode-${provider}:${provider}/${model}`;
+                      const configuredModel = configuredModels.find(m => m.id === fullId);
+
+                      return (
+                        <div key={model} className="flex items-center justify-between py-2 px-3 bg-muted/30 rounded-md">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-mono">{model}</span>
+                            {configured && (
+                              <span className="text-xs text-green-600 dark:text-green-400 flex items-center gap-1">
+                                <Check className="h-3 w-3" /> Added
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {configured && configuredModel ? (
+                              <>
+                                <Switch
+                                  checked={configuredModel.enabled}
+                                  onCheckedChange={(enabled) => onToggleModel(configuredModel.id, enabled)}
+                                />
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-7 w-7 text-muted-foreground"
+                                  onClick={() => setEditingModel(configuredModel)}
+                                >
+                                  <Pencil className="h-3.5 w-3.5" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-7 w-7 text-muted-foreground hover:text-destructive"
+                                  onClick={() => {
+                                    if (confirm(`Remove ${model}?`)) {
+                                      onDeleteModel(configuredModel.id);
+                                    }
+                                  }}
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </Button>
+                              </>
+                            ) : (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-7"
+                                onClick={() => handleAddModel(provider, model)}
+                                disabled={addingModel === fullId}
+                              >
+                                {addingModel === fullId ? (
+                                  <Loader2 className="h-3 w-3 animate-spin" />
+                                ) : (
+                                  <>
+                                    <Plus className="h-3 w-3 mr-1" /> Add
+                                  </>
+                                )}
+                              </Button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-center py-8 text-muted-foreground">
+              {isLoadingModels ? (
+                <div className="flex items-center justify-center gap-2">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  <span>Loading models...</span>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <p>No OpenCode models found.</p>
+                  <p className="text-xs">Make sure the OpenCode CLI is installed and authenticated.</p>
+                </div>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {editingModel && (
+        <EditModelDialog 
+          model={editingModel} 
+          open={!!editingModel} 
+          onOpenChange={(open) => !open && setEditingModel(null)} 
+          onSave={onUpdateModel}
+        />
+      )}
+    </>
+  );
+}
+
+// ==================== OpenAI Compatible Models Components ====================
+
+function ConfiguredModelsCard({
+  models,
+  onToggleModel,
+  onDeleteModel,
+  onUpdateModel,
+}: {
+  models: ModelConfig[];
+  onToggleModel: (modelId: string, enabled: boolean) => Promise<void>;
+  onDeleteModel: (modelId: string) => Promise<void>;
+  onUpdateModel: (modelId: string, updates: Partial<ModelConfig>) => Promise<void>;
+}) {
+  const [editingModel, setEditingModel] = useState<ModelConfig | null>(null);
+
+  if (models.length === 0) {
+    return (
+      <Card>
+        <CardContent className="py-8">
+          <div className="text-center text-muted-foreground">
+            <p>No OpenAI-compatible models configured.</p>
+            <p className="text-xs mt-1">Add one using the button above.</p>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+function PairedDevicesList() {
+  const [devices, setDevices] = useState<PairedDevice[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const fetchDevices = useCallback(async () => {
+    try {
+      const data = await http<PairedDevice[]>('/api/auth/paired-devices', { sendProjectId: false });
+      setDevices(data);
+    } catch (e) {
+      // Silent fail
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchDevices();
+  }, [fetchDevices]);
+
+  const revokeDevice = async (id: string) => {
+    if (!confirm('Are you sure you want to revoke this device? It will be disconnected immediately.')) return;
+    
+    try {
+      await http('/api/auth/revoke-device', {
+        method: 'POST',
+        body: JSON.stringify({ device_id: id }),
+        sendProjectId: false
+      });
+      toast.success('Device revoked');
+      fetchDevices();
+    } catch (e) {
+      toast.error('Failed to revoke device');
+    }
+  };
+
+  if (loading && devices.length === 0) return null;
+  if (!loading && devices.length === 0) return null;
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-base font-medium flex items-center gap-2">
+            <Laptop className="h-5 w-5" />
+            Paired Devices
+          </CardTitle>
+          <Button variant="ghost" size="icon" className="h-8 w-8" onClick={fetchDevices}>
+            <RefreshCw className="h-4 w-4" />
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {devices.map(device => (
+          <div key={device.id} className="flex items-center justify-between p-3 bg-muted/30 rounded-md border">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 font-medium">
+                <Smartphone className="h-4 w-4 text-muted-foreground" />
+                {device.name}
+              </div>
+              <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                <span className="flex items-center gap-1">
+                  <Clock className="h-3 w-3" /> Paired {new Date(device.pairedAt).toLocaleDateString()}
+                </span>
+              </div>
+            </div>
+            <Button variant="ghost" size="sm" className="h-8 text-destructive hover:text-destructive hover:bg-destructive/10" onClick={() => revokeDevice(device.id)}>
+              <Ban className="h-4 w-4 mr-2" /> Revoke
+            </Button>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
+  return (
+    <>
+      <Card>
+        <CardContent className="pt-6">
+          <div className="space-y-3">
+            {models.map(model => (
+              <div key={model.id} className="flex items-center justify-between py-2 px-3 bg-muted/30 rounded-md">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium text-sm truncate">{model.nickname}</span>
+                    <span className="text-xs text-muted-foreground font-mono">{model.provider}/{model.model}</span>
+                  </div>
+                  <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
+                    {model.envApiKeyName && (
+                      <span className="flex items-center gap-1">
+                        <code className="bg-muted px-1 py-0.5 rounded">${model.envApiKeyName}</code>
+                      </span>
+                    )}
+                    {model.baseUrl && (
+                      <span className="flex items-center gap-1 truncate max-w-[200px]">
+                        {model.baseUrl}
+                      </span>
+                    )}
+                    {model.cmdRunner && (
+                      <span className="flex items-center gap-1">
+                        <Terminal className="h-3 w-3" /> Can run commands
+                      </span>
+                    )}
+                    {model.writeFilesToDisk && (
+                      <span className="flex items-center gap-1">
+                        <HardDrive className="h-3 w-3" /> Direct file writes
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Switch
+                    checked={model.enabled}
+                    onCheckedChange={(enabled) => onToggleModel(model.id, enabled)}
+                  />
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 text-muted-foreground"
+                    onClick={() => setEditingModel(model)}
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 text-muted-foreground hover:text-destructive"
+                    onClick={() => {
+                      if (confirm(`Remove ${model.nickname}?`)) {
+                        onDeleteModel(model.id);
+                      }
+                    }}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+
+      {editingModel && (
+        <EditModelDialog 
+          model={editingModel} 
+          open={!!editingModel} 
+          onOpenChange={(open) => !open && setEditingModel(null)} 
+          onSave={onUpdateModel}
+        />
+      )}
+    </>
+  );
+}
+
+function EditModelDialog({
+  model,
+  open,
+  onOpenChange,
+  onSave,
+}: {
+  model: ModelConfig;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSave: (id: string, updates: Partial<ModelConfig>) => Promise<void>;
+}) {
+  const [nickname, setNickname] = useState(model.nickname);
+  const [cmdRunner, setCmdRunner] = useState(model.cmdRunner);
+  const [writeFilesToDisk, setWriteFilesToDisk] = useState(model.writeFilesToDisk);
+  const [envApiKeyName, setEnvApiKeyName] = useState(model.envApiKeyName || '');
+  const [shell, setShell] = useState(model.shell || '');
+  const [baseUrl, setBaseUrl] = useState(model.baseUrl || '');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Update state when model changes (e.g. if dialog is reused or model prop updates)
+  useEffect(() => {
+    setNickname(model.nickname);
+    setShell(model.shell || '');
+    setCmdRunner(model.cmdRunner);
+    setWriteFilesToDisk(model.writeFilesToDisk);
+    setEnvApiKeyName(model.envApiKeyName || '');
+    setBaseUrl(model.baseUrl || '');
+  }, [model]);
+
+  const isOpencode = model.provider.startsWith('opencode-');
+
+  const handleSave = async () => {
+    setIsSubmitting(true);
+    try {
+      const updates: Partial<ModelConfig> = {
+        nickname,
+        cmdRunner,
+        shell: shell === 'auto' ? undefined : shell,
+        writeFilesToDisk,
+      };
+
+      if (!isOpencode) {
+        updates.envApiKeyName = envApiKeyName;
+        updates.baseUrl = baseUrl || undefined;
+      }
+
+      await onSave(model.id, updates);
+      onOpenChange(false);
+      toast.success('Model updated');
+    } catch (e: any) {
+      toast.error('Failed to update model', { description: e.message });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Edit Model</DialogTitle>
+          <DialogDescription>
+            Update configuration for {model.nickname}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4 py-4">
+          <div className="grid gap-2">
+            <Label>Nickname</Label>
+            <Input 
+              value={nickname} 
+              onChange={e => setNickname(e.target.value)} 
+            />
+          </div>
+
+          <div className="grid gap-2">
+            <Label>Shell Preference</Label>
+            <Select value={shell} onValueChange={setShell}>
+              <SelectTrigger>
+                <SelectValue placeholder="Select shell..." />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">Default (CMD)</SelectItem>
+                <SelectItem value="gitbash">Git Bash</SelectItem>
+                <SelectItem value="powershell">PowerShell</SelectItem>
+                <SelectItem value="wsl">WSL</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-[0.8rem] text-muted-foreground">
+              Preferred shell for running commands (Windows).
+            </p>
+          </div>
+
+          {!isOpencode && (
+            <>
+              <div className="grid gap-2">
+                <Label>API Key Environment Variable</Label>
+                <Input 
+                  value={envApiKeyName} 
+                  onChange={e => setEnvApiKeyName(e.target.value)} 
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label>Base URL</Label>
+                <Input 
+                  value={baseUrl} 
+                  onChange={e => setBaseUrl(e.target.value)}
+                  placeholder="Leave empty for default"
+                />
+              </div>
+            </>
+          )}
+
+          <div className="space-y-3 pt-2 border-t">
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <Label className="text-sm">Command Runner</Label>
+                <p className="text-xs text-muted-foreground">Model can execute shell commands</p>
+              </div>
+              <Switch 
+                checked={cmdRunner} 
+                onCheckedChange={setCmdRunner} 
+              />
+            </div>
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <Label className="text-sm">Direct File Writes</Label>
+                <p className="text-xs text-muted-foreground">Model writes files directly instead of diffs</p>
+              </div>
+              <Switch 
+                checked={writeFilesToDisk} 
+                onCheckedChange={setWriteFilesToDisk} 
+              />
+            </div>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
+          <Button onClick={handleSave} disabled={isSubmitting}>
+            {isSubmitting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+            Save Changes
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function AddOpenAICompatibleModelDialog({
+  onAdd,
+  onRefresh,
+}: {
+  onAdd: (provider: string, model: string, envApiKeyName: string, baseUrl?: string, nickname?: string, cmdRunner?: boolean, writeFilesToDisk?: boolean, shell?: string) => Promise<void>;
+  onRefresh: () => void;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [provider, setProvider] = useState('openai');
+  const [model, setModel] = useState('');
+  const [envApiKeyName, setEnvApiKeyName] = useState('OPENAI_API_KEY');
+  const [baseUrl, setBaseUrl] = useState('');
+  const [nickname, setNickname] = useState('');
+  const [cmdRunner, setCmdRunner] = useState(false);
+  const [shell, setShell] = useState('auto');
+  const [writeFilesToDisk, setWriteFilesToDisk] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const handleSubmit = async () => {
+    if (!provider || !model || !envApiKeyName) {
+      toast.error('Please fill in all required fields');
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      await onAdd(
+        provider,
+        model,
+        envApiKeyName,
+        baseUrl || undefined,
+        nickname || undefined,
+        cmdRunner,
+        writeFilesToDisk,
+        shell === 'auto' ? undefined : shell
+      );
+      toast.success('Model added');
+      onRefresh();
+      setIsOpen(false);
+      // Reset form
+      setProvider('openai');
+      setModel('');
+      setEnvApiKeyName('OPENAI_API_KEY');
+      setBaseUrl('');
+      setShell('auto');
+      setNickname('');
+      setCmdRunner(false);
+      setWriteFilesToDisk(false);
+    } catch (e: any) {
+      toast.error('Failed to add model', { description: e.message });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open={isOpen} onOpenChange={setIsOpen}>
+      <DialogTrigger asChild>
+        <Button size="sm">
+          <Plus className="h-4 w-4 mr-2" /> Add Model
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Add OpenAI Compatible Model</DialogTitle>
+          <DialogDescription>
+            Configure a model that uses an OpenAI-compatible API with an environment variable for authentication.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4 py-4">
+          <div className="grid gap-2">
+            <Label>Provider / Base URL *</Label>
+            <Input 
+              placeholder="e.g., openai, together, or https://api.example.com/v1" 
+              value={provider} 
+              onChange={e => setProvider(e.target.value)} 
+            />
+            <p className="text-xs text-muted-foreground">
+              Enter a provider name (e.g., "openai") or a full URL for custom endpoints.
+            </p>
+          </div>
+          <div className="grid gap-2">
+            <Label>Model *</Label>
+            <Input 
+              placeholder="e.g., gpt-4-turbo, mixtral-8x7b" 
+              value={model} 
+              onChange={e => setModel(e.target.value)} 
+            />
+          </div>
+          <div className="grid gap-2">
+            <Label>API Key Environment Variable *</Label>
+            <Input 
+              placeholder="e.g., OPENAI_API_KEY" 
+              value={envApiKeyName} 
+              onChange={e => setEnvApiKeyName(e.target.value)} 
+            />
+            <p className="text-xs text-muted-foreground">
+              The name of the environment variable containing the API key.
+            </p>
+          </div>
+          <div className="grid gap-2">
+            <Label>Base URL (optional)</Label>
+            <Input 
+              placeholder="e.g., https://api.openai.com/v1" 
+              value={baseUrl} 
+              onChange={e => setBaseUrl(e.target.value)} 
+            />
+            <p className="text-xs text-muted-foreground">
+              Override the default API endpoint. Leave empty for standard providers.
+            </p>
+          </div>
+          <div className="grid gap-2">
+            <Label>Nickname (optional)</Label>
+            <Input 
+              placeholder="e.g., GPT-4 Turbo" 
+              value={nickname} 
+              onChange={e => setNickname(e.target.value)} 
+            />
+          </div>
+          <div className="grid gap-2">
+            <Label>Shell Preference</Label>
+            <Select value={shell} onValueChange={setShell}>
+              <SelectTrigger>
+                <SelectValue placeholder="Select shell..." />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">Default (CMD)</SelectItem>
+                <SelectItem value="gitbash">Git Bash</SelectItem>
+                <SelectItem value="powershell">PowerShell</SelectItem>
+                <SelectItem value="wsl">WSL</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-[0.8rem] text-muted-foreground">
+              Preferred shell for running commands (Windows).
+            </p>
+          </div>
+          <div className="space-y-3 pt-2 border-t">
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <Label htmlFor="cmd-runner" className="text-sm">Command Runner</Label>
+                <p className="text-xs text-muted-foreground">Model can execute shell commands</p>
+              </div>
+              <Switch 
+                id="cmd-runner"
+                checked={cmdRunner} 
+                onCheckedChange={setCmdRunner} 
+              />
+            </div>
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <Label htmlFor="write-files" className="text-sm">Direct File Writes</Label>
+                <p className="text-xs text-muted-foreground">Model writes files directly instead of diffs</p>
+              </div>
+              <Switch 
+                id="write-files"
+                checked={writeFilesToDisk} 
+                onCheckedChange={setWriteFilesToDisk} 
+              />
+            </div>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => setIsOpen(false)}>Cancel</Button>
+          <Button onClick={handleSubmit} disabled={isSubmitting || !provider || !model || !envApiKeyName}>
+            {isSubmitting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+            Add Model
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function AddProviderDialog({ onAdd }: { onAdd: () => void }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [providerId, setProviderId] = useState('openai');
+  const [customId, setCustomId] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const handleSubmit = async () => {
+    const id = providerId === 'custom' ? customId : providerId;
+    if (!id) return;
+
+    setIsSubmitting(true);
+    try {
+      await http(`/api/settings/providers/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          providerId: id,
+          apiKey: apiKey,
+          enabled: true
+        }),
+        sendProjectId: false
+      });
+      toast.success('Provider added');
+      onAdd();
+      setIsOpen(false);
+      setApiKey('');
+      setCustomId('');
+    } catch (e) {
+      toast.error('Failed to add provider');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open={isOpen} onOpenChange={setIsOpen}>
+      <DialogTrigger asChild>
+        <Button size="sm">
+          <Plus className="h-4 w-4 mr-2" /> Add Provider
+        </Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Add LLM Provider</DialogTitle>
+          <DialogDescription>Configure a new provider for code generation.</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4 py-4">
+          <div className="grid gap-2">
+            <Label>Provider Type</Label>
+            <Select value={providerId} onValueChange={setProviderId}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="openai">OpenAI</SelectItem>
+                <SelectItem value="anthropic">Anthropic</SelectItem>
+                <SelectItem value="gemini">Google Gemini</SelectItem>
+                <SelectItem value="groq">Groq</SelectItem>
+                <SelectItem value="ollama">Ollama (Local)</SelectItem>
+                <SelectItem value="custom">Custom / Other</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          {providerId === 'custom' && (
+            <div className="grid gap-2">
+              <Label>Provider ID</Label>
+              <Input 
+                placeholder="e.g. mistral" 
+                value={customId} 
+                onChange={e => setCustomId(e.target.value)} 
+              />
+            </div>
+          )}
+
+          <div className="grid gap-2">
+            <Label>API Key</Label>
+            <Input 
+              type="password" 
+              placeholder="sk-..." 
+              value={apiKey} 
+              onChange={e => setApiKey(e.target.value)} 
+            />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => setIsOpen(false)}>Cancel</Button>
+          <Button onClick={handleSubmit} disabled={isSubmitting}>
+            {isSubmitting ? 'Adding...' : 'Add Provider'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function MobilePairingCard() {
+  const [otp, setOtp] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [expiry, setExpiry] = useState<Date | null>(null);
+
+  const generateCode = async () => {
+    setLoading(true);
+    try {
+      const res = await http<{ otp: string; expires_at: string }>('/api/auth/initiate-pairing', {
+        method: 'POST',
+        sendProjectId: false
+      });
+      setOtp(res.otp);
+      setExpiry(new Date(res.expires_at));
+    } catch (e) {
+      toast.error('Failed to generate pairing code');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base font-medium flex items-center gap-2">
+          <Smartphone className="h-5 w-5" />
+          Pair New Device
+        </CardTitle>
+        <CardDescription>
+          Generate a 6-character code to connect your mobile device.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {otp ? (
+          <div className="flex flex-col items-center justify-center p-6 bg-muted/30 rounded-lg border-2 border-dashed animate-in fade-in zoom-in-95 duration-200">
+            <div className="text-sm text-muted-foreground mb-2">Enter this code on your mobile device</div>
+            <div className="text-5xl font-mono font-bold tracking-[0.5em] text-primary mb-4 select-all">
+              {otp}
+            </div>
+            {expiry && (
+              <div className="text-xs text-muted-foreground">
+                Expires at {expiry.toLocaleTimeString()}
+              </div>
+            )}
+            <Button variant="outline" size="sm" className="mt-6" onClick={() => setOtp(null)}>
+              Done
+            </Button>
+          </div>
+        ) : (
+          <div className="flex items-center justify-between">
+            <p className="text-sm text-muted-foreground">
+              Click to generate a one-time pairing code.
+            </p>
+            <Button onClick={generateCode} disabled={loading}>
+              {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Plus className="mr-2 h-4 w-4" />}
+              Generate Code
+            </Button>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function PairedDevicesList() {
+  const [devices, setDevices] = useState<PairedDevice[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const fetchDevices = useCallback(async () => {
+    try {
+      const data = await http<PairedDevice[]>('/api/auth/paired-devices', { sendProjectId: false });
+      setDevices(data);
+    } catch (e) {
+      // Silent fail
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchDevices();
+  }, [fetchDevices]);
+
+  const revokeDevice = async (id: string) => {
+    if (!confirm('Are you sure you want to revoke this device? It will be disconnected immediately.')) return;
+    
+    try {
+      await http('/api/auth/revoke-device', {
+        method: 'POST',
+        body: JSON.stringify({ device_id: id }),
+        sendProjectId: false
+      });
+      toast.success('Device revoked');
+      fetchDevices();
+    } catch (e) {
+      toast.error('Failed to revoke device');
+    }
+  };
+
+  if (loading && devices.length === 0) return null;
+  if (!loading && devices.length === 0) return null;
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-base font-medium flex items-center gap-2">
+            <Laptop className="h-5 w-5" />
+            Paired Devices
+          </CardTitle>
+          <Button variant="ghost" size="icon" className="h-8 w-8" onClick={fetchDevices}>
+            <RefreshCw className="h-4 w-4" />
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {devices.map(device => (
+          <div key={device.id} className="flex items-center justify-between p-3 bg-muted/30 rounded-md border">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 font-medium">
+                <Smartphone className="h-4 w-4 text-muted-foreground" />
+                {device.name}
+              </div>
+              <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                <span className="flex items-center gap-1">
+                  <Clock className="h-3 w-3" /> Paired {new Date(device.pairedAt).toLocaleDateString()}
+                </span>
+              </div>
+            </div>
+            <Button variant="ghost" size="sm" className="h-8 text-destructive hover:text-destructive hover:bg-destructive/10" onClick={() => revokeDevice(device.id)}>
+              <Ban className="h-4 w-4 mr-2" /> Revoke
+            </Button>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
