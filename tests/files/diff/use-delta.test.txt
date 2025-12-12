@@ -1,0 +1,2305 @@
+/**
+ * useDelta - The core data abstraction for V2
+ * 
+ * This hook uses Server-Sent Events (SSE) only for real-time push notifications
+ * combined with delta fetching for efficient data updates.
+ * 
+ * Mechanism:
+ * 1. Mount: Component calls useDelta(namespace, projectId)
+ * 2. SSE: A shared EventSource connection listens for change notifications
+ * 3. On change: Hook fetches /delta/{project_id}/{namespace} immediately
+ * 4. Diffing:
+ *    - 204 No Content: Do nothing
+ *    - 200 OK (Full): Replace local state
+ *    - 200 OK (Delta): Merge changes (added, removed, updated)
+ * 5. Render: Component re-renders with fresh data
+ * 
+ * SSE Connection Failure:
+ * - If SSE fails to connect after MAX_RECONNECT_ATTEMPTS, status becomes 'error'
+ * - A banner is shown to the user
+ * - User can click to enable polling as fallback
+ * 
+ * Error Recovery Features:
+ * - Exponential backoff for retries
+ * - IndexedDB offline cache support
+ * - Delta conflict resolution
+ */
+
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { fetchDelta } from '../lib/http';
+import type { DeltaDiff } from '../types';
+
+// ============================================================================
+// IndexedDB Offline Cache
+// ============================================================================
+
+const DB_NAME = 'sprocket_delta_cache';
+const DB_VERSION = 1;
+const STORE_NAME = 'delta_data';
+
+interface CachedData<T> {
+  key: string;
+  data: T;
+  cacheId: string;
+  timestamp: number;
+}
+
+let dbPromise: Promise<IDBDatabase> | null = null;
+
+function openDatabase(): Promise<IDBDatabase> {
+  if (dbPromise) return dbPromise;
+
+  dbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+      }
+    };
+  });
+
+  return dbPromise;
+}
+
+async function getCachedData<T>(key: string): Promise<CachedData<T> | null> {
+  try {
+    const db = await openDatabase();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, 'readonly');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.get(key);
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result || null);
+    });
+  } catch (error) {
+    console.warn('[DeltaCache] Failed to read from cache:', error);
+    return null;
+  }
+}
+
+async function setCachedData<T>(key: string, data: T, cacheId: string): Promise<void> {
+  try {
+    const db = await openDatabase();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.put({
+        key,
+        data,
+        cacheId,
+        timestamp: Date.now(),
+      });
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve();
+    });
+  } catch (error) {
+    console.warn('[DeltaCache] Failed to write to cache:', error);
+  }
+}
+
+async function clearExpiredCache(maxAgeMs: number = 24 * 60 * 60 * 1000): Promise<void> {
+  try {
+    const db = await openDatabase();
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.openCursor();
+
+    const cutoff = Date.now() - maxAgeMs;
+
+    request.onsuccess = (event) => {
+      const cursor = (event.target as IDBRequest<IDBCursorWithValue>).result;
+      if (cursor) {
+        if (cursor.value.timestamp < cutoff) {
+          cursor.delete();
+        }
+        cursor.continue();
+      }
+    };
+  } catch (error) {
+    console.warn('[DeltaCache] Failed to clear expired cache:', error);
+  }
+}
+
+// Clear expired cache on module load
+if (typeof indexedDB !== 'undefined') {
+  clearExpiredCache();
+}
+
+export interface UseDeltaOptions<T> {
+  /** Fallback polling interval in milliseconds (only used if user enables it). Default: 5000ms */
+  fallbackInterval?: number;
+  /** Whether to start fetching immediately. Default: true */
+  enabled?: boolean;
+  /** Callback when data changes */
+  onData?: (data: T) => void;
+  /** Callback on error */
+  onError?: (error: Error) => void;
+  /** Initial data */
+  initialData?: T;
+  /** Enable offline cache. Default: true */
+  enableCache?: boolean;
+  /** Max retry attempts for fetch failures. Default: 3 */
+  maxRetries?: number;
+  /** Initial retry delay in ms for exponential backoff. Default: 1000 */
+  initialRetryDelay?: number;
+}
+
+export interface UseDeltaResult<T> {
+  /** The current data */
+  data: T | null;
+  /** Whether the initial load is in progress */
+  loading: boolean;
+  /** Any error that occurred */
+  error: Error | null;
+  /** Force a refresh */
+  refresh: () => Promise<void>;
+  /** Current cache ID (for debugging) */
+  cacheId: string | null;
+  /** Whether data was loaded from offline cache */
+  isFromCache: boolean;
+  /** Whether currently online */
+  isOnline: boolean;
+  /** Number of retry attempts */
+  retryCount: number;
+}
+
+/**
+ * Merge delta changes into existing list data
+ */
+function mergeDelta<T extends { id: string }>(
+  currentData: T[],
+  delta: DeltaDiff<T>
+): T[] {
+  const result = [...currentData];
+
+  // Remove items
+  const removedSet = new Set(delta.removed);
+  const filtered = result.filter(item => !removedSet.has(item.id));
+
+  // Update items
+  const updatedMap = new Map(delta.updated.map(item => [item.id, item]));
+  const updated = filtered.map(item => updatedMap.get(item.id) || item);
+
+  // Add new items
+  return [...updated, ...delta.added];
+}
+
+// ============================================================================
+// Shared SSE Connection Manager
+// ============================================================================
+
+export type SSEConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
+
+type ChangeHandler = (namespace: string, hash: string) => void;
+type StatusHandler = (status: SSEConnectionStatus) => void;
+
+interface SSEConnection {
+  eventSource: EventSource;
+  handlers: Set<ChangeHandler>;
+  statusHandlers: Set<StatusHandler>;
+  refCount: number;
+  lastHashes: Record<string, string>;
+  status: SSEConnectionStatus;
+  reconnectAttempts: number;
+  maxReconnectAttempts: number;
+}
+
+const sseConnections = new Map<string, SSEConnection>();
+const globalStatusListeners = new Set<(projectId: string, status: SSEConnectionStatus) => void>();
+
+// Max reconnect attempts before giving up
+const MAX_RECONNECT_ATTEMPTS = 3;
+
+/**
+ * Get or create a shared SSE connection for a project
+ */
+function getSSEConnection(projectId: string, onReconnect?: () => void): SSEConnection {
+  let conn = sseConnections.get(projectId);
+
+  if (!conn) {
+    const eventSource = new EventSource(`/api/stream/${projectId}`);
+    conn = {
+      eventSource,
+      handlers: new Set(),
+      statusHandlers: new Set(),
+      refCount: 0,
+      lastHashes: {},
+      status: 'connecting',
+      reconnectAttempts: 0,
+      maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
+    };
+
+    // Handle init event (initial hashes)
+    eventSource.addEventListener('init', (event) => {
+      const data = JSON.parse(event.data);
+      conn!.lastHashes = data.hashes || {};
+    });
+
+    // Handle successful connection
+    eventSource.onopen = () => {
+      conn!.status = 'connected';
+      conn!.reconnectAttempts = 0;
+      conn!.statusHandlers.forEach(handler => handler('connected'));
+      globalStatusListeners.forEach(listener => listener(projectId, 'connected'));
+    };
+
+    // Handle change events
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        const { namespace, hash } = data;
+
+        // Only notify if hash actually changed
+        if (conn!.lastHashes[namespace] !== hash) {
+          conn!.lastHashes[namespace] = hash;
+          conn!.handlers.forEach(handler => handler(namespace, hash));
+        }
+      } catch (e) {
+        console.error('SSE parse error:', e);
+      }
+    };
+
+    // Handle errors and reconnection
+    eventSource.onerror = () => {
+      conn!.reconnectAttempts++;
+
+      if (conn!.reconnectAttempts >= conn!.maxReconnectAttempts) {
+        // Give up after max attempts
+        conn!.status = 'error';
+        conn!.statusHandlers.forEach(handler => handler('error'));
+        globalStatusListeners.forEach(listener => listener(projectId, 'error'));
+        eventSource.close();
+      } else if (eventSource.readyState === EventSource.CONNECTING) {
+        // EventSource auto-reconnects, notify of connecting status
+        conn!.status = 'connecting';
+        conn!.statusHandlers.forEach(handler => handler('connecting'));
+        globalStatusListeners.forEach(listener => listener(projectId, 'connecting'));
+        onReconnect?.();
+      }
+    };
+
+    sseConnections.set(projectId, conn);
+  }
+
+  conn.refCount++;
+  return conn;
+}
+
+/**
+ * Release a reference to an SSE connection
+ */
+function releaseSSEConnection(projectId: string) {
+  const conn = sseConnections.get(projectId);
+  if (conn) {
+    conn.refCount--;
+    if (conn.refCount <= 0) {
+      conn.statusHandlers.clear();
+      conn.eventSource.close();
+      conn.lastHashes = {};
+      conn.handlers.clear();
+      sseConnections.delete(projectId);
+    }
+  }
+}
+
+/**
+ * Subscribe to changes for a specific namespace
+ */
+function subscribeToChanges(
+  projectId: string, 
+  namespace: string, 
+  onNamespaceChange: () => void,
+  onStatusChange?: StatusHandler,
+  onReconnect?: () => void
+): () => void {
+  const conn = getSSEConnection(projectId, onReconnect);
+
+  const handler: ChangeHandler = (changedNamespace) => {
+    if (changedNamespace === namespace) {
+      onNamespaceChange();
+    }
+  };
+
+  conn.handlers.add(handler);
+
+  if (onStatusChange) {
+    conn.statusHandlers.add(onStatusChange);
+    // Immediately notify of current status
+    onStatusChange(conn.status);
+  }
+
+  return () => {
+    conn.handlers.delete(handler);
+    if (onStatusChange) {
+      conn.statusHandlers.delete(onStatusChange);
+    }
+    releaseSSEConnection(projectId);
+  };
+}
+
+/**
+ * Subscribe to global SSE status changes across all projects
+ */
+export function subscribeToGlobalSSEStatus(listener: (projectId: string, status: SSEConnectionStatus) => void): () => void {
+  globalStatusListeners.add(listener);
+  return () => {
+    globalStatusListeners.delete(listener);
+  };
+}
+
+// ============================================================================
+// useDelta Hook
+// ============================================================================
+
+/**
+ * Generic delta hook for fetching data with SSE push notifications
+ */
+export function useDelta<T>(
+  namespace: string,
+  projectId: string | null,
+  options: UseDeltaOptions<T> = {}
+): UseDeltaResult<T> {
+  const {
+    enabled = true,
+    onData,
+    onError,
+    initialData = null,
+  } = options;
+
+  // Memoize initialData to prevent infinite loops when callers pass inline arrays/objects
+  const stableInitialData = useMemo(() => initialData, []);
+
+  const [data, setData] = useState<T | null>(stableInitialData);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+  const cacheIdRef = useRef<string | null>(null);
+  const mountedRef = useRef(true);
+  const dataRef = useRef<T | null>(stableInitialData);
+  const fetchDataRef = useRef<() => Promise<void>>(async () => {});
+
+  // Keep dataRef in sync with data
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
+
+  const fetchData = useCallback(async () => {
+    if (!projectId || !enabled) return;
+
+    try {
+      const result = await fetchDelta<T>(
+        `/api/delta/${projectId}/${namespace}`,
+        cacheIdRef.current,
+        projectId
+      );
+
+      if (!mountedRef.current) return;
+
+      if (result.hasChanges) {
+        cacheIdRef.current = result.cacheId;
+
+        if (result.isFull) {
+          // Full replacement
+          setData(result.data);
+          onData?.(result.data!);
+        } else if (result.data && Array.isArray(dataRef.current)) {
+          // Delta merge for list data
+          const merged = mergeDelta(
+            dataRef.current as (T & { id: string })[],
+            result.data as unknown as DeltaDiff<T & { id: string }>
+          ) as T;
+          setData(merged);
+          onData?.(merged);
+        } else if (result.data) {
+          // Object update - just replace
+          setData(result.data);
+          onData?.(result.data);
+        }
+      }
+
+      setError(null);
+      setLoading(false);
+    } catch (err) {
+      if (!mountedRef.current) return;
+
+      const error = err instanceof Error ? err : new Error(String(err));
+      setError(error);
+      setLoading(false);
+      onError?.(error);
+    }
+  }, [namespace, projectId, enabled, onData, onError]);
+
+  // Keep fetchDataRef in sync with fetchData to avoid stale closures in SSE callbacks
+  useEffect(() => {
+    fetchDataRef.current = fetchData;
+  }, [fetchData]);
+
+  // Initial fetch and SSE subscription
+  useEffect(() => {
+    if (!projectId || !enabled) return;
+
+    mountedRef.current = true;
+    cacheIdRef.current = null;
+    // Reset data when project/namespace changes to prevent stale data accumulation
+    setData(stableInitialData);
+    dataRef.current = stableInitialData;
+    setLoading(true);
+
+    // Initial fetch
+    fetchDataRef.current();
+
+    // Subscribe to SSE changes for this namespace
+    const unsubscribe = subscribeToChanges(
+      projectId,
+      namespace,
+      () => {
+        // Fetch immediately when notified of changes
+        fetchDataRef.current();
+      },
+      undefined, // Status handler not needed per-hook
+      () => {
+        // On SSE reconnect, refetch to ensure we didn't miss anything
+        fetchDataRef.current();
+      }
+    );
+
+    return () => {
+      mountedRef.current = false;
+      unsubscribe();
+    };
+  }, [namespace, projectId, enabled, stableInitialData]);
+
+  // NOTE: No fallback polling here - polling is handled by useSSEStatus hook
+  // and triggered externally via refresh callbacks
+
+  const refresh = useCallback(async () => {
+    cacheIdRef.current = null;
+    await fetchData();
+  }, [fetchData]);
+
+  return {
+    data,
+    loading,
+    error,
+    refresh,
+    cacheId: cacheIdRef.current,
+  };
+}
+
+// ============================================================================
+// SSE Status Hook
+// ============================================================================
+
+/**
+ * Calculate exponential backoff delay
+ */
+function getRetryDelay(attempt: number, initialDelay: number): number {
+  return Math.min(initialDelay * Math.pow(2, attempt), 30000); // Cap at 30 seconds
+}
+
+/**
+ * Hook for SSE connection status and polling control
+ */
+export function useSSEStatus(projectId: string | null) {
+  const [status, setStatus] = useState<SSEConnectionStatus>('connecting');
+  const [pollingEnabled, setPollingEnabled] = useState(false);
+  const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const refreshCallbacksRef = useRef<Set<() => void>>(new Set());
+
+  useEffect(() => {
+    if (!projectId) return;
+
+    // Get or create connection to track its status
+    const conn = getSSEConnection(projectId);
+    setStatus(conn.status);
+
+    const statusHandler: StatusHandler = (newStatus) => {
+      setStatus(newStatus);
+      // If we reconnect successfully, disable polling
+      if (newStatus === 'connected' && pollingEnabled) {
+        setPollingEnabled(false);
+      }
+    };
+
+    conn.statusHandlers.add(statusHandler);
+
+    return () => {
+      conn.statusHandlers.delete(statusHandler);
+      releaseSSEConnection(projectId);
+    };
+  }, [projectId, pollingEnabled]);
+
+  // Handle polling
+  useEffect(() => {
+    if (pollingEnabled && projectId) {
+      pollingIntervalRef.current = setInterval(() => {
+        refreshCallbacksRef.current.forEach(cb => cb());
+      }, 5000);
+    } else if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
+    }
+
+    return () => {
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+      }
+    };
+  }, [pollingEnabled, projectId]);
+
+  const enablePolling = useCallback(() => {
+    setPollingEnabled(true);
+  }, []);
+
+  const registerRefreshCallback = useCallback((callback: () => void) => {
+    refreshCallbacksRef.current.add(callback);
+    return () => {
+      refreshCallbacksRef.current.delete(callback);
+    };
+  }, []);
+
+  return { 
+    status, 
+    pollingEnabled, 
+    enablePolling,
+    registerRefreshCallback,
+    isDisconnected: status === 'error' && !pollingEnabled,
+  };
+}
+
+// ============================================================================
+// Specialized Delta Hooks
+// ============================================================================
+
+import type { FileTreeData, GitStatus, TerminalSession, Task, Proposal, ProjectCoverage, TestResults, ValidatorResult } from '../types';
+
+/**
+ * Hook for file tree data
+ */
+export function useFileTree(projectId: string | null) {
+  return useDelta<FileTreeData>('files', projectId);
+}
+
+/**
+ * Hook for git status
+ */
+export function useGitStatus(projectId: string | null) {
+  return useDelta<GitStatus>('git_status', projectId);
+}
+
+/**
+ * Hook for terminal sessions
+ */
+export function useTerminals(projectId: string | null) {
+  return useDelta<TerminalSession[]>('terminals', projectId, {
+    initialData: [],
+  });
+}
+
+/**
+ * Hook for tasks list
+ */
+export function useTasks(projectId: string | null) {
+  return useDelta<Task[]>('tasks', projectId, {
+    initialData: [],
+  });
+}
+
+/**
+ * Hook for project coverage data
+ * 
+ * Returns coverage information for all files in the project,
+ * including line hits and summary statistics.
+ */
+export function useCoverage(projectId: string | null) {
+  return useDelta<ProjectCoverage>('coverage', projectId, {
+    initialData: {
+      files: {},
+      summary: undefined,
+      last_updated: undefined,
+    },
+  });
+}
+
+/**
+ * Hook for test results
+ * 
+ * Returns the latest test run results including:
+ * - Pass/fail/skip counts
+ * - Individual test failures with line numbers
+ */
+export function useTestResults(projectId: string | null) {
+  return useDelta<TestResults>('test_results', projectId, {
+    initialData: {
+      passed: 0,
+      failed: 0,
+      skipped: 0,
+      failures: [],
+    },
+  });
+}
+
+/**
+ * Hook for validator results
+ * 
+ * Returns lint/validation errors across project files
+ */
+export function useValidatorResults(projectId: string | null) {
+  return useDelta<ValidatorResult[]>('validator_results', projectId, {
+    initialData: [],
+  });
+}
+
+/**
+ * Hook for proposals list
+ */
+export function useProposals(projectId: string | null) {
+  return useDelta<Proposal[]>('proposals', projectId, {
+    initialData: [],
+  });
+}
+# === TEST ===
+```javascript
+/**
+ * useDelta - The core data abstraction for V2
+ * 
+ * This hook uses Server-Sent Events (SSE) only for real-time push notifications
+ * combined with delta fetching for efficient data updates.
+ * 
+ * Mechanism:
+ * 1. Mount: Component calls useDelta(namespace, projectId)
+ * 2. SSE: A shared EventSource connection listens for change notifications
+ * 3. On change: Hook fetches /delta/{project_id}/{namespace} immediately
+ * 4. Diffing:
+ *    - 204 No Content: Do nothing
+ *    - 200 OK (Full): Replace local state
+ *    - 200 OK (Delta): Merge changes (added, removed, updated)
+ * 5. Render: Component re-renders with fresh data
+ * 
+ * SSE Connection with Ping-Based Monitoring:
+ * - Server sends ping events every 300ms
+ * - Client monitors ping arrival and detects connection loss within 1 second
+ * - On connection loss, exponential backoff is used for reconnection (100ms -> 200ms -> 400ms ... up to 30s)
+ * - After MAX_RECONNECT_ATTEMPTS (10), status becomes 'error' and user can enable polling fallback
+ * 
+ * Error Recovery Features:
+ * - Aggressive ping-based connection monitoring (ideal for mobile)
+ * - Exponential backoff for retries
+ * - IndexedDB offline cache support
+ * - Delta conflict resolution
+ */
+
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { fetchDelta } from '../lib/http';
+import type { DeltaDiff } from '../types';
+
+// ============================================================================
+// IndexedDB Offline Cache
+// ============================================================================
+
+const DB_NAME = 'sprocket_delta_cache';
+const DB_VERSION = 1;
+const STORE_NAME = 'delta_data';
+
+interface CachedData<T> {
+  key: string;
+  data: T;
+  cacheId: string;
+  timestamp: number;
+}
+
+let dbPromise: Promise<IDBDatabase> | null = null;
+
+function openDatabase(): Promise<IDBDatabase> {
+  if (dbPromise) return dbPromise;
+
+  dbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+      }
+    };
+  });
+
+  return dbPromise;
+}
+
+async function getCachedData<T>(key: string): Promise<CachedData<T> | null> {
+  try {
+    const db = await openDatabase();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, 'readonly');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.get(key);
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result || null);
+    });
+  } catch (error) {
+    console.warn('[DeltaCache] Failed to read from cache:', error);
+    return null;
+  }
+}
+
+async function setCachedData<T>(key: string, data: T, cacheId: string): Promise<void> {
+  try {
+    const db = await openDatabase();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.put({
+        key,
+        data,
+        cacheId,
+        timestamp: Date.now(),
+      });
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve();
+    });
+  } catch (error) {
+    console.warn('[DeltaCache] Failed to write to cache:', error);
+  }
+}
+
+async function clearExpiredCache(maxAgeMs: number = 24 * 60 * 60 * 1000): Promise<void> {
+  try {
+    const db = await openDatabase();
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.openCursor();
+
+    const cutoff = Date.now() - maxAgeMs;
+
+    request.onsuccess = (event) => {
+      const cursor = (event.target as IDBRequest<IDBCursorWithValue>).result;
+      if (cursor) {
+        if (cursor.value.timestamp < cutoff) {
+          cursor.delete();
+        }
+        cursor.continue();
+      }
+    };
+  } catch (error) {
+    console.warn('[DeltaCache] Failed to clear expired cache:', error);
+  }
+}
+
+// Clear expired cache on module load
+if (typeof indexedDB !== 'undefined') {
+  clearExpiredCache();
+}
+
+export interface UseDeltaOptions<T> {
+  /** Fallback polling interval in milliseconds (only used if user enables it). Default: 5000ms */
+  fallbackInterval?: number;
+  /** Whether to start fetching immediately. Default: true */
+  enabled?: boolean;
+  /** Callback when data changes */
+  onData?: (data: T) => void;
+  /** Callback on error */
+  onError?: (error: Error) => void;
+  /** Initial data */
+  initialData?: T;
+  /** Enable offline cache. Default: true */
+  enableCache?: boolean;
+  /** Max retry attempts for fetch failures. Default: 3 */
+  maxRetries?: number;
+  /** Initial retry delay in ms for exponential backoff. Default: 1000 */
+  initialRetryDelay?: number;
+}
+
+export interface UseDeltaResult<T> {
+  /** The current data */
+  data: T | null;
+  /** Whether the initial load is in progress */
+  loading: boolean;
+  /** Any error that occurred */
+  error: Error | null;
+  /** Force a refresh */
+  refresh: () => Promise<void>;
+  /** Current cache ID (for debugging) */
+  cacheId: string | null;
+  /** Whether data was loaded from offline cache */
+  isFromCache: boolean;
+  /** Whether currently online */
+  isOnline: boolean;
+  /** Number of retry attempts */
+  retryCount: number;
+}
+
+/**
+ * Merge delta changes into existing list data
+ */
+function mergeDelta<T extends { id: string }>(
+  currentData: T[],
+  delta: DeltaDiff<T>
+): T[] {
+  const result = [...currentData];
+
+  // Remove items
+  const removedSet = new Set(delta.removed);
+  const filtered = result.filter(item => !removedSet.has(item.id));
+
+  // Update items
+  const updatedMap = new Map(delta.updated.map(item => [item.id, item]));
+  const updated = filtered.map(item => updatedMap.get(item.id) || item);
+
+  // Add new items
+  return [...updated, ...delta.added];
+}
+
+// ============================================================================
+// Shared SSE Connection Manager
+// ============================================================================
+
+export type SSEConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
+
+type ChangeHandler = (namespace: string, hash: string) => void;
+type StatusHandler = (status: SSEConnectionStatus) => void;
+
+interface SSEConnection {
+  eventSource: EventSource | null;
+  handlers: Set<ChangeHandler>;
+  statusHandlers: Set<StatusHandler>;
+  refCount: number;
+  lastHashes: Record<string, string>;
+  status: SSEConnectionStatus;
+  reconnectAttempts: number;
+  maxReconnectAttempts: number;
+  // Ping-based connection monitoring
+  lastPingTime: number;
+  pingCheckInterval: ReturnType<typeof setInterval> | null;
+  reconnectTimeout: ReturnType<typeof setTimeout> | null;
+  projectId: string;
+}
+
+const sseConnections = new Map<string, SSEConnection>();
+const globalStatusListeners = new Set<(projectId: string, status: SSEConnectionStatus) => void>();
+
+// Ping configuration for aggressive mobile reconnection
+// Note: Server sends pings every 300ms (PING_INTERVAL_SECONDS = 0.3 in backend)
+const PING_TIMEOUT_MS = 1000; // Consider connection lost if no ping for 1 second
+const PING_CHECK_INTERVAL_MS = 200; // Check for ping timeout every 200ms
+const MAX_RECONNECT_ATTEMPTS = 10; // More attempts for mobile
+const INITIAL_RECONNECT_DELAY_MS = 100; // Start fast for mobile
+const MAX_RECONNECT_DELAY_MS = 30000; // Cap at 30 seconds
+
+/**
+ * Calculate exponential backoff delay for reconnection
+ */
+function getReconnectDelay(attempt: number): number {
+  const delay = INITIAL_RECONNECT_DELAY_MS * Math.pow(2, attempt);
+  return Math.min(delay, MAX_RECONNECT_DELAY_MS);
+}
+
+/**
+ * Update connection status and notify all listeners
+ */
+function updateConnectionStatus(conn: SSEConnection, newStatus: SSEConnectionStatus) {
+  if (conn.status === newStatus) return;
+  
+  conn.status = newStatus;
+  console.log(`[SSE] Status changed to: ${newStatus} (attempts: ${conn.reconnectAttempts})`);
+  conn.statusHandlers.forEach(handler => handler(newStatus));
+  globalStatusListeners.forEach(listener => listener(conn.projectId, newStatus));
+}
+
+/**
+ * Start ping-based connection monitoring
+ */
+function startPingMonitoring(conn: SSEConnection) {
+  // Clear any existing interval
+  if (conn.pingCheckInterval) {
+    clearInterval(conn.pingCheckInterval);
+  }
+
+  conn.pingCheckInterval = setInterval(() => {
+    const now = Date.now();
+    const timeSinceLastPing = now - conn.lastPingTime;
+
+    // If we haven't received a ping in too long, connection is likely lost
+    if (timeSinceLastPing > PING_TIMEOUT_MS && conn.status === 'connected') {
+      console.log(`[SSE] Ping timeout detected (${timeSinceLastPing}ms since last ping)`);
+      handleConnectionLoss(conn);
+    }
+  }, PING_CHECK_INTERVAL_MS);
+}
+
+/**
+ * Stop ping monitoring
+ */
+function stopPingMonitoring(conn: SSEConnection) {
+  if (conn.pingCheckInterval) {
+    clearInterval(conn.pingCheckInterval);
+    conn.pingCheckInterval = null;
+  }
+}
+
+/**
+ * Handle connection loss - close EventSource and schedule reconnect
+ */
+function handleConnectionLoss(conn: SSEConnection) {
+  stopPingMonitoring(conn);
+  
+  if (conn.eventSource) {
+    conn.eventSource.close();
+    conn.eventSource = null;
+  }
+
+  updateConnectionStatus(conn, 'disconnected');
+  scheduleReconnect(conn);
+}
+
+/**
+ * Schedule a reconnection attempt with exponential backoff
+ */
+function scheduleReconnect(conn: SSEConnection) {
+  // Clear any existing reconnect timeout
+  if (conn.reconnectTimeout) {
+    clearTimeout(conn.reconnectTimeout);
+  }
+
+  if (conn.reconnectAttempts >= conn.maxReconnectAttempts) {
+    console.log(`[SSE] Max reconnect attempts (${conn.maxReconnectAttempts}) reached`);
+    updateConnectionStatus(conn, 'error');
+    return;
+  }
+
+  const delay = getReconnectDelay(conn.reconnectAttempts);
+  console.log(`[SSE] Scheduling reconnect in ${delay}ms (attempt ${conn.reconnectAttempts + 1}/${conn.maxReconnectAttempts})`);
+
+  updateConnectionStatus(conn, 'connecting');
+
+  conn.reconnectTimeout = setTimeout(() => {
+    conn.reconnectAttempts++;
+    createEventSource(conn);
+  }, delay);
+}
+
+/**
+ * Create and configure EventSource for a connection
+ */
+function createEventSource(conn: SSEConnection) {
+  // Close existing EventSource if any
+  if (conn.eventSource) {
+    conn.eventSource.close();
+  }
+
+  const eventSource = new EventSource(`/api/stream/${conn.projectId}`);
+  conn.eventSource = eventSource;
+  conn.lastPingTime = Date.now(); // Initialize ping time
+
+  // Handle init event (initial hashes)
+  eventSource.addEventListener('init', (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      conn.lastHashes = data.hashes || {};
+      conn.lastPingTime = Date.now(); // Init counts as activity
+    } catch (e) {
+      console.error('[SSE] Failed to parse init event:', e);
+    }
+  });
+
+  // Handle ping events - update last ping time (no response needed)
+  eventSource.addEventListener('ping', () => {
+    conn.lastPingTime = Date.now();
+    
+    // If we were reconnecting/disconnected and get a ping, we're connected
+    if (conn.status !== 'connected') {
+      conn.reconnectAttempts = 0;
+      updateConnectionStatus(conn, 'connected');
+      startPingMonitoring(conn);
+    }
+  });
+
+  // Handle successful connection
+  eventSource.onopen = () => {
+    console.log('[SSE] EventSource opened');
+    conn.lastPingTime = Date.now();
+    conn.reconnectAttempts = 0;
+    updateConnectionStatus(conn, 'connected');
+    startPingMonitoring(conn);
+  };
+
+  // Handle change events
+  eventSource.onmessage = (event) => {
+    conn.lastPingTime = Date.now(); // Any message counts as activity
+    
+    try {
+      const data = JSON.parse(event.data);
+      const { namespace, hash } = data;
+
+      // Only notify if hash actually changed
+      if (conn.lastHashes[namespace] !== hash) {
+        conn.lastHashes[namespace] = hash;
+        conn.handlers.forEach(handler => handler(namespace, hash));
+      }
+    } catch (e) {
+      console.error('[SSE] Parse error:', e);
+    }
+  };
+
+  // Handle errors - let ping monitoring handle reconnection
+  eventSource.onerror = () => {
+    console.log('[SSE] EventSource error');
+    // Don't immediately reconnect - let ping monitoring detect if connection is truly lost
+    // This prevents rapid reconnection loops when the error is transient
+    if (eventSource.readyState === EventSource.CLOSED) {
+      handleConnectionLoss(conn);
+    }
+  };
+}
+
+/**
+ * Get or create a shared SSE connection for a project
+ */
+function getSSEConnection(projectId: string): SSEConnection {
+  let conn = sseConnections.get(projectId);
+
+  if (!conn) {
+    conn = {
+      eventSource: null,
+      handlers: new Set(),
+      statusHandlers: new Set(),
+      refCount: 0,
+      lastHashes: {},
+      status: 'connecting',
+      reconnectAttempts: 0,
+      maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
+      lastPingTime: Date.now(),
+      pingCheckInterval: null,
+      reconnectTimeout: null,
+      projectId,
+    };
+
+    sseConnections.set(projectId, conn);
+    createEventSource(conn);
+  }
+
+  conn.refCount++;
+  return conn;
+}
+
+/**
+ * Release a reference to an SSE connection
+ */
+function releaseSSEConnection(projectId: string) {
+  const conn = sseConnections.get(projectId);
+  if (conn) {
+    conn.refCount--;
+    if (conn.refCount <= 0) {
+      // Clean up everything
+      stopPingMonitoring(conn);
+      if (conn.reconnectTimeout) {
+        clearTimeout(conn.reconnectTimeout);
+      }
+      if (conn.eventSource) {
+        conn.eventSource.close();
+      }
+      conn.statusHandlers.clear();
+      conn.lastHashes = {};
+      conn.handlers.clear();
+      sseConnections.delete(projectId);
+    }
+  }
+}
+
+/**
+ * Subscribe to changes for a specific namespace
+ */
+function subscribeToChanges(
+  projectId: string, 
+  namespace: string, 
+  onNamespaceChange: () => void,
+  onStatusChange?: StatusHandler,
+  onReconnect?: () => void
+): () => void {
+  const conn = getSSEConnection(projectId);
+
+  const handler: ChangeHandler = (changedNamespace) => {
+    if (changedNamespace === namespace) {
+      onNamespaceChange();
+    }
+  };
+
+  conn.handlers.add(handler);
+
+  // Wrap status handler to also trigger reconnect callback
+  let wasDisconnected = conn.status !== 'connected';
+  const wrappedStatusHandler: StatusHandler = (status) => {
+    // Call reconnect callback when transitioning to connected
+    if (status === 'connected' && wasDisconnected) {
+      onReconnect?.();
+    }
+    wasDisconnected = status !== 'connected';
+    onStatusChange?.(status);
+  };
+
+  if (onStatusChange || onReconnect) {
+    conn.statusHandlers.add(wrappedStatusHandler);
+    // Immediately notify of current status
+    onStatusChange?.(conn.status);
+  }
+
+  return () => {
+    conn.handlers.delete(handler);
+    if (onStatusChange || onReconnect) {
+      conn.statusHandlers.delete(wrappedStatusHandler);
+    }
+    releaseSSEConnection(projectId);
+  };
+}
+
+/**
+ * Subscribe to global SSE status changes across all projects
+ */
+export function subscribeToGlobalSSEStatus(listener: (projectId: string, status: SSEConnectionStatus) => void): () => void {
+  globalStatusListeners.add(listener);
+  return () => {
+    globalStatusListeners.delete(listener);
+  };
+}
+
+// ============================================================================
+// useDelta Hook
+// ============================================================================
+
+/**
+ * Generic delta hook for fetching data with SSE push notifications
+ */
+export function useDelta<T>(
+  namespace: string,
+  projectId: string | null,
+  options: UseDeltaOptions<T> = {}
+): UseDeltaResult<T> {
+  const {
+    enabled = true,
+    onData,
+    onError,
+    initialData = null,
+  } = options;
+
+  // Memoize initialData to prevent infinite loops when callers pass inline arrays/objects
+  const stableInitialData = useMemo(() => initialData, []);
+
+  const [data, setData] = useState<T | null>(stableInitialData);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+  const cacheIdRef = useRef<string | null>(null);
+  const mountedRef = useRef(true);
+  const dataRef = useRef<T | null>(stableInitialData);
+  const fetchDataRef = useRef<() => Promise<void>>(async () => {});
+
+  // Keep dataRef in sync with data
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
+
+  const fetchData = useCallback(async () => {
+    if (!projectId || !enabled) return;
+
+    try {
+      const result = await fetchDelta<T>(
+        `/api/delta/${projectId}/${namespace}`,
+        cacheIdRef.current,
+        projectId
+      );
+
+      if (!mountedRef.current) return;
+
+      if (result.hasChanges) {
+        cacheIdRef.current = result.cacheId;
+
+        if (result.isFull) {
+          // Full replacement
+          setData(result.data);
+          onData?.(result.data!);
+        } else if (result.data && Array.isArray(dataRef.current)) {
+          // Delta merge for list data
+          const merged = mergeDelta(
+            dataRef.current as (T & { id: string })[],
+            result.data as unknown as DeltaDiff<T & { id: string }>
+          ) as T;
+          setData(merged);
+          onData?.(merged);
+        } else if (result.data) {
+          // Object update - just replace
+          setData(result.data);
+          onData?.(result.data);
+        }
+      }
+
+      setError(null);
+      setLoading(false);
+    } catch (err) {
+      if (!mountedRef.current) return;
+
+      const error = err instanceof Error ? err : new Error(String(err));
+      setError(error);
+      setLoading(false);
+      onError?.(error);
+    }
+  }, [namespace, projectId, enabled, onData, onError]);
+
+  // Keep fetchDataRef in sync with fetchData to avoid stale closures in SSE callbacks
+  useEffect(() => {
+    fetchDataRef.current = fetchData;
+  }, [fetchData]);
+
+  // Initial fetch and SSE subscription
+  useEffect(() => {
+    if (!projectId || !enabled) return;
+
+    mountedRef.current = true;
+    cacheIdRef.current = null;
+    // Reset data when project/namespace changes to prevent stale data accumulation
+    setData(stableInitialData);
+    dataRef.current = stableInitialData;
+    setLoading(true);
+
+    // Initial fetch
+    fetchDataRef.current();
+
+    // Subscribe to SSE changes for this namespace
+    const unsubscribe = subscribeToChanges(
+      projectId,
+      namespace,
+      () => {
+        // Fetch immediately when notified of changes
+        fetchDataRef.current();
+      },
+      undefined, // Status handler not needed per-hook
+      () => {
+        // On SSE reconnect, refetch to ensure we didn't miss anything
+        fetchDataRef.current();
+      }
+    );
+
+    return () => {
+      mountedRef.current = false;
+      unsubscribe();
+    };
+  }, [namespace, projectId, enabled, stableInitialData]);
+
+  // NOTE: No fallback polling here - polling is handled by useSSEStatus hook
+  // and triggered externally via refresh callbacks
+
+  const refresh = useCallback(async () => {
+    cacheIdRef.current = null;
+    await fetchData();
+  }, [fetchData]);
+
+  return {
+    data,
+    loading,
+    error,
+    refresh,
+    cacheId: cacheIdRef.current,
+  };
+}
+
+// ============================================================================
+// SSE Status Hook
+// ============================================================================
+
+/**
+ * Calculate exponential backoff delay
+ */
+function getRetryDelay(attempt: number, initialDelay: number): number {
+  return Math.min(initialDelay * Math.pow(2, attempt), 30000); // Cap at 30 seconds
+}
+
+/**
+ * Hook for SSE connection status and polling control
+ */
+export function useSSEStatus(projectId: string | null) {
+  const [status, setStatus] = useState<SSEConnectionStatus>('connecting');
+  const [pollingEnabled, setPollingEnabled] = useState(false);
+  const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const refreshCallbacksRef = useRef<Set<() => void>>(new Set());
+
+  useEffect(() => {
+    if (!projectId) return;
+
+    // Get or create connection to track its status
+    const conn = getSSEConnection(projectId);
+    setStatus(conn.status);
+
+    const statusHandler: StatusHandler = (newStatus) => {
+      setStatus(newStatus);
+      // If we reconnect successfully, disable polling
+      if (newStatus === 'connected' && pollingEnabled) {
+        setPollingEnabled(false);
+      }
+    };
+
+    conn.statusHandlers.add(statusHandler);
+
+    return () => {
+      conn.statusHandlers.delete(statusHandler);
+      releaseSSEConnection(projectId);
+    };
+  }, [projectId, pollingEnabled]);
+
+  // Handle polling
+  useEffect(() => {
+    if (pollingEnabled && projectId) {
+      pollingIntervalRef.current = setInterval(() => {
+        refreshCallbacksRef.current.forEach(cb => cb());
+      }, 5000);
+    } else if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
+    }
+
+    return () => {
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+      }
+    };
+  }, [pollingEnabled, projectId]);
+
+  const enablePolling = useCallback(() => {
+    setPollingEnabled(true);
+  }, []);
+
+  const registerRefreshCallback = useCallback((callback: () => void) => {
+    refreshCallbacksRef.current.add(callback);
+    return () => {
+      refreshCallbacksRef.current.delete(callback);
+    };
+  }, []);
+
+  return { 
+    status, 
+    pollingEnabled, 
+    enablePolling,
+    registerRefreshCallback,
+    isDisconnected: status === 'error' && !pollingEnabled,
+  };
+}
+
+// ============================================================================
+// Specialized Delta Hooks
+// ============================================================================
+
+import type { FileTreeData, GitStatus, TerminalSession, Task, Proposal, ProjectCoverage, TestResults, ValidatorResult } from '../types';
+
+/**
+ * Hook for file tree data
+ */
+export function useFileTree(projectId: string | null) {
+  return useDelta<FileTreeData>('files', projectId);
+}
+
+/**
+ * Hook for git status
+ */
+export function useGitStatus(projectId: string | null) {
+  return useDelta<GitStatus>('git_status', projectId);
+}
+
+/**
+ * Hook for terminal sessions
+ */
+export function useTerminals(projectId: string | null) {
+  return useDelta<TerminalSession[]>('terminals', projectId, {
+    initialData: [],
+  });
+}
+
+/**
+ * Hook for tasks list
+ */
+export function useTasks(projectId: string | null) {
+  return useDelta<Task[]>('tasks', projectId, {
+    initialData: [],
+  });
+}
+
+/**
+ * Hook for project coverage data
+ * 
+ * Returns coverage information for all files in the project,
+ * including line hits and summary statistics.
+ */
+export function useCoverage(projectId: string | null) {
+  return useDelta<ProjectCoverage>('coverage', projectId, {
+    initialData: {
+      files: {},
+      summary: undefined,
+      last_updated: undefined,
+    },
+  });
+}
+
+/**
+ * Hook for test results
+ * 
+ * Returns the latest test run results including:
+ * - Pass/fail/skip counts
+ * - Individual test failures with line numbers
+ */
+export function useTestResults(projectId: string | null) {
+  return useDelta<TestResults>('test_results', projectId, {
+    initialData: {
+      passed: 0,
+      failed: 0,
+      skipped: 0,
+      failures: [],
+    },
+  });
+}
+
+/**
+ * Hook for validator results
+ * 
+ * Returns lint/validation errors across project files
+ */
+export function useValidatorResults(projectId: string | null) {
+  return useDelta<ValidatorResult[]>('validator_results', projectId, {
+    initialData: [],
+  });
+}
+
+/**
+ * Hook for proposals list
+ */
+export function useProposals(projectId: string | null) {
+  return useDelta<Proposal[]>('proposals', projectId, {
+    initialData: [],
+  });
+}
+```
+
+# === RESULT ===
+/**
+ * useDelta - The core data abstraction for V2
+ * 
+ * This hook uses Server-Sent Events (SSE) only for real-time push notifications
+ * combined with delta fetching for efficient data updates.
+ * 
+ * Mechanism:
+ * 1. Mount: Component calls useDelta(namespace, projectId)
+ * 2. SSE: A shared EventSource connection listens for change notifications
+ * 3. On change: Hook fetches /delta/{project_id}/{namespace} immediately
+ * 4. Diffing:
+ *    - 204 No Content: Do nothing
+ *    - 200 OK (Full): Replace local state
+ *    - 200 OK (Delta): Merge changes (added, removed, updated)
+ * 5. Render: Component re-renders with fresh data
+ * 
+ * SSE Connection with Ping-Based Monitoring:
+ * - Server sends ping events every 300ms
+ * - Client monitors ping arrival and detects connection loss within 1 second
+ * - On connection loss, exponential backoff is used for reconnection (100ms -> 200ms -> 400ms ... up to 30s)
+ * - After MAX_RECONNECT_ATTEMPTS (10), status becomes 'error' and user can enable polling fallback
+ * 
+ * Error Recovery Features:
+ * - Aggressive ping-based connection monitoring (ideal for mobile)
+ * - Exponential backoff for retries
+ * - IndexedDB offline cache support
+ * - Delta conflict resolution
+ */
+
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { fetchDelta } from '../lib/http';
+import type { DeltaDiff } from '../types';
+
+// ============================================================================
+// IndexedDB Offline Cache
+// ============================================================================
+
+const DB_NAME = 'sprocket_delta_cache';
+const DB_VERSION = 1;
+const STORE_NAME = 'delta_data';
+
+interface CachedData<T> {
+  key: string;
+  data: T;
+  cacheId: string;
+  timestamp: number;
+}
+
+let dbPromise: Promise<IDBDatabase> | null = null;
+
+function openDatabase(): Promise<IDBDatabase> {
+  if (dbPromise) return dbPromise;
+
+  dbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+      }
+    };
+  });
+
+  return dbPromise;
+}
+
+async function getCachedData<T>(key: string): Promise<CachedData<T> | null> {
+  try {
+    const db = await openDatabase();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, 'readonly');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.get(key);
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result || null);
+    });
+  } catch (error) {
+    console.warn('[DeltaCache] Failed to read from cache:', error);
+    return null;
+  }
+}
+
+async function setCachedData<T>(key: string, data: T, cacheId: string): Promise<void> {
+  try {
+    const db = await openDatabase();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.put({
+        key,
+        data,
+        cacheId,
+        timestamp: Date.now(),
+      });
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve();
+    });
+  } catch (error) {
+    console.warn('[DeltaCache] Failed to write to cache:', error);
+  }
+}
+
+async function clearExpiredCache(maxAgeMs: number = 24 * 60 * 60 * 1000): Promise<void> {
+  try {
+    const db = await openDatabase();
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.openCursor();
+
+    const cutoff = Date.now() - maxAgeMs;
+
+    request.onsuccess = (event) => {
+      const cursor = (event.target as IDBRequest<IDBCursorWithValue>).result;
+      if (cursor) {
+        if (cursor.value.timestamp < cutoff) {
+          cursor.delete();
+        }
+        cursor.continue();
+      }
+    };
+  } catch (error) {
+    console.warn('[DeltaCache] Failed to clear expired cache:', error);
+  }
+}
+
+// Clear expired cache on module load
+if (typeof indexedDB !== 'undefined') {
+  clearExpiredCache();
+}
+
+export interface UseDeltaOptions<T> {
+  /** Fallback polling interval in milliseconds (only used if user enables it). Default: 5000ms */
+  fallbackInterval?: number;
+  /** Whether to start fetching immediately. Default: true */
+  enabled?: boolean;
+  /** Callback when data changes */
+  onData?: (data: T) => void;
+  /** Callback on error */
+  onError?: (error: Error) => void;
+  /** Initial data */
+  initialData?: T;
+  /** Enable offline cache. Default: true */
+  enableCache?: boolean;
+  /** Max retry attempts for fetch failures. Default: 3 */
+  maxRetries?: number;
+  /** Initial retry delay in ms for exponential backoff. Default: 1000 */
+  initialRetryDelay?: number;
+}
+
+export interface UseDeltaResult<T> {
+  /** The current data */
+  data: T | null;
+  /** Whether the initial load is in progress */
+  loading: boolean;
+  /** Any error that occurred */
+  error: Error | null;
+  /** Force a refresh */
+  refresh: () => Promise<void>;
+  /** Current cache ID (for debugging) */
+  cacheId: string | null;
+  /** Whether data was loaded from offline cache */
+  isFromCache: boolean;
+  /** Whether currently online */
+  isOnline: boolean;
+  /** Number of retry attempts */
+  retryCount: number;
+}
+
+/**
+ * Merge delta changes into existing list data
+ */
+function mergeDelta<T extends { id: string }>(
+  currentData: T[],
+  delta: DeltaDiff<T>
+): T[] {
+  const result = [...currentData];
+
+  // Remove items
+  const removedSet = new Set(delta.removed);
+  const filtered = result.filter(item => !removedSet.has(item.id));
+
+  // Update items
+  const updatedMap = new Map(delta.updated.map(item => [item.id, item]));
+  const updated = filtered.map(item => updatedMap.get(item.id) || item);
+
+  // Add new items
+  return [...updated, ...delta.added];
+}
+
+// ============================================================================
+// Shared SSE Connection Manager
+// ============================================================================
+
+export type SSEConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
+
+type ChangeHandler = (namespace: string, hash: string) => void;
+type StatusHandler = (status: SSEConnectionStatus) => void;
+
+interface SSEConnection {
+  eventSource: EventSource | null;
+  handlers: Set<ChangeHandler>;
+  statusHandlers: Set<StatusHandler>;
+  refCount: number;
+  lastHashes: Record<string, string>;
+  status: SSEConnectionStatus;
+  reconnectAttempts: number;
+  maxReconnectAttempts: number;
+  // Ping-based connection monitoring
+  lastPingTime: number;
+  pingCheckInterval: ReturnType<typeof setInterval> | null;
+  reconnectTimeout: ReturnType<typeof setTimeout> | null;
+  projectId: string;
+}
+
+const sseConnections = new Map<string, SSEConnection>();
+const globalStatusListeners = new Set<(projectId: string, status: SSEConnectionStatus) => void>();
+
+// Ping configuration for aggressive mobile reconnection
+// Note: Server sends pings every 300ms (PING_INTERVAL_SECONDS = 0.3 in backend)
+const PING_TIMEOUT_MS = 1000; // Consider connection lost if no ping for 1 second
+const PING_CHECK_INTERVAL_MS = 200; // Check for ping timeout every 200ms
+const MAX_RECONNECT_ATTEMPTS = 10; // More attempts for mobile
+const INITIAL_RECONNECT_DELAY_MS = 100; // Start fast for mobile
+const MAX_RECONNECT_DELAY_MS = 30000; // Cap at 30 seconds
+
+/**
+ * Calculate exponential backoff delay for reconnection
+ */
+function getReconnectDelay(attempt: number): number {
+  const delay = INITIAL_RECONNECT_DELAY_MS * Math.pow(2, attempt);
+  return Math.min(delay, MAX_RECONNECT_DELAY_MS);
+}
+
+/**
+ * Update connection status and notify all listeners
+ */
+function updateConnectionStatus(conn: SSEConnection, newStatus: SSEConnectionStatus) {
+  if (conn.status === newStatus) return;
+  
+  conn.status = newStatus;
+  console.log(`[SSE] Status changed to: ${newStatus} (attempts: ${conn.reconnectAttempts})`);
+  conn.statusHandlers.forEach(handler => handler(newStatus));
+  globalStatusListeners.forEach(listener => listener(conn.projectId, newStatus));
+}
+
+/**
+ * Start ping-based connection monitoring
+ */
+function startPingMonitoring(conn: SSEConnection) {
+  // Clear any existing interval
+  if (conn.pingCheckInterval) {
+    clearInterval(conn.pingCheckInterval);
+  }
+
+  conn.pingCheckInterval = setInterval(() => {
+    const now = Date.now();
+    const timeSinceLastPing = now - conn.lastPingTime;
+
+    // If we haven't received a ping in too long, connection is likely lost
+    if (timeSinceLastPing > PING_TIMEOUT_MS && conn.status === 'connected') {
+      console.log(`[SSE] Ping timeout detected (${timeSinceLastPing}ms since last ping)`);
+      handleConnectionLoss(conn);
+    }
+  }, PING_CHECK_INTERVAL_MS);
+}
+
+/**
+ * Stop ping monitoring
+ */
+function stopPingMonitoring(conn: SSEConnection) {
+  if (conn.pingCheckInterval) {
+    clearInterval(conn.pingCheckInterval);
+    conn.pingCheckInterval = null;
+  }
+}
+
+/**
+ * Handle connection loss - close EventSource and schedule reconnect
+ */
+function handleConnectionLoss(conn: SSEConnection) {
+  stopPingMonitoring(conn);
+  
+  if (conn.eventSource) {
+    conn.eventSource.close();
+    conn.eventSource = null;
+  }
+
+  updateConnectionStatus(conn, 'disconnected');
+  scheduleReconnect(conn);
+}
+
+/**
+ * Schedule a reconnection attempt with exponential backoff
+ */
+function scheduleReconnect(conn: SSEConnection) {
+  // Clear any existing reconnect timeout
+  if (conn.reconnectTimeout) {
+    clearTimeout(conn.reconnectTimeout);
+  }
+
+  if (conn.reconnectAttempts >= conn.maxReconnectAttempts) {
+    console.log(`[SSE] Max reconnect attempts (${conn.maxReconnectAttempts}) reached`);
+    updateConnectionStatus(conn, 'error');
+    return;
+  }
+
+  const delay = getReconnectDelay(conn.reconnectAttempts);
+  console.log(`[SSE] Scheduling reconnect in ${delay}ms (attempt ${conn.reconnectAttempts + 1}/${conn.maxReconnectAttempts})`);
+
+  updateConnectionStatus(conn, 'connecting');
+
+  conn.reconnectTimeout = setTimeout(() => {
+    conn.reconnectAttempts++;
+    createEventSource(conn);
+  }, delay);
+}
+
+/**
+ * Create and configure EventSource for a connection
+ */
+function createEventSource(conn: SSEConnection) {
+  // Close existing EventSource if any
+  if (conn.eventSource) {
+    conn.eventSource.close();
+  }
+
+  const eventSource = new EventSource(`/api/stream/${conn.projectId}`);
+  conn.eventSource = eventSource;
+  conn.lastPingTime = Date.now(); // Initialize ping time
+
+  // Handle init event (initial hashes)
+  eventSource.addEventListener('init', (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      conn.lastHashes = data.hashes || {};
+      conn.lastPingTime = Date.now(); // Init counts as activity
+    } catch (e) {
+      console.error('[SSE] Failed to parse init event:', e);
+    }
+  });
+
+  // Handle ping events - update last ping time (no response needed)
+  eventSource.addEventListener('ping', () => {
+    conn.lastPingTime = Date.now();
+    
+    // If we were reconnecting/disconnected and get a ping, we're connected
+    if (conn.status !== 'connected') {
+      conn.reconnectAttempts = 0;
+      updateConnectionStatus(conn, 'connected');
+      startPingMonitoring(conn);
+    }
+  });
+
+  // Handle successful connection
+  eventSource.onopen = () => {
+    console.log('[SSE] EventSource opened');
+    conn.lastPingTime = Date.now();
+    conn.reconnectAttempts = 0;
+    updateConnectionStatus(conn, 'connected');
+    startPingMonitoring(conn);
+  };
+
+  // Handle change events
+  eventSource.onmessage = (event) => {
+    conn.lastPingTime = Date.now(); // Any message counts as activity
+    
+    try {
+      const data = JSON.parse(event.data);
+      const { namespace, hash } = data;
+
+      // Only notify if hash actually changed
+      if (conn.lastHashes[namespace] !== hash) {
+        conn.lastHashes[namespace] = hash;
+        conn.handlers.forEach(handler => handler(namespace, hash));
+      }
+    } catch (e) {
+      console.error('[SSE] Parse error:', e);
+    }
+  };
+
+  // Handle errors - let ping monitoring handle reconnection
+  eventSource.onerror = () => {
+    console.log('[SSE] EventSource error');
+    // Don't immediately reconnect - let ping monitoring detect if connection is truly lost
+    // This prevents rapid reconnection loops when the error is transient
+    if (eventSource.readyState === EventSource.CLOSED) {
+      handleConnectionLoss(conn);
+    }
+  };
+}
+
+/**
+ * Get or create a shared SSE connection for a project
+ */
+function getSSEConnection(projectId: string): SSEConnection {
+  let conn = sseConnections.get(projectId);
+
+  if (!conn) {
+    conn = {
+      eventSource: null,
+      handlers: new Set(),
+      statusHandlers: new Set(),
+      refCount: 0,
+      lastHashes: {},
+      status: 'connecting',
+      reconnectAttempts: 0,
+      maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
+      lastPingTime: Date.now(),
+      pingCheckInterval: null,
+      reconnectTimeout: null,
+      projectId,
+    };
+
+    sseConnections.set(projectId, conn);
+    createEventSource(conn);
+  }
+
+  conn.refCount++;
+  return conn;
+}
+
+/**
+ * Release a reference to an SSE connection
+ */
+function releaseSSEConnection(projectId: string) {
+  const conn = sseConnections.get(projectId);
+  if (conn) {
+    conn.refCount--;
+    if (conn.refCount <= 0) {
+      // Clean up everything
+      stopPingMonitoring(conn);
+      if (conn.reconnectTimeout) {
+        clearTimeout(conn.reconnectTimeout);
+      }
+      if (conn.eventSource) {
+        conn.eventSource.close();
+      }
+      conn.statusHandlers.clear();
+      conn.lastHashes = {};
+      conn.handlers.clear();
+      sseConnections.delete(projectId);
+    }
+  }
+}
+
+/**
+ * Subscribe to changes for a specific namespace
+ */
+function subscribeToChanges(
+  projectId: string, 
+  namespace: string, 
+  onNamespaceChange: () => void,
+  onStatusChange?: StatusHandler,
+  onReconnect?: () => void
+): () => void {
+  const conn = getSSEConnection(projectId);
+
+  const handler: ChangeHandler = (changedNamespace) => {
+    if (changedNamespace === namespace) {
+      onNamespaceChange();
+    }
+  };
+
+  conn.handlers.add(handler);
+
+  // Wrap status handler to also trigger reconnect callback
+  let wasDisconnected = conn.status !== 'connected';
+  const wrappedStatusHandler: StatusHandler = (status) => {
+    // Call reconnect callback when transitioning to connected
+    if (status === 'connected' && wasDisconnected) {
+      onReconnect?.();
+    }
+    wasDisconnected = status !== 'connected';
+    onStatusChange?.(status);
+  };
+
+  if (onStatusChange || onReconnect) {
+    conn.statusHandlers.add(wrappedStatusHandler);
+    // Immediately notify of current status
+    onStatusChange?.(conn.status);
+  }
+
+  return () => {
+    conn.handlers.delete(handler);
+    if (onStatusChange || onReconnect) {
+      conn.statusHandlers.delete(wrappedStatusHandler);
+    }
+    releaseSSEConnection(projectId);
+  };
+}
+
+/**
+ * Subscribe to global SSE status changes across all projects
+ */
+export function subscribeToGlobalSSEStatus(listener: (projectId: string, status: SSEConnectionStatus) => void): () => void {
+  globalStatusListeners.add(listener);
+  return () => {
+    globalStatusListeners.delete(listener);
+  };
+}
+
+// ============================================================================
+// useDelta Hook
+// ============================================================================
+
+/**
+ * Generic delta hook for fetching data with SSE push notifications
+ */
+export function useDelta<T>(
+  namespace: string,
+  projectId: string | null,
+  options: UseDeltaOptions<T> = {}
+): UseDeltaResult<T> {
+  const {
+    enabled = true,
+    onData,
+    onError,
+    initialData = null,
+  } = options;
+
+  // Memoize initialData to prevent infinite loops when callers pass inline arrays/objects
+  const stableInitialData = useMemo(() => initialData, []);
+
+  const [data, setData] = useState<T | null>(stableInitialData);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+  const cacheIdRef = useRef<string | null>(null);
+  const mountedRef = useRef(true);
+  const dataRef = useRef<T | null>(stableInitialData);
+  const fetchDataRef = useRef<() => Promise<void>>(async () => {});
+
+  // Keep dataRef in sync with data
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
+
+  const fetchData = useCallback(async () => {
+    if (!projectId || !enabled) return;
+
+    try {
+      const result = await fetchDelta<T>(
+        `/api/delta/${projectId}/${namespace}`,
+        cacheIdRef.current,
+        projectId
+      );
+
+      if (!mountedRef.current) return;
+
+      if (result.hasChanges) {
+        cacheIdRef.current = result.cacheId;
+
+        if (result.isFull) {
+          // Full replacement
+          setData(result.data);
+          onData?.(result.data!);
+        } else if (result.data && Array.isArray(dataRef.current)) {
+          // Delta merge for list data
+          const merged = mergeDelta(
+            dataRef.current as (T & { id: string })[],
+            result.data as unknown as DeltaDiff<T & { id: string }>
+          ) as T;
+          setData(merged);
+          onData?.(merged);
+        } else if (result.data) {
+          // Object update - just replace
+          setData(result.data);
+          onData?.(result.data);
+        }
+      }
+
+      setError(null);
+      setLoading(false);
+    } catch (err) {
+      if (!mountedRef.current) return;
+
+      const error = err instanceof Error ? err : new Error(String(err));
+      setError(error);
+      setLoading(false);
+      onError?.(error);
+    }
+  }, [namespace, projectId, enabled, onData, onError]);
+
+  // Keep fetchDataRef in sync with fetchData to avoid stale closures in SSE callbacks
+  useEffect(() => {
+    fetchDataRef.current = fetchData;
+  }, [fetchData]);
+
+  // Initial fetch and SSE subscription
+  useEffect(() => {
+    if (!projectId || !enabled) return;
+
+    mountedRef.current = true;
+    cacheIdRef.current = null;
+    // Reset data when project/namespace changes to prevent stale data accumulation
+    setData(stableInitialData);
+    dataRef.current = stableInitialData;
+    setLoading(true);
+
+    // Initial fetch
+    fetchDataRef.current();
+
+    // Subscribe to SSE changes for this namespace
+    const unsubscribe = subscribeToChanges(
+      projectId,
+      namespace,
+      () => {
+        // Fetch immediately when notified of changes
+        fetchDataRef.current();
+      },
+      undefined, // Status handler not needed per-hook
+      () => {
+        // On SSE reconnect, refetch to ensure we didn't miss anything
+        fetchDataRef.current();
+      }
+    );
+
+    return () => {
+      mountedRef.current = false;
+      unsubscribe();
+    };
+  }, [namespace, projectId, enabled, stableInitialData]);
+
+  // NOTE: No fallback polling here - polling is handled by useSSEStatus hook
+  // and triggered externally via refresh callbacks
+
+  const refresh = useCallback(async () => {
+    cacheIdRef.current = null;
+    await fetchData();
+  }, [fetchData]);
+
+  return {
+    data,
+    loading,
+    error,
+    refresh,
+    cacheId: cacheIdRef.current,
+  };
+}
+
+// ============================================================================
+// SSE Status Hook
+// ============================================================================
+
+/**
+ * Calculate exponential backoff delay
+ */
+function getRetryDelay(attempt: number, initialDelay: number): number {
+  return Math.min(initialDelay * Math.pow(2, attempt), 30000); // Cap at 30 seconds
+}
+
+/**
+ * Hook for SSE connection status and polling control
+ */
+export function useSSEStatus(projectId: string | null) {
+  const [status, setStatus] = useState<SSEConnectionStatus>('connecting');
+  const [pollingEnabled, setPollingEnabled] = useState(false);
+  const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const refreshCallbacksRef = useRef<Set<() => void>>(new Set());
+
+  useEffect(() => {
+    if (!projectId) return;
+
+    // Get or create connection to track its status
+    const conn = getSSEConnection(projectId);
+    setStatus(conn.status);
+
+    const statusHandler: StatusHandler = (newStatus) => {
+      setStatus(newStatus);
+      // If we reconnect successfully, disable polling
+      if (newStatus === 'connected' && pollingEnabled) {
+        setPollingEnabled(false);
+      }
+    };
+
+    conn.statusHandlers.add(statusHandler);
+
+    return () => {
+      conn.statusHandlers.delete(statusHandler);
+      releaseSSEConnection(projectId);
+    };
+  }, [projectId, pollingEnabled]);
+
+  // Handle polling
+  useEffect(() => {
+    if (pollingEnabled && projectId) {
+      pollingIntervalRef.current = setInterval(() => {
+        refreshCallbacksRef.current.forEach(cb => cb());
+      }, 5000);
+    } else if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
+    }
+
+    return () => {
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+      }
+    };
+  }, [pollingEnabled, projectId]);
+
+  const enablePolling = useCallback(() => {
+    setPollingEnabled(true);
+  }, []);
+
+  const registerRefreshCallback = useCallback((callback: () => void) => {
+    refreshCallbacksRef.current.add(callback);
+    return () => {
+      refreshCallbacksRef.current.delete(callback);
+    };
+  }, []);
+
+  return { 
+    status, 
+    pollingEnabled, 
+    enablePolling,
+    registerRefreshCallback,
+    isDisconnected: status === 'error' && !pollingEnabled,
+  };
+}
+
+// ============================================================================
+// Specialized Delta Hooks
+// ============================================================================
+
+import type { FileTreeData, GitStatus, TerminalSession, Task, Proposal, ProjectCoverage, TestResults, ValidatorResult } from '../types';
+
+/**
+ * Hook for file tree data
+ */
+export function useFileTree(projectId: string | null) {
+  return useDelta<FileTreeData>('files', projectId);
+}
+
+/**
+ * Hook for git status
+ */
+export function useGitStatus(projectId: string | null) {
+  return useDelta<GitStatus>('git_status', projectId);
+}
+
+/**
+ * Hook for terminal sessions
+ */
+export function useTerminals(projectId: string | null) {
+  return useDelta<TerminalSession[]>('terminals', projectId, {
+    initialData: [],
+  });
+}
+
+/**
+ * Hook for tasks list
+ */
+export function useTasks(projectId: string | null) {
+  return useDelta<Task[]>('tasks', projectId, {
+    initialData: [],
+  });
+}
+
+/**
+ * Hook for project coverage data
+ * 
+ * Returns coverage information for all files in the project,
+ * including line hits and summary statistics.
+ */
+export function useCoverage(projectId: string | null) {
+  return useDelta<ProjectCoverage>('coverage', projectId, {
+    initialData: {
+      files: {},
+      summary: undefined,
+      last_updated: undefined,
+    },
+  });
+}
+
+/**
+ * Hook for test results
+ * 
+ * Returns the latest test run results including:
+ * - Pass/fail/skip counts
+ * - Individual test failures with line numbers
+ */
+export function useTestResults(projectId: string | null) {
+  return useDelta<TestResults>('test_results', projectId, {
+    initialData: {
+      passed: 0,
+      failed: 0,
+      skipped: 0,
+      failures: [],
+    },
+  });
+}
+
+/**
+ * Hook for validator results
+ * 
+ * Returns lint/validation errors across project files
+ */
+export function useValidatorResults(projectId: string | null) {
+  return useDelta<ValidatorResult[]>('validator_results', projectId, {
+    initialData: [],
+  });
+}
+
+/**
+ * Hook for proposals list
+ */
+export function useProposals(projectId: string | null) {
+  return useDelta<Proposal[]>('proposals', projectId, {
+    initialData: [],
+  });
+}

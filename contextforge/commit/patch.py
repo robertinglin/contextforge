@@ -838,53 +838,137 @@ def _find_all_hunk_candidates(
                 lead_slice = lead_ctx[-min(ctx_probe, len(lead_ctx)) :] if lead_ctx else []
                 tail_slice = tail_ctx[: min(ctx_probe, len(tail_ctx))] if tail_ctx else []
 
-                lead_hits = (
+                # Find both exact and loose matches
+                # Exact matches preserve whitespace, loose matches ignore it
+                lead_hits_exact = set(
+                    _find_block_matches(target_lines, lead_slice, loose=False) if lead_slice else []
+                )
+                tail_hits_exact = set(
+                    _find_block_matches(target_lines, tail_slice, loose=False) if tail_slice else []
+                )
+                lead_hits_loose = set(
                     _find_block_matches(target_lines, lead_slice, loose=True) if lead_slice else []
                 )
-                tail_hits = (
+                tail_hits_loose = set(
                     _find_block_matches(target_lines, tail_slice, loose=True) if tail_slice else []
                 )
 
+                # Loose-only hits (matches that work with loose but not exact matching)
+                lead_hits_loose_only = lead_hits_loose - lead_hits_exact
+                tail_hits_loose_only = tail_hits_loose - tail_hits_exact
+
                 candidates = []
 
-                if lead_hits and tail_hits:
-                    # Find all valid insertion points between lead and tail matches
-                    for L in lead_hits:
+                # Build all candidates with appropriate confidence scores
+                # IMPORTANT: Exact whitespace matches get MUCH higher confidence than loose matches
+                # because LLMs often hallucinate line numbers but rarely get indentation wrong.
+                # This means we prefer exact matches even if they're far from the hint line number.
+
+                # Exact lead + exact tail (highest confidence)
+                if lead_hits_exact and tail_hits_exact:
+                    for L in lead_hits_exact:
                         L_end = L + len(lead_slice)
-                        for T in tail_hits:
-                            # Use <= for search_max to allow insertions at exact end of file
+                        for T in tail_hits_exact:
                             if search_min <= L_end <= T <= search_max:
                                 candidates.append(
                                     {
                                         "start_idx": L_end,
                                         "end_idx": L_end,
                                         "replacement_lines": addition_lines,
-                                        "match_type": "pure_addition",
-                                        "confidence": 0.9,
+                                        "match_type": "pure_addition_exact",
+                                        "confidence": 0.98,
                                         "distance_from_hint": abs(L_end - start_hint),
                                     }
                                 )
-                elif lead_hits:
-                    # Only lead context matches - use it with lower confidence
-                    for L in lead_hits:
+
+                # Exact lead + loose tail (high confidence - tail has minor whitespace differences)
+                # This handles cases where trailing whitespace differs but position is still reliable
+                if lead_hits_exact and tail_hits_loose:
+                    for L in lead_hits_exact:
                         L_end = L + len(lead_slice)
-                        # Use <= for search_max to allow insertions at exact end of file
+                        for T in tail_hits_loose:
+                            if search_min <= L_end <= T <= search_max:
+                                # Skip if we already have this position from exact+exact
+                                if not any(c["start_idx"] == L_end and c["confidence"] >= 0.98 for c in candidates):
+                                    candidates.append(
+                                        {
+                                            "start_idx": L_end,
+                                            "end_idx": L_end,
+                                            "replacement_lines": addition_lines,
+                                            "match_type": "pure_addition_exact_lead_loose_tail",
+                                            "confidence": 0.96,
+                                            "distance_from_hint": abs(L_end - start_hint),
+                                        }
+                                    )
+
+                # Exact lead only (high confidence) - no tail context available
+                if lead_hits_exact:
+                    for L in lead_hits_exact:
+                        L_end = L + len(lead_slice)
+                        if search_min <= L_end <= search_max:
+                            # Skip if we already have this position from exact+exact or exact+loose
+                            if not any(c["start_idx"] == L_end and c["confidence"] > 0.95 for c in candidates):
+                                candidates.append(
+                                    {
+                                        "start_idx": L_end,
+                                        "end_idx": L_end,
+                                        "replacement_lines": addition_lines,
+                                        "match_type": "pure_addition_exact_lead_only",
+                                        "confidence": 0.95,
+                                        "distance_from_hint": abs(L_end - start_hint),
+                                    }
+                                )
+
+                # Loose lead + loose tail (medium confidence) - only for loose-only matches
+                if lead_hits_loose_only and tail_hits_loose_only:
+                    for L in lead_hits_loose_only:
+                        L_end = L + len(lead_slice)
+                        for T in tail_hits_loose_only:
+                            if search_min <= L_end <= T <= search_max:
+                                candidates.append(
+                                    {
+                                        "start_idx": L_end,
+                                        "end_idx": L_end,
+                                        "replacement_lines": addition_lines,
+                                        "match_type": "pure_addition_loose",
+                                        "confidence": 0.85,
+                                        "distance_from_hint": abs(L_end - start_hint),
+                                    }
+                                )
+
+                # Loose lead only (lower confidence) - only for loose-only matches
+                if lead_hits_loose_only:
+                    for L in lead_hits_loose_only:
+                        L_end = L + len(lead_slice)
                         if search_min <= L_end <= search_max:
                             candidates.append(
                                 {
                                     "start_idx": L_end,
                                     "end_idx": L_end,
                                     "replacement_lines": addition_lines,
-                                    "match_type": "pure_addition_lead_only",
-                                    "confidence": 0.85,
+                                    "match_type": "pure_addition_loose_lead_only",
+                                    "confidence": 0.80,
                                     "distance_from_hint": abs(L_end - start_hint),
                                 }
                             )
 
                 # Only return early if we found candidates from matching context
                 if candidates:
-                    # Sort by distance from hint
-                    candidates.sort(key=lambda c: c["distance_from_hint"])
+                    # Sort by confidence first (descending).
+                    # For lead-only matches (no tail context), prefer positions closer to end of file
+                    # since pure additions typically add new functions/code at the end.
+                    # For matches with both lead+tail context, use distance from hint as tiebreaker
+                    # since we have more certainty about the exact position.
+                    # LLMs often hallucinate line numbers but rarely get indentation/spacing wrong.
+                    def sort_key(c):
+                        is_lead_only = "lead_only" in c["match_type"]
+                        if is_lead_only:
+                            # Prefer end of file for lead-only matches
+                            return (-c["confidence"], -c["start_idx"], c["distance_from_hint"])
+                        else:
+                            # Use distance from hint for matches with tail context
+                            return (-c["confidence"], c["distance_from_hint"], -c["start_idx"])
+                    candidates.sort(key=sort_key)
                     return candidates[:max_candidates]
 
                 # If no context-based candidates found, use insertion heuristic as fallback
