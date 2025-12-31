@@ -863,6 +863,10 @@ def _find_all_hunk_candidates(
                 # IMPORTANT: Exact whitespace matches get MUCH higher confidence than loose matches
                 # because LLMs often hallucinate line numbers but rarely get indentation wrong.
                 # This means we prefer exact matches even if they're far from the hint line number.
+                #
+                # CRITICAL: For pure additions with both lead AND tail context, prefer ADJACENT
+                # matches (where lead ends exactly where tail begins). This is much more reliable
+                # than LLM-provided line numbers for disambiguation.
 
                 # Exact lead + exact tail (highest confidence)
                 if lead_hits_exact and tail_hits_exact:
@@ -870,13 +874,17 @@ def _find_all_hunk_candidates(
                         L_end = L + len(lead_slice)
                         for T in tail_hits_exact:
                             if search_min <= L_end <= T <= search_max:
+                                # Adjacent matches (lead ends exactly where tail begins) get
+                                # highest confidence - this is the expected pattern for pure
+                                # additions inserting between existing context
+                                is_adjacent = (L_end == T)
                                 candidates.append(
                                     {
                                         "start_idx": L_end,
                                         "end_idx": L_end,
                                         "replacement_lines": addition_lines,
-                                        "match_type": "pure_addition_exact",
-                                        "confidence": 0.98,
+                                        "match_type": "pure_addition_exact_adjacent" if is_adjacent else "pure_addition_exact",
+                                        "confidence": 0.99 if is_adjacent else 0.95,
                                         "distance_from_hint": abs(L_end - start_hint),
                                     }
                                 )
@@ -889,14 +897,15 @@ def _find_all_hunk_candidates(
                         for T in tail_hits_loose:
                             if search_min <= L_end <= T <= search_max:
                                 # Skip if we already have this position from exact+exact
-                                if not any(c["start_idx"] == L_end and c["confidence"] >= 0.98 for c in candidates):
+                                if not any(c["start_idx"] == L_end and c["confidence"] >= 0.95 for c in candidates):
+                                    is_adjacent = (L_end == T)
                                     candidates.append(
                                         {
                                             "start_idx": L_end,
                                             "end_idx": L_end,
                                             "replacement_lines": addition_lines,
-                                            "match_type": "pure_addition_exact_lead_loose_tail",
-                                            "confidence": 0.96,
+                                            "match_type": "pure_addition_exact_lead_loose_tail_adjacent" if is_adjacent else "pure_addition_exact_lead_loose_tail",
+                                            "confidence": 0.97 if is_adjacent else 0.93,
                                             "distance_from_hint": abs(L_end - start_hint),
                                         }
                                     )

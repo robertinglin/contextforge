@@ -1,0 +1,1298 @@
+import React, { useState, useCallback, useEffect, useMemo } from "react";
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Play, Code, Eye, AlertTriangle, Terminal } from "lucide-react";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import ThemeSelector from "./ThemeSelector";
+
+// BoxMD Parser Implementation
+const createBoxMDParser = (onLog) => {
+  return {
+    tokens: [],
+    ast: {
+      type: "root",
+      children: [],
+      scripts: [],
+    },
+    logs: [],
+
+    addLog(message) {
+      this.logs.push(message);
+      onLog(message);
+    },
+
+    reset() {
+      this.tokens = [];
+      this.ast = {
+        type: "root",
+        children: [],
+        scripts: [],
+      };
+      this.logs = [];
+    },
+
+    tokenize(input) {
+      const lines = input.split("\n");
+      let inScript = false;
+      let currentScript = null;
+
+      this.addLog("Starting tokenization...");
+      this.addLog(`Total lines to process: ${lines.length}`);
+
+      lines.forEach((line, index) => {
+        const trimmedLine = line.trim();
+
+        // Get the raw line without the right border for better indentation detection
+        const lineWithoutRightBorder = line.replace(/[│┘┐]\s*$/, "");
+        const indentMatch = lineWithoutRightBorder.match(/^(\s*[│\s]*)/);
+        const lineIndent = indentMatch
+          ? Math.floor(indentMatch[1].replace(/[│]/g, " ").length / 2)
+          : 0;
+
+        this.addLog(
+          `Processing line ${index + 1}: [indent=${lineIndent}] ${line}`
+        );
+
+        // Handle script blocks
+        if (trimmedLine.startsWith("────") && trimmedLine.includes("Script:")) {
+          if (!inScript) {
+            const scriptName = trimmedLine.match(/\[ Script: (\w+) \]/)?.[1];
+            currentScript = {
+              type: "script",
+              name: scriptName,
+              content: [],
+              startLine: index,
+            };
+            this.addLog(
+              `Found script start: ${scriptName} at line ${index + 1}`
+            );
+            inScript = true;
+          } else {
+            currentScript.endLine = index;
+            this.ast.scripts.push(currentScript);
+            this.addLog(
+              `Found script end: ${currentScript.name} at line ${index + 1}`
+            );
+            inScript = false;
+            currentScript = null;
+          }
+          return;
+        }
+
+        if (inScript) {
+          currentScript.content.push(line);
+          this.addLog(`Added script line: ${line}`);
+          return;
+        }
+
+        // Component header detection - allow for indentation and borders
+        // Match both formats: [ Type: ID ] and [ Type ]
+        if (line.match(/.*[┌].*\[ .+?(:.*?)? \].*[┐]/)) {
+          const fullMatch = line.match(/\[ (.+?)(?::(.+?))? \]/);
+          if (fullMatch) {
+            const type = fullMatch[1];
+            const id = fullMatch[2];
+            const token = {
+              type: "component_start",
+              componentType: type.trim(),
+              id: id ? id.trim() : undefined,
+              line: index,
+              indent: lineIndent,
+            };
+            this.tokens.push(token);
+            this.addLog(
+              `Found component start: ${type.trim()}${
+                id ? ` (${id.trim()})` : ""
+              } at indent ${lineIndent}, line ${index + 1}`
+            );
+            this.addLog(`Token details: ${JSON.stringify(token)}`);
+          }
+          return;
+        }
+
+        // Component closure detection - allow for indentation and borders
+        if (line.match(/.*[└][-─]+[┘]/)) {
+          const token = {
+            type: "component_end",
+            line: index,
+            indent: lineIndent,
+          };
+          this.tokens.push(token);
+          this.addLog(
+            `Found component end at indent ${lineIndent}, line ${index + 1}`
+          );
+          this.addLog(`Token details: ${JSON.stringify(token)}`);
+          return;
+        }
+
+        // Content line detection - handle nested content with proper indentation
+        const contentMatch = line.match(/^(\s*[│\s]*)[│]\s*(.*?)\s*[│]/);
+        if (contentMatch) {
+          const content = contentMatch[2];
+          if (content.trim()) {
+            const attributeMatch = content.match(/^(\w+):\s*(.+)$/);
+            if (attributeMatch) {
+              const [_, key, value] = attributeMatch;
+              const token = {
+                type: "attribute",
+                key: key.trim(),
+                value: value.trim(),
+                line: index,
+                indent: lineIndent,
+              };
+              this.tokens.push(token);
+              this.addLog(
+                `Found attribute: ${key.trim()} = ${value.trim()} at indent ${lineIndent}, line ${
+                  index + 1
+                }`
+              );
+              this.addLog(`Token details: ${JSON.stringify(token)}`);
+            }
+          }
+        }
+      });
+
+      this.addLog(`Tokenization complete. Found ${this.tokens.length} tokens.`);
+      this.addLog(`Token list: ${JSON.stringify(this.tokens, null, 2)}`);
+      return this.tokens;
+    },
+
+    buildAST() {
+      const stack = [this.ast];
+      let currentComponent = null;
+
+      this.addLog("Starting AST construction...");
+      this.addLog(`Initial stack: ${JSON.stringify(stack.map((s) => s.type))}`);
+
+      this.tokens.forEach((token, index) => {
+        this.addLog(`Processing token: ${JSON.stringify(token)}`);
+        this.addLog(
+          `Current stack depth: ${stack.length}, Components: ${stack
+            .map((s) => s.type)
+            .join(" > ")}`
+        );
+
+        if (token.type === "component_start") {
+          const component = {
+            type: token.componentType,
+            id: token.id,
+            attributes: {},
+            children: [],
+            indent: token.indent,
+          };
+
+          // Find the appropriate parent based on indentation
+          while (stack.length > 1) {
+            const parent = stack[stack.length - 1];
+            this.addLog(
+              `Checking parent ${parent.type} indent ${parent.indent} vs token indent ${token.indent}`
+            );
+            if (parent.indent < token.indent) {
+              break;
+            }
+            const popped = stack.pop();
+            this.addLog(
+              `Popped component ${popped.type} from stack due to indentation`
+            );
+          }
+
+          const parent = stack[stack.length - 1];
+          parent.children.push(component);
+          stack.push(component);
+          currentComponent = component;
+
+          this.addLog(
+            `Added component ${token.componentType} (${token.id}) to parent ${parent.type}`
+          );
+          this.addLog(`Updated stack: ${stack.map((s) => s.type).join(" > ")}`);
+        } else if (token.type === "attribute") {
+          // Find the component this attribute belongs to based on indentation
+          let targetComponent = null;
+          for (let i = stack.length - 1; i >= 0; i--) {
+            const component = stack[i];
+            this.addLog(
+              `Checking component ${component.type} at indent ${component.indent} for attribute at indent ${token.indent}`
+            );
+            if (component.indent < token.indent) {
+              targetComponent = component;
+              break;
+            }
+          }
+
+          if (targetComponent) {
+            targetComponent.attributes[token.key] = token.value;
+            this.addLog(
+              `Added attribute ${token.key}=${token.value} to component ${targetComponent.type}`
+            );
+          } else {
+            this.addLog(
+              `Warning: Could not find target component for attribute ${token.key}`
+            );
+          }
+        } else if (token.type === "component_end") {
+          // Only pop if the next token has lower or equal indentation
+          const nextToken = this.tokens[index + 1];
+          this.addLog(
+            `Component end token at indent ${token.indent}, next token: ${
+              nextToken ? JSON.stringify(nextToken) : "none"
+            }`
+          );
+
+          if (!nextToken || nextToken.indent <= token.indent) {
+            if (stack.length > 1) {
+              const component = stack.pop();
+              currentComponent = stack[stack.length - 1];
+              this.addLog(
+                `Closed component ${component.type}, new current: ${currentComponent.type}`
+              );
+              this.addLog(
+                `Stack after pop: ${stack.map((s) => s.type).join(" > ")}`
+              );
+            }
+          } else {
+            this.addLog(
+              `Keeping component in stack due to next token's higher indentation: ${nextToken.indent}`
+            );
+          }
+        }
+      });
+
+      this.addLog("AST construction complete");
+      this.addLog(`Final AST: ${JSON.stringify(this.ast, null, 2)}`);
+      return this.ast;
+    },
+
+    validateComponent(component) {
+      const errors = [];
+
+      switch (component.type) {
+        case "Button":
+          if (!component.attributes.label) {
+            errors.push(
+              `Button ${component.id} missing required 'label' attribute`
+            );
+          }
+          break;
+        case "Input/Display":
+        case "Display":
+          if (!component.attributes.type) {
+            component.attributes.type = "text";
+            this.addLog(
+              `Added default type 'text' to ${component.type} ${component.id}`
+            );
+          }
+          break;
+        case "Container":
+          if (!component.attributes.direction) {
+            errors.push(
+              `Container ${component.id} missing required 'direction' attribute`
+            );
+          }
+          break;
+      }
+
+      // Recursively validate children
+      component.children?.forEach((child) => {
+        errors.push(...this.validateComponent(child));
+      });
+
+      return errors;
+    },
+
+    parse(input) {
+      try {
+        this.reset();
+        this.addLog("Starting parse...");
+
+        this.tokenize(input);
+        this.buildAST();
+
+        const errors = [];
+        this.ast.children.forEach((component) => {
+          errors.push(...this.validateComponent(component));
+        });
+
+        if (errors.length > 0) {
+          this.addLog("Validation errors found:");
+          errors.forEach((error) => this.addLog(`Error: ${error}`));
+          throw new Error(errors.join("\n"));
+        }
+
+        this.addLog("Preparing output...");
+        this.addLog(
+          `Found ${this.ast.children.length} components and ${this.ast.scripts.length} scripts`
+        );
+
+        return {
+          components: this.ast.children,
+          scripts: this.ast.scripts.map((script) => ({
+            name: script.name,
+            content: script.content.join("\n"),
+          })),
+          logs: this.logs,
+        };
+      } catch (error) {
+        this.addLog(`Error during parsing: ${error.message}`);
+        throw error;
+      }
+    },
+  };
+};
+
+// BoxMD Playground Component
+const BoxMDPlayground = () => {
+  const [boxMDScript, setBoxMDScript] = useState("");
+  const [activeTab, setActiveTab] = useState("editor");
+  const [parseErrors, setParseErrors] = useState([]);
+  const [parseLogs, setParseLogs] = useState([]);
+  const [components, setComponents] = useState([]);
+  const [scripts, setScripts] = useState([]);
+
+  const parser = useMemo(
+    () =>
+      createBoxMDParser((log) => {
+        setParseLogs((prev) => [...prev, log]);
+      }),
+    []
+  );
+
+  const renderComponent = useCallback((component) => {
+    switch (component.type) {
+      case "Button":
+        return (
+          <Button
+            key={component.id}
+            id={component.id}
+            onClick={() => {
+              try {
+                new Function(component.attributes.onClick)();
+              } catch (error) {
+                console.error(`Error in button click handler: ${error}`);
+              }
+            }}
+            className="boxmd-button"
+          >
+            {component.attributes.label}
+          </Button>
+        );
+      case "Container":
+        return (
+          <div
+            key={component.id}
+            id={component.id}
+            className="boxmd-container"
+            style={{
+              flexDirection:
+                component.attributes.direction === "vertical"
+                  ? "column"
+                  : "row",
+              gap: "8px",
+            }}
+          >
+            {component.children?.map((child) => renderComponent(child))}
+          </div>
+        );
+      case "Layout":
+        return (
+          <div
+            key={`layout-${Math.random()}`}
+            className="boxmd-layout"
+            style={{
+              flexDirection: component.attributes.direction || "row",
+              gap: "8px",
+            }}
+          >
+            {component.children?.map((child) => renderComponent(child))}
+          </div>
+        );
+      case "Display":
+        return (
+          <div
+            key={component.id}
+            id={component.id}
+            className="boxmd-display"
+            style={{
+              fontFamily:
+                component.attributes.style === "monospace"
+                  ? "monospace"
+                  : "inherit",
+              fontSize:
+                component.attributes.size === "large"
+                  ? "28px"
+                  : component.attributes.size === "small"
+                  ? "12px"
+                  : "20px",
+            }}
+          >
+            {component.attributes.value}
+          </div>
+        );
+      case "Input":
+        return (
+          <label>
+            {component.attributes.label}
+            <input
+              key={component.id}
+              id={component.id}
+              type={component.attributes.type || "text"}
+              defaultValue={component.attributes.value || ""}
+              readOnly={component.attributes.readonly === "true"}
+              className="boxmd-input"
+            />
+          </label>
+        );
+      default:
+        console.warn(`Unknown component type: ${component.type}`);
+        return null;
+    }
+  }, []);
+
+  const executeScript = useCallback((scriptContent) => {
+    try {
+      const scriptEl = document.createElement("script");
+      scriptEl.textContent = scriptContent;
+      document.body.appendChild(scriptEl);
+    } catch (err) {
+      console.error("Script execution error:", err);
+      setParseLogs((prev) => [
+        ...prev,
+        `Error executing script: ${err.message}`,
+      ]);
+    }
+  }, []);
+
+  const handleRunPreview = useCallback(() => {
+    setParseLogs([]);
+    try {
+      const { components: parsedComponents, scripts: parsedScripts } =
+        parser.parse(boxMDScript);
+      setComponents(parsedComponents);
+      setScripts(parsedScripts);
+      setParseErrors([]);
+      setActiveTab("preview");
+
+      // Execute scripts after a short delay to ensure components are mounted
+      setTimeout(() => {
+        parsedScripts.forEach((script) => {
+          if (script.content) {
+            executeScript(
+              Array.isArray(script.content)
+                ? script.content.join("\n")
+                : script.content
+            );
+          }
+        });
+      }, 0);
+    } catch (error) {
+      console.error("Parse error:", error);
+      setParseErrors([error.message]);
+      setParseLogs((prev) => [
+        ...prev,
+        `Error during execution: ${error.message}`,
+      ]);
+    }
+  }, [boxMDScript, parser, executeScript]);
+
+  // Cleanup scripts on unmount
+  useEffect(() => {
+    return () => {
+      document
+        .querySelectorAll("script[data-boxmd-script]")
+        .forEach((el) => el.remove());
+    };
+  }, []);
+
+  return (
+    <Card className="w-full max-w-4xl">
+      <CardHeader>
+        <CardTitle>BoxMD Playground</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <ThemeSelector />
+        <Tabs value={activeTab} onValueChange={setActiveTab}>
+          <TabsList className="grid w-full grid-cols-3">
+            <TabsTrigger value="editor">
+              <Code className="mr-2 h-4 w-4" />
+              Editor
+            </TabsTrigger>
+            <TabsTrigger value="preview">
+              <Eye className="mr-2 h-4 w-4" />
+              Preview
+            </TabsTrigger>
+            <TabsTrigger value="logs">
+              <Terminal className="mr-2 h-4 w-4" />
+              Logs
+            </TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="editor">
+            <Textarea
+              value={boxMDScript}
+              onChange={(e) => setBoxMDScript(e.target.value)}
+              placeholder="Paste your BoxMD script here..."
+              className="font-mono h-96"
+            />
+            <Button onClick={handleRunPreview} className="w-full">
+              <Play className="mr-2 h-4 w-4" />
+              Run Preview
+            </Button>
+          </TabsContent>
+
+          <TabsContent
+            value="preview"
+            className="min-h-[400px] border rounded-lg p-4"
+          >
+            <div className="space-y-4">
+              {components.map((component) => renderComponent(component))}
+            </div>
+          </TabsContent>
+
+          <TabsContent
+            value="logs"
+            className="min-h-[400px] border rounded-lg p-4"
+          >
+            <pre className="font-mono text-sm whitespace-pre-wrap">
+              {parseLogs.length > 0
+                ? parseLogs.join("\n")
+                : "No parse logs available."}
+            </pre>
+          </TabsContent>
+        </Tabs>
+
+        {parseErrors.length > 0 && (
+          <div className="mt-4 p-4 border border-red-500 rounded-lg bg-red-50">
+            <div className="flex items-center text-red-500 mb-2">
+              <AlertTriangle className="mr-2 h-4 w-4" />
+              Parse Errors:
+            </div>
+            <pre className="text-sm text-red-600 whitespace-pre-wrap">
+              {parseErrors.join("\n")}
+            </pre>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+};
+
+export default BoxMDPlayground;
+# === TEST ===
+The project is an innovative implementation of an ASCII-based UI markup language called **BoxMD**. It translates visual ASCII art layouts into functional React components, effectively bridging the gap between "whiteboard sketching" and functional prototyping.
+
+**Key Strengths:**
+*   **Intuitive Syntax:** The ASCII syntax is visual and easy to read, making layout definitions self-documenting.
+*   **Separation of Concerns:** The architecture clearly separates parsing (`BoxMDParser`), AST generation, and rendering (`BoxMDRenderer`), making it maintainable.
+*   **Playground Environment:** The inclusion of a live editor with a preview and logs tab is excellent for experimentation and debugging.
+
+**Observations & Areas for Improvement:**
+1.  **Parser Rigidity:** The current parser implementation in `BoxMdRenderer.jsx` uses strict Regex matching for box corners (`┌`, `┐`, `└`, `┘`). The specification, however, calls for flexibility, allowing characters like `+` and `#`.
+2.  **Layout Logic Gap:** The specification defines Layouts as `[ Layout: horizontal ]`, where the second part is a property, not an ID. The current parser treats this as an ID (`id="horizontal"`), causing the layout direction to be ignored during rendering.
+3.  **Rendering Bugs:**
+    *   The `Layout` component renderer attempts to set `flexDirection: "vertical"`, which is invalid CSS (should be `column`).
+    *   `Container` handles direction mapping correctly but `Layout` does not.
+4.  **Security:** The script execution uses `new Function` and `<script>` injection. While acceptable for a client-side playground, this is an XSS vector if used with untrusted input in a production app.
+
+The following changes improve parser compliance with the spec (supporting `+`, `#`, etc.), fix the Layout direction syntax handling, and correct the CSS flex-direction mapping.
+
+```diff
+--- a/src/components/BoxMdRenderer.jsx
++++ b/src/components/BoxMdRenderer.jsx
+@@ -48,3 +48,3 @@
+ 
+-        // Handle script blocks
++        // Handle script blocks - detect start/end
+         if (trimmedLine.startsWith("────") && trimmedLine.includes("Script:")) {
+@@ -75,6 +75,7 @@
+         // Component header detection - allow for indentation and borders
+         // Match both formats: [ Type: ID ] and [ Type ]
+-        if (line.match(/.*[┌].*\[ .+?(:.*?)? \].*[┐]/)) {
++        // Updated regex to support ASCII variants: ┌, +, # as per spec
++        if (line.match(/.*[┌+#].*\[ .+?(:.*?)? \].*[┐+#]/)) {
+           const fullMatch = line.match(/\[ (.+?)(?::(.+?))? \]/);
+           if (fullMatch) {
+             const type = fullMatch[1];
+@@ -95,4 +96,5 @@
+         // Component closure detection - allow for indentation and borders
+-        if (line.match(/.*[└][-─]+[┘]/)) {
++        // Updated regex for corners └, +, # and lines ─, -, _, ═
++        if (line.match(/.*[└+#][-─_═]+[┘+#]/)) {
+           const token = {
+             type: "component_end",
+@@ -147,2 +149,14 @@
+ 
++          // Special handling for Layout syntax: [ Layout: horizontal ]
++          // The spec says Layouts don't have IDs, so the second part is the direction.
++          if (component.type.toLowerCase() === 'layout' && component.id) {
++            const lowerId = component.id.toLowerCase();
++            if (['horizontal', 'vertical', 'h', 'v'].includes(lowerId)) {
++              component.attributes.direction = lowerId;
++              component.id = undefined; // Clear ID as it was actually a direction
++              this.addLog(`Converted Layout ID '${lowerId}' to direction attribute`);
++            }
++          }
++
+           // Find the appropriate parent based on indentation
+           while (stack.length > 1) {
+@@ -262,2 +276,12 @@
+ 
++  // Helper to map BoxMD direction to CSS flex-direction
++  const getFlexDirection = (dir) => {
++    const d = dir?.toLowerCase();
++    if (d === 'vertical' || d === 'v') return 'column';
++    if (d === 'horizontal' || d === 'h') return 'row';
++    return 'row'; // default
++  };
++
+   const renderComponent = useCallback((component) => {
+     switch (component.type) {
+       case "Button":
+@@ -285,5 +309,3 @@
+             className="boxmd-container"
+             style={{
+-              flexDirection:
+-                component.attributes.direction === "vertical"
+-                  ? "column"
+-                  : "row",
++              flexDirection: getFlexDirection(component.attributes.direction || "vertical"),
+               gap: "8px",
+             }}
+@@ -298,3 +320,3 @@
+             style={{
+-              flexDirection: component.attributes.direction || "row",
++              flexDirection: getFlexDirection(component.attributes.direction),
+               gap: "8px",
+             }}
+@@ -342,3 +364,28 @@
+ // BoxMD Playground Component
++const DEFAULT_EXAMPLE = `┌────[ Container: ExampleApp ]────────┐
++│ direction: vertical                 │
++│ padding: 10                         │
++│                                     │
++│ ┌────[ Display: displayResult ]──┐  │
++│ │ value: 0                       │  │
++│ │ readonly: true                 │  │
++│ │ size: large                    │  │
++│ └────────────────────────────────┘  │
++│                                     │
++│ ┌──────[ Button: button1 ]───────┐  │
++│ │ label: Add 1                   │  │
++│ │ onClick: appendDigit('1')      │  │
++│ └────────────────────────────────┘  │
++└─────────────────────────────────────┘
++
++──────[ Script: exampleScript ]───────
++let displayValue = '0';
++function appendDigit(digit) {
++  displayValue = displayValue === '0' ? digit : displayValue + digit;
++  const el = document.getElementById('displayResult');
++  if(el) el.innerText = displayValue;
++}
++──────[ Script: exampleLogic ]───────`;
++
+ const BoxMDPlayground = () => {
+-  const [boxMDScript, setBoxMDScript] = useState("");
++  const [boxMDScript, setBoxMDScript] = useState(DEFAULT_EXAMPLE);
+   const [activeTab, setActiveTab] = useState("editor");
+
+```
+# === RESULT ===
+import React, { useState, useCallback, useEffect, useMemo } from "react";
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Play, Code, Eye, AlertTriangle, Terminal } from "lucide-react";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import ThemeSelector from "./ThemeSelector";
+
+// BoxMD Parser Implementation
+const createBoxMDParser = (onLog) => {
+  return {
+    tokens: [],
+    ast: {
+      type: "root",
+      children: [],
+      scripts: [],
+    },
+    logs: [],
+
+    addLog(message) {
+      this.logs.push(message);
+      onLog(message);
+    },
+
+    reset() {
+      this.tokens = [];
+      this.ast = {
+        type: "root",
+        children: [],
+        scripts: [],
+      };
+      this.logs = [];
+    },
+
+    tokenize(input) {
+      const lines = input.split("\n");
+      let inScript = false;
+      let currentScript = null;
+
+      this.addLog("Starting tokenization...");
+      this.addLog(`Total lines to process: ${lines.length}`);
+
+      lines.forEach((line, index) => {
+        const trimmedLine = line.trim();
+
+        // Get the raw line without the right border for better indentation detection
+        const lineWithoutRightBorder = line.replace(/[│┘┐]\s*$/, "");
+        const indentMatch = lineWithoutRightBorder.match(/^(\s*[│\s]*)/);
+        const lineIndent = indentMatch
+          ? Math.floor(indentMatch[1].replace(/[│]/g, " ").length / 2)
+          : 0;
+
+        this.addLog(
+          `Processing line ${index + 1}: [indent=${lineIndent}] ${line}`
+        );
+
+        // Handle script blocks - detect start/end
+        if (trimmedLine.startsWith("────") && trimmedLine.includes("Script:")) {
+          if (!inScript) {
+            const scriptName = trimmedLine.match(/\[ Script: (\w+) \]/)?.[1];
+            currentScript = {
+              type: "script",
+              name: scriptName,
+              content: [],
+              startLine: index,
+            };
+            this.addLog(
+              `Found script start: ${scriptName} at line ${index + 1}`
+            );
+            inScript = true;
+          } else {
+            currentScript.endLine = index;
+            this.ast.scripts.push(currentScript);
+            this.addLog(
+              `Found script end: ${currentScript.name} at line ${index + 1}`
+            );
+            inScript = false;
+            currentScript = null;
+          }
+          return;
+        }
+
+        if (inScript) {
+          currentScript.content.push(line);
+          this.addLog(`Added script line: ${line}`);
+          return;
+        }
+
+        // Component header detection - allow for indentation and borders
+        // Match both formats: [ Type: ID ] and [ Type ]
+        // Updated regex to support ASCII variants: ┌, +, # as per spec
+        if (line.match(/.*[┌+#].*\[ .+?(:.*?)? \].*[┐+#]/)) {
+          const fullMatch = line.match(/\[ (.+?)(?::(.+?))? \]/);
+          if (fullMatch) {
+            const type = fullMatch[1];
+            const id = fullMatch[2];
+            const token = {
+              type: "component_start",
+              componentType: type.trim(),
+              id: id ? id.trim() : undefined,
+              line: index,
+              indent: lineIndent,
+            };
+            this.tokens.push(token);
+            this.addLog(
+              `Found component start: ${type.trim()}${
+                id ? ` (${id.trim()})` : ""
+              } at indent ${lineIndent}, line ${index + 1}`
+            );
+            this.addLog(`Token details: ${JSON.stringify(token)}`);
+          }
+          return;
+        }
+
+        // Component closure detection - allow for indentation and borders
+        // Updated regex for corners └, +, # and lines ─, -, _, ═
+        if (line.match(/.*[└+#][-─_═]+[┘+#]/)) {
+          const token = {
+            type: "component_end",
+            line: index,
+            indent: lineIndent,
+          };
+          this.tokens.push(token);
+          this.addLog(
+            `Found component end at indent ${lineIndent}, line ${index + 1}`
+          );
+          this.addLog(`Token details: ${JSON.stringify(token)}`);
+          return;
+        }
+
+        // Content line detection - handle nested content with proper indentation
+        const contentMatch = line.match(/^(\s*[│\s]*)[│]\s*(.*?)\s*[│]/);
+        if (contentMatch) {
+          const content = contentMatch[2];
+          if (content.trim()) {
+            const attributeMatch = content.match(/^(\w+):\s*(.+)$/);
+            if (attributeMatch) {
+              const [_, key, value] = attributeMatch;
+              const token = {
+                type: "attribute",
+                key: key.trim(),
+                value: value.trim(),
+                line: index,
+                indent: lineIndent,
+              };
+              this.tokens.push(token);
+              this.addLog(
+                `Found attribute: ${key.trim()} = ${value.trim()} at indent ${lineIndent}, line ${
+                  index + 1
+                }`
+              );
+              this.addLog(`Token details: ${JSON.stringify(token)}`);
+            }
+          }
+        }
+      });
+
+      this.addLog(`Tokenization complete. Found ${this.tokens.length} tokens.`);
+      this.addLog(`Token list: ${JSON.stringify(this.tokens, null, 2)}`);
+      return this.tokens;
+    },
+
+    buildAST() {
+      const stack = [this.ast];
+      let currentComponent = null;
+
+      this.addLog("Starting AST construction...");
+      this.addLog(`Initial stack: ${JSON.stringify(stack.map((s) => s.type))}`);
+
+      this.tokens.forEach((token, index) => {
+        this.addLog(`Processing token: ${JSON.stringify(token)}`);
+        this.addLog(
+          `Current stack depth: ${stack.length}, Components: ${stack
+            .map((s) => s.type)
+            .join(" > ")}`
+        );
+
+        if (token.type === "component_start") {
+          const component = {
+            type: token.componentType,
+            id: token.id,
+            attributes: {},
+            children: [],
+            indent: token.indent,
+          };
+
+          // Special handling for Layout syntax: [ Layout: horizontal ]
+          // The spec says Layouts don't have IDs, so the second part is the direction.
+          if (component.type.toLowerCase() === 'layout' && component.id) {
+            const lowerId = component.id.toLowerCase();
+            if (['horizontal', 'vertical', 'h', 'v'].includes(lowerId)) {
+              component.attributes.direction = lowerId;
+              component.id = undefined; // Clear ID as it was actually a direction
+              this.addLog(`Converted Layout ID '${lowerId}' to direction attribute`);
+            }
+          }
+
+          // Find the appropriate parent based on indentation
+          while (stack.length > 1) {
+            const parent = stack[stack.length - 1];
+            this.addLog(
+              `Checking parent ${parent.type} indent ${parent.indent} vs token indent ${token.indent}`
+            );
+            if (parent.indent < token.indent) {
+              break;
+            }
+            const popped = stack.pop();
+            this.addLog(
+              `Popped component ${popped.type} from stack due to indentation`
+            );
+          }
+
+          const parent = stack[stack.length - 1];
+          parent.children.push(component);
+          stack.push(component);
+          currentComponent = component;
+
+          this.addLog(
+            `Added component ${token.componentType} (${token.id}) to parent ${parent.type}`
+          );
+          this.addLog(`Updated stack: ${stack.map((s) => s.type).join(" > ")}`);
+        } else if (token.type === "attribute") {
+          // Find the component this attribute belongs to based on indentation
+          let targetComponent = null;
+          for (let i = stack.length - 1; i >= 0; i--) {
+            const component = stack[i];
+            this.addLog(
+              `Checking component ${component.type} at indent ${component.indent} for attribute at indent ${token.indent}`
+            );
+            if (component.indent < token.indent) {
+              targetComponent = component;
+              break;
+            }
+          }
+
+          if (targetComponent) {
+            targetComponent.attributes[token.key] = token.value;
+            this.addLog(
+              `Added attribute ${token.key}=${token.value} to component ${targetComponent.type}`
+            );
+          } else {
+            this.addLog(
+              `Warning: Could not find target component for attribute ${token.key}`
+            );
+          }
+        } else if (token.type === "component_end") {
+          // Only pop if the next token has lower or equal indentation
+          const nextToken = this.tokens[index + 1];
+          this.addLog(
+            `Component end token at indent ${token.indent}, next token: ${
+              nextToken ? JSON.stringify(nextToken) : "none"
+            }`
+          );
+
+          if (!nextToken || nextToken.indent <= token.indent) {
+            if (stack.length > 1) {
+              const component = stack.pop();
+              currentComponent = stack[stack.length - 1];
+              this.addLog(
+                `Closed component ${component.type}, new current: ${currentComponent.type}`
+              );
+              this.addLog(
+                `Stack after pop: ${stack.map((s) => s.type).join(" > ")}`
+              );
+            }
+          } else {
+            this.addLog(
+              `Keeping component in stack due to next token's higher indentation: ${nextToken.indent}`
+            );
+          }
+        }
+      });
+
+      this.addLog("AST construction complete");
+      this.addLog(`Final AST: ${JSON.stringify(this.ast, null, 2)}`);
+      return this.ast;
+    },
+
+    validateComponent(component) {
+      const errors = [];
+
+      switch (component.type) {
+        case "Button":
+          if (!component.attributes.label) {
+            errors.push(
+              `Button ${component.id} missing required 'label' attribute`
+            );
+          }
+          break;
+        case "Input/Display":
+        case "Display":
+          if (!component.attributes.type) {
+            component.attributes.type = "text";
+            this.addLog(
+              `Added default type 'text' to ${component.type} ${component.id}`
+            );
+          }
+          break;
+        case "Container":
+          if (!component.attributes.direction) {
+            errors.push(
+              `Container ${component.id} missing required 'direction' attribute`
+            );
+          }
+          break;
+      }
+
+      // Recursively validate children
+      component.children?.forEach((child) => {
+        errors.push(...this.validateComponent(child));
+      });
+
+      return errors;
+    },
+
+    parse(input) {
+      try {
+        this.reset();
+        this.addLog("Starting parse...");
+
+        this.tokenize(input);
+        this.buildAST();
+
+        const errors = [];
+        this.ast.children.forEach((component) => {
+          errors.push(...this.validateComponent(component));
+        });
+
+        if (errors.length > 0) {
+          this.addLog("Validation errors found:");
+          errors.forEach((error) => this.addLog(`Error: ${error}`));
+          throw new Error(errors.join("\n"));
+        }
+
+        this.addLog("Preparing output...");
+        this.addLog(
+          `Found ${this.ast.children.length} components and ${this.ast.scripts.length} scripts`
+        );
+
+        return {
+          components: this.ast.children,
+          scripts: this.ast.scripts.map((script) => ({
+            name: script.name,
+            content: script.content.join("\n"),
+          })),
+          logs: this.logs,
+        };
+      } catch (error) {
+        this.addLog(`Error during parsing: ${error.message}`);
+        throw error;
+      }
+    },
+  };
+};
+
+// BoxMD Playground Component
+const BoxMDPlayground = () => {
+  const [boxMDScript, setBoxMDScript] = useState("");
+  const [activeTab, setActiveTab] = useState("editor");
+  const [parseErrors, setParseErrors] = useState([]);
+  const [parseLogs, setParseLogs] = useState([]);
+  const [components, setComponents] = useState([]);
+  const [scripts, setScripts] = useState([]);
+
+  const parser = useMemo(
+    () =>
+      createBoxMDParser((log) => {
+        setParseLogs((prev) => [...prev, log]);
+      }),
+    []
+  );
+
+  // Helper to map BoxMD direction to CSS flex-direction
+  const getFlexDirection = (dir) => {
+    const d = dir?.toLowerCase();
+    if (d === 'vertical' || d === 'v') return 'column';
+    if (d === 'horizontal' || d === 'h') return 'row';
+    return 'row'; // default
+  };
+
+  const renderComponent = useCallback((component) => {
+    switch (component.type) {
+      case "Button":
+        return (
+          <Button
+            key={component.id}
+            id={component.id}
+            onClick={() => {
+              try {
+                new Function(component.attributes.onClick)();
+              } catch (error) {
+                console.error(`Error in button click handler: ${error}`);
+              }
+            }}
+            className="boxmd-button"
+          >
+            {component.attributes.label}
+          </Button>
+        );
+      case "Container":
+        return (
+          <div
+            key={component.id}
+            id={component.id}
+            className="boxmd-container"
+            style={{
+              flexDirection: getFlexDirection(component.attributes.direction || "vertical"),
+              gap: "8px",
+            }}
+          >
+            {component.children?.map((child) => renderComponent(child))}
+          </div>
+        );
+      case "Layout":
+        return (
+          <div
+            key={`layout-${Math.random()}`}
+            className="boxmd-layout"
+            style={{
+              flexDirection: getFlexDirection(component.attributes.direction),
+              gap: "8px",
+            }}
+          >
+            {component.children?.map((child) => renderComponent(child))}
+          </div>
+        );
+      case "Display":
+        return (
+          <div
+            key={component.id}
+            id={component.id}
+            className="boxmd-display"
+            style={{
+              fontFamily:
+                component.attributes.style === "monospace"
+                  ? "monospace"
+                  : "inherit",
+              fontSize:
+                component.attributes.size === "large"
+                  ? "28px"
+                  : component.attributes.size === "small"
+                  ? "12px"
+                  : "20px",
+            }}
+          >
+            {component.attributes.value}
+          </div>
+        );
+      case "Input":
+        return (
+          <label>
+            {component.attributes.label}
+            <input
+              key={component.id}
+              id={component.id}
+              type={component.attributes.type || "text"}
+              defaultValue={component.attributes.value || ""}
+              readOnly={component.attributes.readonly === "true"}
+              className="boxmd-input"
+            />
+          </label>
+        );
+      default:
+        console.warn(`Unknown component type: ${component.type}`);
+        return null;
+    }
+  }, []);
+
+  const executeScript = useCallback((scriptContent) => {
+    try {
+      const scriptEl = document.createElement("script");
+      scriptEl.textContent = scriptContent;
+      document.body.appendChild(scriptEl);
+    } catch (err) {
+      console.error("Script execution error:", err);
+      setParseLogs((prev) => [
+        ...prev,
+        `Error executing script: ${err.message}`,
+      ]);
+    }
+  }, []);
+
+  const handleRunPreview = useCallback(() => {
+    setParseLogs([]);
+    try {
+      const { components: parsedComponents, scripts: parsedScripts } =
+        parser.parse(boxMDScript);
+      setComponents(parsedComponents);
+      setScripts(parsedScripts);
+      setParseErrors([]);
+      setActiveTab("preview");
+
+      // Execute scripts after a short delay to ensure components are mounted
+      setTimeout(() => {
+        parsedScripts.forEach((script) => {
+          if (script.content) {
+            executeScript(
+              Array.isArray(script.content)
+                ? script.content.join("\n")
+                : script.content
+            );
+          }
+        });
+      }, 0);
+    } catch (error) {
+      console.error("Parse error:", error);
+      setParseErrors([error.message]);
+      setParseLogs((prev) => [
+        ...prev,
+        `Error during execution: ${error.message}`,
+      ]);
+    }
+  }, [boxMDScript, parser, executeScript]);
+
+  // Cleanup scripts on unmount
+  useEffect(() => {
+    return () => {
+      document
+        .querySelectorAll("script[data-boxmd-script]")
+        .forEach((el) => el.remove());
+    };
+  }, []);
+
+  return (
+    <Card className="w-full max-w-4xl">
+      <CardHeader>
+        <CardTitle>BoxMD Playground</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <ThemeSelector />
+        <Tabs value={activeTab} onValueChange={setActiveTab}>
+          <TabsList className="grid w-full grid-cols-3">
+            <TabsTrigger value="editor">
+              <Code className="mr-2 h-4 w-4" />
+              Editor
+            </TabsTrigger>
+            <TabsTrigger value="preview">
+              <Eye className="mr-2 h-4 w-4" />
+              Preview
+            </TabsTrigger>
+            <TabsTrigger value="logs">
+              <Terminal className="mr-2 h-4 w-4" />
+              Logs
+            </TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="editor">
+            <Textarea
+              value={boxMDScript}
+              onChange={(e) => setBoxMDScript(e.target.value)}
+              placeholder="Paste your BoxMD script here..."
+              className="font-mono h-96"
+            />
+            <Button onClick={handleRunPreview} className="w-full">
+              <Play className="mr-2 h-4 w-4" />
+              Run Preview
+            </Button>
+          </TabsContent>
+
+          <TabsContent
+            value="preview"
+            className="min-h-[400px] border rounded-lg p-4"
+          >
+            <div className="space-y-4">
+              {components.map((component) => renderComponent(component))}
+            </div>
+          </TabsContent>
+
+          <TabsContent
+            value="logs"
+            className="min-h-[400px] border rounded-lg p-4"
+          >
+            <pre className="font-mono text-sm whitespace-pre-wrap">
+              {parseLogs.length > 0
+                ? parseLogs.join("\n")
+                : "No parse logs available."}
+            </pre>
+          </TabsContent>
+        </Tabs>
+
+        {parseErrors.length > 0 && (
+          <div className="mt-4 p-4 border border-red-500 rounded-lg bg-red-50">
+            <div className="flex items-center text-red-500 mb-2">
+              <AlertTriangle className="mr-2 h-4 w-4" />
+              Parse Errors:
+            </div>
+            <pre className="text-sm text-red-600 whitespace-pre-wrap">
+              {parseErrors.join("\n")}
+            </pre>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+};
+
+export default BoxMDPlayground;
