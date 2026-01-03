@@ -1,0 +1,257 @@
+import { Button } from './ui/button';
+import { useCallback } from 'react';
+import { toast } from 'sonner';
+import { http } from '../lib/http';
+import { Clipboard } from 'lucide-react';
+
+interface PasteToTaskButtonProps {
+  projectId: string;
+  onTaskCreated?: (taskId: string, proposalId?: string) => void;
+}
+
+export const PasteToTaskButton = ({ projectId, onTaskCreated }: PasteToTaskButtonProps) => {
+  const handlePasteToTask = useCallback(async () => {
+    try {
+      const pastedText = await navigator.clipboard.readText();
+      if (!pastedText?.trim()) {
+        toast.info("Clipboard is empty.");
+        return;
+      }
+
+      const toastId = toast.loading("Creating task from clipboard...");
+
+      const response = await http<{ 
+        action: 'task_created' | 'no_action'; 
+        taskId?: string; 
+        proposalId?: string; 
+        message?: string 
+      }>('/api/workspace/paste-to-task', {
+        method: 'POST',
+        body: JSON.stringify({
+          markdownContent: pastedText,
+          instructions: 'Task from clipboard',
+        }),
+      });
+
+      if (response?.action === 'task_created' && response.taskId && response.proposalId) {
+        // Try to summarize the proposal using the configured summarizer model
+        toast.loading("Generating summary...", { id: toastId });
+
+        try {
+          const summaryResponse = await http<{
+            success: boolean;
+            title?: string;
+            summary?: string;
+            message?: string;
+          }>('/api/workspace/summarize-proposal', {
+            method: 'POST',
+            body: JSON.stringify({
+              proposalId: response.proposalId,
+              taskId: response.taskId,
+            }),
+          });
+
+          if (summaryResponse.success && summaryResponse.title) {
+            toast.success(`Task created: ${summaryResponse.title}`, { id: toastId });
+          } else {
+            toast.success('Task created from pasted content!', { id: toastId });
+          }
+        } catch {
+          // Summarization failed, but task was still created
+          toast.success('Task created from pasted content!', { id: toastId });
+        }
+
+        if (onTaskCreated) {
+          onTaskCreated(response.taskId, response.proposalId);
+        }
+      } else if (response?.action === 'no_action') {
+        toast.dismiss(toastId);
+        toast.info(response.message || 'No action was taken for the pasted content.');
+      } else {
+        toast.dismiss(toastId);
+      }
+    } catch (error: any) {
+      if (error.name === 'NotAllowedError') {
+        toast.error('Permission to read clipboard was denied.');
+      } else {
+        toast.error('Failed to process pasted content', {
+          description: error.message,
+        });
+      }
+    }
+  }, [projectId, onTaskCreated]);
+
+  return (
+    <Button
+      variant="outline"
+      onClick={handlePasteToTask}
+      size="sm"
+      className="h-8 text-xs px-3"
+    >
+      <Clipboard className="mr-1.5 h-3.5 w-3.5" />
+      Paste to Task
+    </Button>
+  );
+};
+# === TEST ===
+
+```diff
+--- a/src_v2/components/PasteToTaskButton.tsx
++++ b/src_v2/components/PasteToTaskButton.tsx
+@@ -34,36 +34,34 @@
+       });
+ 
+       if (response?.action === 'task_created' && response.taskId && response.proposalId) {
+-        // Try to summarize the proposal using the configured summarizer model
+-        toast.loading("Generating summary...", { id: toastId });
+-
+-        try {
+-          const summaryResponse = await http<{
+-            success: boolean;
+-            title?: string;
+-            summary?: string;
+-            message?: string;
+-          }>('/api/workspace/summarize-proposal', {
+-            method: 'POST',
+-            body: JSON.stringify({
+-              proposalId: response.proposalId,
+-              taskId: response.taskId,
+-            }),
+-          });
+-
+-          if (summaryResponse.success && summaryResponse.title) {
+-            toast.success(`Task created: ${summaryResponse.title}`, { id: toastId });
+-          } else {
+-            toast.success('Task created from pasted content!', { id: toastId });
+-          }
+-        } catch {
+-          // Summarization failed, but task was still created
+-          toast.success('Task created from pasted content!', { id: toastId });
+-        }
++        // Immediately notify success so user can proceed with review
++        toast.success('Task created from pasted content!', { id: toastId });
+ 
+         if (onTaskCreated) {
+           onTaskCreated(response.taskId, response.proposalId);
+         }
++
++        // Fire-and-forget: summarize in the background without blocking
++        http<{
++          success: boolean;
++          title?: string;
++          summary?: string;
++          message?: string;
++        }>('/api/workspace/summarize-proposal', {
++          method: 'POST',
++          body: JSON.stringify({
++            proposalId: response.proposalId,
++            taskId: response.taskId,
++          }),
++        })
++          .then((summaryResponse) => {
++            if (summaryResponse.success && summaryResponse.title) {
++              toast.success(`Summary ready: ${summaryResponse.title}`, { duration: 3000 });
++            }
++          })
++          .catch(() => {
++            // Summarization failed silently - task is already created
++          });
+       } else if (response?.action === 'no_action') {
+         toast.dismiss(toastId);
+         toast.info(response.message || 'No action was taken for the pasted content.');
+```
+
+# === RESULT ===
+import { Button } from './ui/button';
+import { useCallback } from 'react';
+import { toast } from 'sonner';
+import { http } from '../lib/http';
+import { Clipboard } from 'lucide-react';
+
+interface PasteToTaskButtonProps {
+  projectId: string;
+  onTaskCreated?: (taskId: string, proposalId?: string) => void;
+}
+
+export const PasteToTaskButton = ({ projectId, onTaskCreated }: PasteToTaskButtonProps) => {
+  const handlePasteToTask = useCallback(async () => {
+    try {
+      const pastedText = await navigator.clipboard.readText();
+      if (!pastedText?.trim()) {
+        toast.info("Clipboard is empty.");
+        return;
+      }
+
+      const toastId = toast.loading("Creating task from clipboard...");
+
+      const response = await http<{ 
+        action: 'task_created' | 'no_action'; 
+        taskId?: string; 
+        proposalId?: string; 
+        message?: string 
+      }>('/api/workspace/paste-to-task', {
+        method: 'POST',
+        body: JSON.stringify({
+          markdownContent: pastedText,
+          instructions: 'Task from clipboard',
+        }),
+      });
+
+      if (response?.action === 'task_created' && response.taskId && response.proposalId) {
+        // Immediately notify success so user can proceed with review
+        toast.success('Task created from pasted content!', { id: toastId });
+
+        if (onTaskCreated) {
+          onTaskCreated(response.taskId, response.proposalId);
+        }
+
+        // Fire-and-forget: summarize in the background without blocking
+        http<{
+          success: boolean;
+          title?: string;
+          summary?: string;
+          message?: string;
+        }>('/api/workspace/summarize-proposal', {
+          method: 'POST',
+          body: JSON.stringify({
+            proposalId: response.proposalId,
+            taskId: response.taskId,
+          }),
+        })
+          .then((summaryResponse) => {
+            if (summaryResponse.success && summaryResponse.title) {
+              toast.success(`Summary ready: ${summaryResponse.title}`, { duration: 3000 });
+            }
+          })
+          .catch(() => {
+            // Summarization failed silently - task is already created
+          });
+      } else if (response?.action === 'no_action') {
+        toast.dismiss(toastId);
+        toast.info(response.message || 'No action was taken for the pasted content.');
+      } else {
+        toast.dismiss(toastId);
+      }
+    } catch (error: any) {
+      if (error.name === 'NotAllowedError') {
+        toast.error('Permission to read clipboard was denied.');
+      } else {
+        toast.error('Failed to process pasted content', {
+          description: error.message,
+        });
+      }
+    }
+  }, [projectId, onTaskCreated]);
+
+  return (
+    <Button
+      variant="outline"
+      onClick={handlePasteToTask}
+      size="sm"
+      className="h-8 text-xs px-3"
+    >
+      <Clipboard className="mr-1.5 h-3.5 w-3.5" />
+      Paste to Task
+    </Button>
+  );
+};

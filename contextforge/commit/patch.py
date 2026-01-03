@@ -1140,6 +1140,8 @@ def _find_all_hunk_candidates(
             # Calculate how well the context matches
             context_score = 0.0
             context_weight = 0
+            lead_ratio = 0.0
+            tail_ratio = 0.0
 
             # Check leading context
             if lead_ctx:
@@ -1169,9 +1171,16 @@ def _find_all_hunk_candidates(
                 context_weight += 1
                 log.debug(f"  Anchor {anchor_idx}: tail_context_ratio={tail_ratio:.3f}")
 
-            # Overall confidence: high base score with context adjustment
+            # Overall confidence: base score with context adjustment
+            # Perfect lead context (>=0.98) gets a boost since it confirms correct positioning
+            # But we still use avg_context for tiebreaking between multiple perfect lead matches
             avg_context = (context_score / context_weight) if context_weight > 0 else 0.5
-            confidence = 0.9 + (avg_context * 0.1)  # 0.9-1.0 range
+            if lead_ctx and lead_ratio >= 0.98:
+                # Perfect lead context match - boost base confidence but still differentiate
+                # by tail context for cases where multiple positions have perfect lead
+                confidence = 0.95 + (avg_context * 0.05)  # 0.95-1.0 range
+            else:
+                confidence = 0.9 + (avg_context * 0.1)  # 0.9-1.0 range
 
             # Calculate the actual hunk start position
             # Count non-addition lines between leading context and the first deletion
